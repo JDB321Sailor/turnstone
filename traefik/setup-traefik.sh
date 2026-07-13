@@ -736,6 +736,7 @@ EOF_DONE
 
 main() {
     printf '%s%sTurnstone Traefik setup%s\n\n' "$BOLD" "$GREEN" "$RESET"
+    info "All prompts use visible input, including token and secret fields."
 
     detect_os
     ensure_git
