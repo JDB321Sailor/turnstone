@@ -355,7 +355,7 @@ write_managed_file() {
         if [ -n "$template" ] && cmp -s "$file" "$template"; then
             :
         else
-        ask "Overwrite existing unmanaged file $file?" n || die "refusing to overwrite $file"
+        ask "Overwrite existing unmanaged file $file?" n || die "Refusing to overwrite $file."
         fi
     fi
     mkdir -p "$(dirname "$file")"
@@ -453,7 +453,7 @@ prepare_root_env() {
     set_env_key "$ROOT_ENV" POSTGRES_PORT "$PG_PORT"
     set_env_key "$ROOT_ENV" CONSOLE_HTTPS_PORT "$CADDY_PORT"
     if [ -n "$existing_compose" ] && [ "$existing_compose" != "$target_compose" ]; then
-        ask "Replace existing COMPOSE_FILE in $ROOT_ENV so plain docker compose commands include Traefik?" y || die "COMPOSE_FILE must include the Traefik override."
+        ask "Replace existing COMPOSE_FILE in $ROOT_ENV so plain docker compose commands include Traefik?" y || die "Cannot proceed without updating COMPOSE_FILE. Re-run the script after allowing the Traefik override."
     fi
     set_env_key "$ROOT_ENV" COMPOSE_FILE "$target_compose"
     chmod 600 "$ROOT_ENV"
@@ -685,7 +685,7 @@ EOF_AUTH
 
 write_root_override() {
     if [ -f "$ROOT_OVERRIDE" ] && ! is_managed_file "$ROOT_OVERRIDE"; then
-        ask "Overwrite existing unmanaged file $ROOT_OVERRIDE?" n || die "refusing to overwrite $ROOT_OVERRIDE"
+        ask "Overwrite existing unmanaged file $ROOT_OVERRIDE?" n || die "Refusing to overwrite $ROOT_OVERRIDE."
     fi
     {
         echo "$ROOT_OVERRIDE_MARKER"
