@@ -12,6 +12,7 @@ DYNAMIC_AUTH="$SCRIPT_DIR/dynamic/dashboard-auth.yaml"
 ACME_FILE="$SCRIPT_DIR/acme/acme.json"
 TEMPLATE_ENV="$SCRIPT_DIR/example.env"
 TEMPLATE_CONFIG="$SCRIPT_DIR/example.config.yaml"
+TEMPLATE_OIDC_ENV="$SCRIPT_DIR/example.oidc.env"
 TEMPLATE_OVERRIDE="$SCRIPT_DIR/override.compose.yaml"
 ROOT_OVERRIDE="$REPO_DIR/override.compose.yaml"
 NODE_OVERRIDE="$REPO_DIR/compose.override.yaml"
@@ -347,11 +348,15 @@ is_managed_file() {
 }
 
 write_managed_file() {
-    local file="$1" tmp
+    local file="$1" template="${2:-}" tmp
     tmp="$(mktemp)"
     cat >"$tmp"
     if [ -f "$file" ] && ! is_managed_file "$file"; then
+        if [ -n "$template" ] && cmp -s "$file" "$template"; then
+            :
+        else
         ask "Overwrite existing unmanaged file $file?" n || die "refusing to overwrite $file"
+        fi
     fi
     mkdir -p "$(dirname "$file")"
     cat "$tmp" >"$file"
@@ -382,7 +387,7 @@ port_free() { ! port_in_use "$1"; }
 
 random_high_port() {
     local port
-    for _ in $(seq 1 25); do
+    for (( attempt = 0; attempt < 25; attempt++ )); do
         port=$(( (RANDOM % 64000) + 1024 ))
         port_free "$port" && { echo "$port"; return; }
     done
@@ -486,7 +491,7 @@ EOF_NODE
         {
             echo "$NODE_OVERRIDE_MARKER"
             echo "services:"
-            for node in $(seq $((NODE_COUNT + 1)) 10); do
+            for (( node = NODE_COUNT + 1; node <= 10; node++ )); do
                 printf '  node-%s: { profiles: ["extra"] }\n' "$node"
             done
         } >"$file"
@@ -500,27 +505,11 @@ EOF_NODE
 copy_templates() {
     [ -f "$TEMPLATE_ENV" ] || die "missing $TEMPLATE_ENV"
     [ -f "$TEMPLATE_CONFIG" ] || die "missing $TEMPLATE_CONFIG"
+    [ -f "$TEMPLATE_OIDC_ENV" ] || die "missing $TEMPLATE_OIDC_ENV"
     mkdir -p "$SCRIPT_DIR/config" "$SCRIPT_DIR/acme" "$SCRIPT_DIR/dynamic"
     copy_template_if_missing "$TEMPLATE_ENV" "$TRAEFIK_ENV" 0600
     copy_template_if_missing "$TEMPLATE_CONFIG" "$TRAEFIK_CONFIG" 0600
-    if [ ! -f "$OIDC_ENV" ]; then
-        (
-            umask 077
-            cat >"$OIDC_ENV" <<EOF_OIDC
-TURNSTONE_OIDC_ISSUER=
-TURNSTONE_OIDC_CLIENT_ID=
-TURNSTONE_OIDC_CLIENT_SECRET=
-TURNSTONE_OIDC_SCOPES=openid email profile
-TURNSTONE_OIDC_PROVIDER_NAME=SSO
-TURNSTONE_OIDC_ROLE_CLAIM=
-TURNSTONE_OIDC_ROLE_MAP=
-TURNSTONE_OIDC_PASSWORD_ENABLED=true
-TURNSTONE_OIDC_REDIRECT_BASE=
-TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS=
-TURNSTONE_OIDC_ALLOW_PRIVATE_NETWORK=false
-EOF_OIDC
-        )
-    fi
+    copy_template_if_missing "$TEMPLATE_OIDC_ENV" "$OIDC_ENV" 0600
     if [ ! -f "$ACME_FILE" ]; then
         (
             umask 077
@@ -614,11 +603,8 @@ collect_inputs() {
 
 write_traefik_env() {
     local dashboard_password_line
-    if [ -f "$TRAEFIK_ENV" ] && cmp -s "$TRAEFIK_ENV" "$TEMPLATE_ENV"; then
-        rm -f "$TRAEFIK_ENV"
-    fi
     dashboard_password_line="$(env_format "$TRAEFIK_DASHBOARD_PASSWORD")"
-    write_managed_file "$TRAEFIK_ENV" <<EOF_TENV
+    write_managed_file "$TRAEFIK_ENV" "$TEMPLATE_ENV" <<EOF_TENV
 $ROOT_OVERRIDE_MARKER
 CF_DNS_API_TOKEN=$(env_format "$CF_DNS_API_TOKEN")
 TURNSTONE_TRAEFIK_ACME_EMAIL=$(env_format "$TURNSTONE_TRAEFIK_ACME_EMAIL")
@@ -630,10 +616,7 @@ EOF_TENV
 }
 
 write_oidc_env() {
-    if [ -f "$OIDC_ENV" ] && head -1 "$OIDC_ENV" 2>/dev/null | grep -q '^TURNSTONE_OIDC_ISSUER='; then
-        rm -f "$OIDC_ENV"
-    fi
-    write_managed_file "$OIDC_ENV" <<EOF_OIDC
+    write_managed_file "$OIDC_ENV" "$TEMPLATE_OIDC_ENV" <<EOF_OIDC
 $ROOT_OVERRIDE_MARKER
 TURNSTONE_OIDC_ISSUER=$(env_format "$TURNSTONE_OIDC_ISSUER")
 TURNSTONE_OIDC_CLIENT_ID=$(env_format "$TURNSTONE_OIDC_CLIENT_ID")
@@ -651,10 +634,7 @@ EOF_OIDC
 }
 
 write_static_config() {
-    if [ -f "$TRAEFIK_CONFIG" ] && cmp -s "$TRAEFIK_CONFIG" "$TEMPLATE_CONFIG"; then
-        rm -f "$TRAEFIK_CONFIG"
-    fi
-    write_managed_file "$TRAEFIK_CONFIG" <<EOF_CFG
+    write_managed_file "$TRAEFIK_CONFIG" "$TEMPLATE_CONFIG" <<EOF_CFG
 $ROOT_OVERRIDE_MARKER
 api:
   dashboard: true
