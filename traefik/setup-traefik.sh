@@ -231,10 +231,10 @@ get_docker_com_supports() {
 install_docker() {
     case "$PKG" in
         apt|dnf|yum)
-            if [ -n "$OS_ID" ] && ! get_docker_com_supports "$OS_ID"; then
-                install_docker_ce_repo
-            else
+            if [ -n "$OS_ID" ] && get_docker_com_supports "$OS_ID"; then
                 curl -fsSL https://get.docker.com | $SUDO sh
+            else
+                install_docker_ce_repo
             fi
             ;;
         pacman)
@@ -419,7 +419,7 @@ hash_basic_auth() {
 }
 
 prepare_root_env() {
-    local jwt pgpw existing_jwt existing_pgpw existing_host existing_postgres_port existing_caddy_port existing_compose
+    local jwt pgpw existing_jwt existing_pgpw existing_host existing_postgres_port existing_caddy_port existing_compose target_compose
     if [ -f "$ROOT_ENV" ]; then
         chmod 600 "$ROOT_ENV" 2>/dev/null || true
         info "Keeping existing $ROOT_ENV and updating Traefik-related keys."
@@ -430,6 +430,7 @@ prepare_root_env() {
     existing_postgres_port="$(env_get "$ROOT_ENV" POSTGRES_PORT "")"
     existing_caddy_port="$(env_get "$ROOT_ENV" CONSOLE_HTTPS_PORT "")"
     existing_compose="$(env_get "$ROOT_ENV" COMPOSE_FILE "")"
+    target_compose="compose.yaml:override.compose.yaml:compose.override.yaml"
     [ -n "$existing_jwt" ] && jwt="$existing_jwt" || jwt="$(gen_hex 32)"
     [ -n "$existing_pgpw" ] && pgpw="$existing_pgpw" || pgpw="$(gen_hex 18)"
     if [ -n "$existing_postgres_port" ]; then PG_PORT="$existing_postgres_port"; else PG_PORT="$(pick_pg_port)"; fi
@@ -446,12 +447,10 @@ prepare_root_env() {
     set_env_key "$ROOT_ENV" TURNSTONE_HOST_IP "$existing_host"
     set_env_key "$ROOT_ENV" POSTGRES_PORT "$PG_PORT"
     set_env_key "$ROOT_ENV" CONSOLE_HTTPS_PORT "$CADDY_PORT"
-    if [ -z "$existing_compose" ] || [ "$existing_compose" = "compose.yaml:override.compose.yaml:compose.override.yaml" ]; then
-        set_env_key "$ROOT_ENV" COMPOSE_FILE "compose.yaml:override.compose.yaml:compose.override.yaml"
-    else
+    if [ -n "$existing_compose" ] && [ "$existing_compose" != "$target_compose" ]; then
         ask "Replace existing COMPOSE_FILE in $ROOT_ENV so plain docker compose commands include Traefik?" y || die "COMPOSE_FILE must include the Traefik override."
-        set_env_key "$ROOT_ENV" COMPOSE_FILE "compose.yaml:override.compose.yaml:compose.override.yaml"
     fi
+    set_env_key "$ROOT_ENV" COMPOSE_FILE "$target_compose"
     chmod 600 "$ROOT_ENV"
 }
 
@@ -476,9 +475,6 @@ write_node_override() {
     local file="$NODE_OVERRIDE" node
     if [ -f "$file" ] && ! head -1 "$file" 2>/dev/null | grep -qF "$NODE_OVERRIDE_MARKER"; then
         warn "$file exists and is not managed by run.sh. Leaving it unchanged."
-        if [ ! -f "$file" ]; then
-            printf 'services: {}\n' >"$file"
-        fi
         return
     fi
     if [ "$NODE_COUNT" -ge 10 ]; then
