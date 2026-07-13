@@ -389,9 +389,10 @@ port_free() { ! port_in_use "$1"; }
 random_high_port() {
     local port
     for (( attempt = 0; attempt < 25; attempt++ )); do
-        port=$(( (RANDOM % 63512) + 1024 ))
+        port=$(( (RANDOM % 64512) + 1024 ))
         port_free "$port" && { echo "$port"; return; }
     done
+    echo ""
 }
 
 pick_caddy_port() {
