@@ -5,7 +5,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 ROOT_ENV="$REPO_DIR/.env"
-TRAEFIK_ENV="$SCRIPT_DIR/config/traefik.env"
+TRAEFIK_ENV="$SCRIPT_DIR/.env"
 TRAEFIK_CONFIG="$SCRIPT_DIR/config/traefik.yaml"
 OIDC_ENV="$SCRIPT_DIR/config/turnstone-oidc.env"
 DYNAMIC_AUTH="$SCRIPT_DIR/dynamic/dashboard-auth.yaml"
@@ -90,16 +90,7 @@ prompt_value() {
         die "missing required input for: $prompt. Set ${envvar}."
     fi
     if [ "$secret" = 1 ]; then
-        while :; do
-            printf '%s%s%s: ' "$BOLD" "$prompt" "$RESET" >/dev/tty
-            read -r -s value </dev/tty || value=""
-            printf '\n' >/dev/tty
-            if [ -n "$value" ]; then
-                printf -v "$outvar" '%s' "$value"
-                return
-            fi
-            printf 'A value is required.\n' >/dev/tty
-        done
+        prompt="$prompt (visible input)"
     fi
     while :; do
         if [ -n "$default" ]; then
@@ -508,6 +499,7 @@ copy_templates() {
     [ -f "$TEMPLATE_ENV" ] || die "missing $TEMPLATE_ENV"
     [ -f "$TEMPLATE_CONFIG" ] || die "missing $TEMPLATE_CONFIG"
     [ -f "$TEMPLATE_OIDC_ENV" ] || die "missing $TEMPLATE_OIDC_ENV"
+    [ -f "$TEMPLATE_OVERRIDE" ] || die "missing $TEMPLATE_OVERRIDE"
     mkdir -p "$SCRIPT_DIR/config" "$SCRIPT_DIR/acme" "$SCRIPT_DIR/dynamic"
     copy_template_if_missing "$TEMPLATE_ENV" "$TRAEFIK_ENV" 0600
     copy_template_if_missing "$TEMPLATE_CONFIG" "$TRAEFIK_CONFIG" 0600
@@ -652,7 +644,7 @@ entryPoints:
     address: ":443"
 providers:
   docker:
-    endpoint: "http://docker-socket-proxy:2375"
+    endpoint: "tcp://docker-socket-proxy:2375"
     exposedByDefault: false
     network: turnstone-traefik
   file:
