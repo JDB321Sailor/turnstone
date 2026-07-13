@@ -29,3 +29,10 @@ tools/skill_audit_analysis/output/
 design_ideas/
 .claude/
 docs/design/
+
+override.compose.yaml
+traefik/config/traefik.env
+traefik/config/traefik.yaml
+traefik/config/turnstone-oidc.env
+traefik/dynamic/dashboard-auth.yaml
+traefik/acme/acme.json
