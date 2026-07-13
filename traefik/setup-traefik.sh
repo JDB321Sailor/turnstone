@@ -355,6 +355,7 @@ write_managed_file() {
         if [ -n "$template" ] && cmp -s "$file" "$template"; then
             :
         else
+
         ask "Overwrite existing unmanaged file $file?" n || die "Refusing to overwrite $file."
         fi
     fi
@@ -388,7 +389,7 @@ port_free() { ! port_in_use "$1"; }
 random_high_port() {
     local port
     for (( attempt = 0; attempt < 25; attempt++ )); do
-        port=$(( (RANDOM % 64000) + 1024 ))
+        port=$(( (RANDOM % 63512) + 1024 ))
         port_free "$port" && { echo "$port"; return; }
     done
 }
@@ -453,7 +454,7 @@ prepare_root_env() {
     set_env_key "$ROOT_ENV" POSTGRES_PORT "$PG_PORT"
     set_env_key "$ROOT_ENV" CONSOLE_HTTPS_PORT "$CADDY_PORT"
     if [ -n "$existing_compose" ] && [ "$existing_compose" != "$target_compose" ]; then
-        ask "Replace existing COMPOSE_FILE in $ROOT_ENV so plain docker compose commands include Traefik?" y || die "Cannot proceed without updating COMPOSE_FILE. Re-run the script after allowing the Traefik override."
+        ask "Replace existing COMPOSE_FILE in $ROOT_ENV so plain docker compose commands include Traefik?" y || die "COMPOSE_FILE must be updated to include Traefik. Re-run and accept the prompt."
     fi
     set_env_key "$ROOT_ENV" COMPOSE_FILE "$target_compose"
     chmod 600 "$ROOT_ENV"
