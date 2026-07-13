@@ -356,7 +356,7 @@ write_managed_file() {
             :
         else
 
-        ask "Overwrite existing unmanaged file $file?" n || die "Refusing to overwrite $file."
+            ask "Overwrite existing unmanaged file $file?" n || die "Refusing to overwrite $file."
         fi
     fi
     mkdir -p "$(dirname "$file")"
