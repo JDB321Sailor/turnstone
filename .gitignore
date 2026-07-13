@@ -31,6 +31,7 @@ design_ideas/
 docs/design/
 
 override.compose.yaml
+!traefik/override.compose.yaml
 traefik/config/traefik.env
 traefik/config/traefik.yaml
 traefik/config/turnstone-oidc.env
