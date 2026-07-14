@@ -31,9 +31,10 @@ design_ideas/
 docs/design/
 
 override.compose.yaml
-!traefik/override.compose.yaml
-traefik/config/traefik.env
-traefik/config/traefik.yaml
-traefik/config/turnstone-oidc.env
-traefik/dynamic/dashboard-auth.yaml
-traefik/acme/acme.json
+production/compose.yaml
+production/override.compose.yaml
+production/tls.compose.yaml
+production/Caddyfile
+production/caddy/
+production/config/
+production/searxng/
