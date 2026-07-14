@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._session_helpers import scripted_chat_client
 from turnstone.core.model_registry import (
     ModelConfig,
     ModelRegistry,
@@ -1188,8 +1189,13 @@ class TestSessionModelCommand:
         assert session.max_tokens == 2048
         assert session.reasoning_effort == "high"
 
-    def test_model_switch_none_params_reverts_to_global(self) -> None:
-        """Switching to a model with no overrides reverts to global defaults."""
+    def test_model_switch_storeless_keeps_explicit_knobs(self) -> None:
+        """On a STORE-LESS session (the CLI), the current knobs are the
+        user's explicit flags — the only authority that exists — so a
+        switch to an override-free alias keeps them (mirroring the
+        max_tokens fallback).  With a ConfigStore the shared resolvers
+        re-resolve for the new alias instead (unset → None → wire
+        omission), so per-model overrides don't leak between aliases."""
         reg = ModelRegistry(
             models={
                 "hot": ModelConfig("hot", "x", "x", "hot-model", temperature=1.5),
@@ -1198,11 +1204,15 @@ class TestSessionModelCommand:
             default="hot",
         )
         session = _make_session(registry=reg, model_alias="hot")
-        session.temperature = 1.5  # as set by per-model override
-        # Without a config_store, fallback keeps current value (CLI sessions).
-        # With a config_store, it would revert to the global default.
+        session.temperature = 0.9  # user's explicit --temperature flag
+        session.reasoning_effort = "high"  # user's explicit /reason choice
         session.handle_command("/model plain")
-        assert session.temperature == 1.5  # no config_store → keeps current
+        assert session.temperature == 0.9
+        assert session.reasoning_effort == "high"
+        # A per-model override on the TARGET alias still wins over the
+        # carried knob.
+        session.handle_command("/model hot")
+        assert session.temperature == 1.5
 
     def test_model_switch_unknown_alias(self) -> None:
         reg = ModelRegistry(
@@ -1290,18 +1300,8 @@ class TestSessionAgentModel:
         )
         session = _make_session(registry=reg, model_alias="main")
 
-        # Mock the API to capture what model was used
-        captured_model = None
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "done"
-        mock_response.choices[0].message.tool_calls = None
-        mock_response.choices[0].finish_reason = "stop"
-
-        def fake_create(**kwargs: Any) -> Any:
-            nonlocal captured_model
-            captured_model = kwargs.get("model")
-            return mock_response
+        # Scripted client records kwargs; read the model off its calls.
+        fake_create = scripted_chat_client({"content": "done"})
 
         # Get the agent client from the registry and patch it
         agent_client = reg.get_client("agent")
@@ -1312,21 +1312,21 @@ class TestSessionAgentModel:
             Turn.user("Do something."),
         ]
         session._run_agent(agent_msgs)
-        assert captured_model == "agent-model"
+        assert fake_create.calls[-1].get("model") == "agent-model"
 
     @staticmethod
     def _capture_on(client: Any) -> dict[str, Any]:
-        """Patch *client* (registry-resolved or session.client) to capture kwargs."""
+        """Patch *client* (registry-resolved or session.client) to capture kwargs.
+
+        Rides the shared scripted client; the returned dict mirrors the
+        LAST call's kwargs (existing reader contract).
+        """
         captured: dict[str, Any] = {}
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "done"
-        mock_response.choices[0].message.tool_calls = None
-        mock_response.choices[0].finish_reason = "stop"
+        scripted = scripted_chat_client({"content": "done"})
 
         def fake_create(**kwargs: Any) -> Any:
             captured.update(kwargs)
-            return mock_response
+            return scripted(**kwargs)
 
         client.chat.completions.create = fake_create
         return captured
@@ -1467,16 +1467,22 @@ class TestSessionAgentModel:
         silently dropped on the agent path."""
         reg = self._three_model_registry()  # no agent_model / plan_model set
         session = _make_session(registry=reg, model_alias="main")
-        # Probe what _run_agent passes to _provider_extra_params and
-        # _resolve_capabilities by recording the model_alias on each call.
-        captured_extra_alias: list[str | None] = []
+        # Probe the lane resolution: extra_params now resolve INSIDE
+        # resolve_lane (single config fetch) rather than via the session's
+        # pre-resolution wrapper, so spy on the module seam; capability
+        # resolution still routes through the session wrapper.
+        from unittest.mock import patch
+
+        import turnstone.core.model_turn as mt
+
+        captured_lane_alias: list[str | None] = []
         captured_resolve_alias: list[str | None] = []
-        original_extra = session._provider_extra_params
+        original_lane = mt.resolve_lane
         original_resolve = session._resolve_capabilities
 
-        def spy_extra(*args: Any, **kwargs: Any) -> Any:
-            captured_extra_alias.append(kwargs.get("model_alias"))
-            return original_extra(*args, **kwargs)
+        def spy_lane(*args: Any, **kwargs: Any) -> Any:
+            captured_lane_alias.append(kwargs.get("alias"))
+            return original_lane(*args, **kwargs)
 
         def spy_resolve(*args: Any, **kwargs: Any) -> Any:
             # _resolve_capabilities(provider, model, alias)
@@ -1484,15 +1490,15 @@ class TestSessionAgentModel:
             captured_resolve_alias.append(alias)
             return original_resolve(*args, **kwargs)
 
-        session._provider_extra_params = spy_extra  # type: ignore[method-assign]
         session._resolve_capabilities = spy_resolve  # type: ignore[method-assign]
 
         self._capture_on(session.client)  # patch client.chat.completions.create
-        session._run_agent([Turn.user("x")], label="plan")
+        with patch("turnstone.core.session.resolve_lane", side_effect=spy_lane):
+            session._run_agent([Turn.user("x")], label="plan")
 
-        assert captured_extra_alias and captured_extra_alias[-1] == "main", (
-            f"agent fallback path did not inherit primary alias for extra_params: "
-            f"{captured_extra_alias!r}"
+        assert captured_lane_alias and captured_lane_alias[-1] == "main", (
+            f"agent fallback path did not inherit primary alias for the lane: "
+            f"{captured_lane_alias!r}"
         )
         assert captured_resolve_alias and captured_resolve_alias[-1] == "main", (
             f"agent fallback path did not inherit primary alias for caps: "

@@ -26,10 +26,12 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
+from tests._session_helpers import as_stream, mock_completion_result
 from tests._session_helpers import make_session as _make_session
 from turnstone.core.providers._anthropic import AnthropicProvider
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 from turnstone.core.providers._openai_responses import OpenAIResponsesProvider
+from turnstone.core.trajectory import turns_from_dicts
 
 
 def _vllm_registry(*, replay: bool = True, alias: str = "qwen3") -> Any:
@@ -284,7 +286,7 @@ class TestReasoningFieldReachesWireBytes:
             {"role": "user", "content": "follow-up"},
         ]
 
-        provider.create_completion(
+        provider.create_streaming(
             client=client,
             model="qwen3-test",
             messages=messages,
@@ -322,7 +324,7 @@ class TestReasoningFieldReachesWireBytes:
             {"role": "user", "content": "follow-up"},
         ]
 
-        provider.create_completion(
+        provider.create_streaming(
             client=client,
             model="gpt-4o",  # canonical OpenAI, not vLLM
             messages=messages,
@@ -400,14 +402,12 @@ class TestCallSitesInvokeMaybeAttach:
 
         captured: dict[str, Any] = {}
 
-        def capture_completion(**kwargs: Any) -> Any:
+        def capture_streaming(**kwargs: Any) -> Any:
             captured.update(kwargs)
-            return SimpleNamespace(
-                content="", tool_calls=[], usage=None, raw_blocks=None, provider_blocks=None
-            )
+            return as_stream(mock_completion_result(""))
 
         provider = OpenAIChatCompletionsProvider()
-        provider.create_completion = capture_completion  # type: ignore[method-assign]
+        provider.create_streaming = capture_streaming  # type: ignore[method-assign]
         session._provider = provider
 
         with (
@@ -417,7 +417,7 @@ class TestCallSitesInvokeMaybeAttach:
             ),
         ):
             session._utility_completion(
-                messages=[_assistant_msg_with_thinking("from utility")],
+                turns_from_dicts([_assistant_msg_with_thinking("from utility")]),
             )
 
         msgs_sent = captured["messages"]

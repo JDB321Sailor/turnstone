@@ -18,6 +18,63 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Added
 
+- **One provider transport: every model call now streams (#831).**
+  The per-adapter non-streaming entry (`create_completion`) is retired;
+  single-shot lanes — judges, titles, compaction, web-fetch extraction,
+  perception, eval, optimizer — sample through the same streaming entry
+  the chat loop uses and accumulate via one shared drain, so request
+  shaping can no longer drift between the two consumption styles. Two
+  operator-visible consequences: long single-shot generations (a thinking
+  model composing a title, a slow local judge) no longer sit in a single
+  blocking read that can hit client read-timeouts — the same reason the
+  Anthropic adapter already streamed internally — and judge timeouts now
+  *abort* the underlying HTTP read instead of abandoning a worker thread
+  on a dead call. Because every call now streams, an alias pointed at a
+  model or org that cannot stream (OpenAI's verified-org streaming
+  entitlement, a gateway api-version predating `stream_options` — e.g.
+  older Azure OpenAI deployments) fails at request time where 1.7's
+  non-streaming single-shot call succeeded; remediation is on the
+  serving side (verify the org, bump the api-version/gateway) — there is
+  deliberately no per-model non-streaming fallback left to configure. These lanes are also complete-or-error now: a stream
+  that ends without any finish signal is treated as a generation that
+  died mid-response and retried, instead of storing the partial text as
+  a clean result (previously a half-generated compaction summary could
+  silently replace real history). Caveats: these lanes now carry the
+  same `stream_options: {include_usage: true}` the chat loop always
+  sent — OpenAI-compatible servers old enough to *ignore* it stop
+  producing usage rows on these lanes, and servers strict enough to
+  *reject* unknown fields (pre-2024 llama.cpp/proxy builds) will 400 —
+  such a server already couldn't serve turnstone's chat loop, but a
+  judge/utility alias pointed at one worked on 1.7 and needs to move to
+  a current server. Transient mid-stream deaths (connection drop, proxy
+  hiccup) are re-issued in place up to twice with exponential backoff —
+  the retry the SDK's request loop used to provide these lanes
+  invisibly. Each lane accepts its own terminal marker (Anthropic
+  `message_stop`, Responses terminal events); a lax server/gateway that
+  never sends any terminal signal needs
+  `{"finish_reason_optional": true}` in the model definition's
+  capabilities JSON, which restores 1.7's tolerance (clean end-of-stream
+  after output = completion) for that model on every lane — without it
+  such streams fail as died-mid-generation, because SSE gives no way to
+  tell the two apart and the default favors catching truncation. The
+  unread `supports_streaming` capability flag (and its admin tile) is
+  gone; the o-series models it described are dropped from the capability
+  table entirely (see Removed).
+
+- **One turn interface for every model call: `core/model_turn.py` (#827).**
+  Judges (intent + output guard), perception, title generation, compaction,
+  web-fetch extraction, the eval harness, the optimizer's meta lanes, and
+  task agents all advance a trajectory through the same plant-call
+  primitive the agent seam pioneered — Turn IR in, one shared lowering
+  (argument sanitize → minted-id restore → vLLM reasoning attach), one
+  shared re-ingest (blank-id repair → native-lane finalize). The judges'
+  hand-built OpenAI-dict path is gone, and with it the Gemini judge's
+  tool-blindness: evidence tools now work on Google models because the
+  native lane round-trips `thought_signature` (with pairwise repair for
+  blank-id compat responses). Provider adapters still take lowered wire
+  dicts — the transport collapse and main-loop migration are tracked as
+  #831 / #832.
+
 - **task_agent keeps its model's reasoning across its own tool loop — on
   every provider lane.** A task agent's replayed turns now carry the
   provider-native reasoning lane the model produced — Anthropic thinking
@@ -54,7 +111,65 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   itself backgrounds is still reaped when that shell exits — the no-leak
   guarantee below is unchanged.
 
+### Changed
+
+- **Sampling knobs (temperature, reasoning effort) now ride one assignment
+  scheme: per-model alias value → operator-stored global setting → the
+  model definition's declared default (effort only) → field omitted.**
+  Turnstone previously manufactured values onto every unconfigured
+  request — a hidden `temperature: 0.5` and a `reasoning_effort: "medium"`
+  baked in at three layers — overriding serving-side defaults like a vLLM
+  model's `generation_config`. Unconfigured installs now send neither
+  field and the inference engine's own defaults rule; `model.temperature`
+  is blank by default ("inherit each model's own default") and
+  `model.reasoning_effort` defaults to the empty "inherit" choice. The
+  per-model → global resolution lives in one shared resolver used by the
+  session factories, the `/model` switch, and every `model_turn` lane, so
+  the same alias samples identically on every surface. CLI
+  `--temperature` / `--reasoning-effort` likewise default to inherit.
+
+  **Upgrade notes:**
+  - The empty (`""`) reasoning-effort choice changed meaning from
+    "explicitly disable thinking" to "inherit the model/serving default".
+    On local manual-thinking models (e.g. Qwen templates with
+    `enable_thinking`), a stored `""` previously sent
+    `enable_thinking: false`; it now sends nothing, so the template's own
+    default (often thinking ON) applies. Use **`none`** to actually
+    disable reasoning.
+  - Workstreams saved by earlier versions carry the old defaults
+    (`temperature=0.5`, `reasoning_effort=medium`) in their persisted
+    config and keep that exact behavior on resume; they pick up the new
+    inherit semantics the next time you change the model or a sampling
+    knob in that workstream. New workstreams inherit from the start.
+
+### Removed
+
+- **O-series and pre-5.4 GPT-5 rows dropped from the OpenAI capability
+  table.** `o1`, `o1-mini`, `o3`, `o3-mini`, `o3-pro`, `o4-mini`,
+  `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5-pro`, `gpt-5.1`,
+  `gpt-5.1-codex-max`, `gpt-5.2`, `gpt-5.2-pro`, and `gpt-5.3` no longer
+  have built-in capability rows — OpenAI has retired these model ids
+  from the API, so the rows described contracts no request can reach
+  anymore. The table floor is now `gpt-5.4`; the search-api and
+  audio/STT/TTS rows are unchanged. An alias still pinning a retired id
+  fails at OpenAI itself; any other unlisted commercial id resolves to
+  the generic commercial defaults (temperature sent, no declared
+  reasoning-effort vocabulary, 200K window) — declare the contract on
+  the model definition's capabilities JSON if you run one, or move to a
+  current model.
+
 ### Fixed
+
+- **OpenAI Responses streaming: truncated and refused responses no longer
+  vanish.** A response that hit `max_output_tokens` terminates the stream
+  with `response.incomplete`, which the stream consumer did not handle —
+  the turn was mislabeled `finish_reason: stop` and its final usage and
+  collected output items were dropped. Refusal parts had no streaming
+  handler at all, so a refusal rendered as empty content instead of the
+  `[Refused: …]` text the non-streaming path produced. Both now match:
+  truncation maps to `length` with usage/items intact, refusals render
+  in content. Applies to the chat loop and every drained single-shot
+  lane (#831).
 
 - **task_agent: sub-tool ids no longer alias across a local model's reused
   ids.** A local model that reissues per-response sequential tool-call ids

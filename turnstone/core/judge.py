@@ -15,21 +15,24 @@ import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field, fields, replace
-from functools import partial
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.deadline import (
     DeadlineCancelledError,
     DeadlineExceededError,
-    run_with_deadline,
+    run_abortable_with_deadline,
 )
 from turnstone.core.log import get_logger
+from turnstone.core.model_turn import model_turn, resolve_capabilities, resolve_lane
+from turnstone.core.trajectory import Turn
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.model_turn import ModelTurnResult
     from turnstone.core.providers._protocol import LLMProvider, ModelCapabilities
 
 log = get_logger(__name__)
@@ -844,33 +847,6 @@ def _positive_window(*candidates: Any, floor: int = _DEFAULT_JUDGE_CONTEXT_WINDO
     return floor
 
 
-def _resolve_model_capabilities(provider: LLMProvider, model: str, cfg: Any) -> ModelCapabilities:
-    """Provider base capabilities with a model definition's ``capabilities``
-    overrides applied — the same lowering ``ChatSession._resolve_capabilities``
-    performs for the session, utility, and sub-agent completion lanes.
-
-    The judges are the only completion callers that live outside ``ChatSession``,
-    so they cannot reach ``self._resolve_capabilities``; this mirrors it so a
-    judge alias honors operator-declared capabilities (effort passthrough, tool
-    support, temperature, verbosity) exactly like the main loop.  ``cfg`` is the
-    alias's ``ModelConfig``; a missing or non-dict ``capabilities`` is ignored
-    rather than raised — capability resolution must never crash a judge turn.
-
-    It does NOT fold in ``ModelConfig.context_window``: that is a separate field,
-    not part of the capabilities JSON, and the caller sizes the judge's window
-    budget off it directly (the static caps table reports 200000 for local
-    models, which would silently over-budget them).
-    """
-    caps = provider.get_capabilities(model)
-    overrides = getattr(cfg, "capabilities", None)
-    if isinstance(overrides, dict) and overrides:
-        names = {f.name for f in fields(type(caps))}
-        applied = {k: v for k, v in overrides.items() if k in names}
-        if applied:
-            caps = replace(caps, **applied)
-    return caps
-
-
 def honest_truncate(text: str, budget: int) -> str:
     """Return *text* untouched when it fits *budget* characters, otherwise the
     leading ``budget`` characters followed by an explicit note of exactly how
@@ -1001,9 +977,16 @@ class IntentJudge:
         session_capabilities: ModelCapabilities | None = None,
         rule_registry: Any | None = None,
         model_registry: Any | None = None,
+        session_model_alias: str = "",
+        config_store: Any | None = None,
     ) -> None:
         self._config = config
         self._rule_registry = rule_registry
+        # Carried into the per-evaluation ModelLane so extra_params, the
+        # live operator flags, and the temperature ladder (per-model value →
+        # global ``model.temperature``) resolve like every other lane.
+        self._model_registry = model_registry
+        self._config_store = config_store
         # The caller (ChatSession) resolves the session model's real caps from
         # _get_capabilities (config/registry-aware) and passes them in; they are
         # this judge's wire capabilities and window when it inherits the session
@@ -1036,8 +1019,19 @@ class IntentJudge:
                         self._provider.provider_name,
                     )
                     self._model = model_name
-                    self._capabilities = _resolve_model_capabilities(
-                        self._provider, self._model, model_cfg
+                    self._alias = config.model
+                    # The shared lane resolver (model_turn) merges the alias's
+                    # capability overrides; it deliberately does NOT fold in
+                    # ModelConfig.context_window — that is a separate field,
+                    # sized into the judge's window budget right below (the
+                    # static caps table reports 200000 for local models, which
+                    # would silently over-budget them).
+                    # ``cfg=model_cfg`` reuses the config resolve() already
+                    # fetched — one lookup, one generation; a hot-reload
+                    # between two fetches cannot mix client/window with
+                    # foreign capability overrides.
+                    self._capabilities = resolve_capabilities(
+                        self._provider, self._model, config.model, model_registry, cfg=model_cfg
                     )
                     # Use the registry's per-model context window, NOT
                     # ``provider.get_capabilities().context_window``: the static
@@ -1073,6 +1067,12 @@ class IntentJudge:
                 session_provider.provider_name,
             )
             self._model = session_model
+            # Inherit the session's registry alias so the lane resolves
+            # extra_params / replay flag / vLLM attach exactly like every
+            # other lane on the same model — with alias "" (no registry
+            # alias, or a legacy caller) each registry pass degrades to its
+            # documented miss behavior, matching the pre-#827 judges.
+            self._alias = session_model_alias
             # Wire caps: the caller's resolved session caps, or the provider's
             # static table as a last resort for degraded / legacy callers.
             self._capabilities = (
@@ -1320,19 +1320,43 @@ class IntentJudge:
         except (TypeError, ValueError):
             func_args_json = honest_truncate(str(func_args), _VERDICT_ARG_CAP)
 
-        # Prepare context
-        judge_messages = self._prepare_context(item, messages)
+        # Prepare context (Turn IR — lowered per call inside model_turn)
+        judge_turns = self._prepare_context(item, messages)
 
         # Prepare tools (only if read_only_tools enabled).
-        # Pass raw OpenAI-format schemas — create_completion handles conversion.
-        # Google's API requires thought_signature in function call round-trips
-        # which our normalized tool_calls don't preserve, so skip tools for Google.
+        # Raw OpenAI-format schemas — the provider adapter converts them.
+        # These are γ-side instruments, deliberately OUTSIDE the persona
+        # envelope: middle-rank config must not be able to blind the gate's
+        # evidence gathering.  The old provider_name == "google" skip is gone:
+        # the judge's trajectory now carries the provider-native lane
+        # (thought_signature rides ``provider_blocks`` and is reconstructed by
+        # the Google adapter), so the Gemini judge runs the same evidence loop
+        # as every other provider.
         tools: list[dict[str, Any]] | None = None
-        if self._config.read_only_tools and self._provider.provider_name != "google":
+        if self._config.read_only_tools:
             tools = list(_JUDGE_TOOL_SCHEMAS)
 
+        # The judge's resolved lane for this evaluation: fresh client per run
+        # (thread isolation), extra_params / live flags / temperature ladder
+        # from the registry like every other lane.  Capabilities are
+        # DELIBERATELY the constructor-frozen set (not re-resolved here):
+        # the judge's window budget was sized against them at construction,
+        # and the session swaps the whole judge on model/credential change —
+        # an in-place capabilities edit to the same alias applies on the
+        # next judge swap, keeping caps and window from ever disagreeing
+        # within one judge lifetime.
+        lane = resolve_lane(
+            self._provider,
+            client,
+            self._model,
+            alias=self._alias,
+            registry=self._model_registry,
+            capabilities=self._capabilities,
+            config_store=self._config_store,
+        )
+
         # Multi-turn judge loop
-        result = None  # will hold the last CompletionResult
+        result = None  # will hold the last ModelTurnResult
         empty_retries = 0  # track consecutive empty responses for retry
         turn = 0
 
@@ -1352,15 +1376,12 @@ class IntentJudge:
             # On the last turn, strip tools and inject a forcing message
             # so the model knows it must render a verdict now.
             if is_last_turn:
-                judge_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "You have gathered enough evidence. "
-                            "You MUST now render your final verdict as JSON. "
-                            "No more tool calls."
-                        ),
-                    }
+                judge_turns.append(
+                    Turn.user(
+                        "You have gathered enough evidence. "
+                        "You MUST now render your final verdict as JSON. "
+                        "No more tool calls."
+                    )
                 )
 
             # Per-turn timeout: each turn gets a fresh budget so local
@@ -1372,24 +1393,30 @@ class IntentJudge:
                 # non-daemon thread that would block interpreter exit — the old
                 # single-slot ThreadPoolExecutor left a stuck worker that
                 # poisoned the pool, which is why the restart dance existed.
-                result = run_with_deadline(
-                    partial(
-                        self._provider.create_completion,
-                        client=client,
-                        model=self._model,
-                        messages=judge_messages,
-                        tools=None if is_last_turn else tools,
+                # The abort wiring (fresh ref per turn) closes the abandoned
+                # worker's HTTP stream so the read raises promptly.
+                # Temperature is deliberately NOT pinned (house rule): the
+                # lane inherits the judge model's configured temperature —
+                # many modern models misbehave below 1.0, so the model's own
+                # configuration beats a hard determinism pin.
+                turn_tools = None if is_last_turn else tools
+
+                # Bound default: the call runs synchronously within this
+                # iteration; the binding makes the per-turn capture explicit
+                # (and satisfies B023 in the loop).
+                def _sample(
+                    ref: StreamAbortRef, _tools: list[dict[str, Any]] | None = turn_tools
+                ) -> ModelTurnResult:
+                    return model_turn(
+                        lane,
+                        judge_turns,
+                        tools=_tools,
                         max_tokens=2048,
-                        temperature=0.0,
-                        reasoning_effort="medium",
-                        # Thread the judge model's operator-declared capabilities
-                        # onto the wire like every other lane — resolved from the
-                        # judge alias's model definition, or the session model on
-                        # fallback.  Without this the provider would fall back to
-                        # its static capability table and silently ignore the
-                        # definition's overrides on judge calls alone.
-                        capabilities=self._capabilities,
-                    ),
+                        cancel_ref=ref,
+                    )
+
+                result = run_abortable_with_deadline(
+                    _sample,
                     timeout=per_call_timeout,
                     cancel_event=cancel_event,
                     thread_name="judge-api",
@@ -1431,14 +1458,14 @@ class IntentJudge:
 
             # Check for tool calls
             if result.tool_calls:
-                # Execute read-only tools and append results
-                judge_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": result.content or None,
-                        "tool_calls": result.tool_calls,
-                    }
-                )
+                # Append the assistant turn — the native lane rides along
+                # (Gemini thought_signature, Anthropic thinking, Responses
+                # reasoning items), so the next lowering replays it and the
+                # evidence loop keeps its reasoning continuity.  The judge
+                # never mints ids: its trajectory is ephemeral and pinned to
+                # one provider, so provider-original ids stay consistent
+                # between the native blocks, the mirror, and the results.
+                judge_turns.append(result.turn)
                 for tc in result.tool_calls:
                     tc_func = tc.get("function", {})
                     tc_name = tc_func.get("name", "")
@@ -1451,13 +1478,7 @@ class IntentJudge:
                         tc_args = {}
 
                     tool_result = self._exec_read_only_tool(tc_name, tc_args)
-                    judge_messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tc.get("id", ""),
-                            "content": tool_result,
-                        }
-                    )
+                    judge_turns.append(Turn.tool(tc.get("id", ""), tool_result))
                 turn += 1
                 continue
 
@@ -1486,15 +1507,12 @@ class IntentJudge:
                     )
                     return None
                 # On earlier turns, inject a nudge and continue
-                judge_messages.append({"role": "assistant", "content": result.content})
-                judge_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "Your response was not valid JSON. "
-                            "Please respond ONLY with the JSON verdict object."
-                        ),
-                    }
+                judge_turns.append(result.turn)
+                judge_turns.append(
+                    Turn.user(
+                        "Your response was not valid JSON. "
+                        "Please respond ONLY with the JSON verdict object."
+                    )
                 )
                 turn += 1
                 continue
@@ -1511,15 +1529,12 @@ class IntentJudge:
             empty_retries += 1
             if empty_retries <= 3:
                 log.info("judge.empty_response.retry", retry=empty_retries, max_retries=3)
-                judge_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "You returned an empty response. "
-                            "Please analyze the tool call and respond with "
-                            "the JSON verdict object."
-                        ),
-                    }
+                judge_turns.append(
+                    Turn.user(
+                        "You returned an empty response. "
+                        "Please analyze the tool call and respond with "
+                        "the JSON verdict object."
+                    )
                 )
                 continue
             log.info("judge.empty_response.giving_up", retries=empty_retries)
@@ -1551,8 +1566,17 @@ class IntentJudge:
         self,
         item: dict[str, Any],
         messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """Build the judge's message list with FIFO-truncated conversation."""
+    ) -> list[Turn]:
+        """Build the judge's opening trajectory with FIFO-truncated conversation.
+
+        *messages* is the session's wire-dict history (read-only input: the
+        judge observes the session, it does not join it); the output is Turn
+        IR — the judge's own ephemeral trajectory, lowered per call by
+        ``model_turn``.  The flattened single-user-message transcript is the
+        judge's deliberate π-projection, not a lowering artifact: the judge
+        evaluates a projection of the conversation, and strict providers
+        reject the raw multi-turn role sequence out of context.
+        """
         # Build user message with tool call details
         func_name = item.get("func_name", item.get("name", ""))
         func_args = item.get("func_args", {})
@@ -1637,18 +1661,15 @@ class IntentJudge:
         transcript = "\n\n".join(transcript_lines)
 
         return [
-            {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": (
-                    f"Conversation context:\n\n{transcript}\n\n"
-                    "---\n\n"
-                    "Please evaluate the following tool call that is "
-                    "pending human approval:\n\n"
-                    f"{tool_detail}\n\n"
-                    "Render your verdict as JSON."
-                ),
-            },
+            Turn.system(_JUDGE_SYSTEM_PROMPT),
+            Turn.user(
+                f"Conversation context:\n\n{transcript}\n\n"
+                "---\n\n"
+                "Please evaluate the following tool call that is "
+                "pending human approval:\n\n"
+                f"{tool_detail}\n\n"
+                "Render your verdict as JSON."
+            ),
         ]
 
     # Paths the judge is never allowed to read (security hardening).

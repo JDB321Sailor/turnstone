@@ -30,12 +30,10 @@
     }
   ],
   "model": "gpt-4o-mini",
-  "reasoning_effort": "medium",
   "stream": true,
   "stream_options": {
     "include_usage": true
   },
-  "temperature": 0.5,
   "tools": [
     {
       "function": {

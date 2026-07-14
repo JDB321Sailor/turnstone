@@ -55,15 +55,17 @@ def _build_registry() -> dict[str, SettingDef]:
         SettingDef(
             "model.temperature",
             "float",
-            0.5,
-            "Default sampling temperature (overridden by per-model settings)",
+            None,
+            "Global sampling temperature (empty = inherit each model's own default)",
             "model",
             min_value=0.0,
             max_value=2.0,
-            help="Default sampling temperature for models without a per-model override. "
-            "Controls randomness in responses. Lower values (0.0\u20130.3) give focused, "
-            "deterministic output; higher values (0.7\u20131.5) make responses more creative "
-            "and varied. Per-model overrides can be set in the Models tab.",
+            help="Global sampling temperature for models without a per-model override. "
+            "When empty (the default), the request omits the field entirely and the "
+            "model's own serving default applies \u2014 recommended for modern models, "
+            "which ship tuned sampling defaults and often reject explicit values. "
+            "Set a number only to force one temperature everywhere; per-model "
+            "overrides can be set in the Models tab.",
             reference_url="https://arxiv.org/abs/1904.09751",
         ),
         SettingDef(
@@ -80,14 +82,17 @@ def _build_registry() -> dict[str, SettingDef]:
         SettingDef(
             "model.reasoning_effort",
             "str",
-            "medium",
-            "Default reasoning effort (overridden by per-model settings)",
+            "",
+            "Global reasoning effort (empty = inherit each model's own default)",
             "model",
             choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
-            help="Default reasoning effort for models without a per-model override. "
+            help="Global reasoning effort for models without a per-model override. "
             "Controls how much internal \u2018thinking\u2019 the model does before responding. "
-            "Higher effort improves quality on complex tasks but is slower and uses more "
-            "tokens. Per-model overrides can be set in the Models tab.",
+            "When empty (the default), each model's own declared or serving-side "
+            "default applies. \u2018none\u2019 explicitly disables reasoning where the model "
+            "supports that; higher effort improves quality on complex tasks but is "
+            "slower and uses more tokens. Per-model overrides can be set in the "
+            "Models tab.",
         ),
         SettingDef(
             "model.task_alias",
@@ -826,16 +831,16 @@ def _build_registry() -> dict[str, SettingDef]:
         SettingDef(
             "coordinator.reasoning_effort",
             "str",
-            "medium",
+            "",
             "Reasoning effort for coordinator sessions (empty = inherit from model.reasoning_effort)",
             "coordinator",
             choices=["", "none", "minimal", "low", "medium", "high", "xhigh", "max"],
-            help="Reasoning effort for coordinator sessions. Coordinators benefit from "
-            "medium-or-higher effort when juggling multiple child workstreams. Use "
-            "'low' only when your coordinator handles simple, one-off dispatch "
-            "workflows. (Empty here means “inherit” — the per-model "
-            "override on the alias wins, otherwise model.reasoning_effort. Use "
-            "‘none’ to actually disable reasoning.)",
+            help="Reasoning effort for coordinator sessions. When empty (the default), "
+            "coordinators inherit like every other lane: the per-model override on "
+            "the alias wins, then model.reasoning_effort, then the model's own "
+            "declared or serving-side default. Coordinators juggling many child "
+            "workstreams often benefit from an explicit medium-or-higher value here. "
+            "Use ‘none’ to actually disable reasoning.",
         ),
         SettingDef(
             "coordinator.max_active",

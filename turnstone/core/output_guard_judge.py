@@ -13,7 +13,7 @@ Design:
   already in hand.
 - JSON-in-content verdict.  4-strategy parser inlined from
   :meth:`IntentJudge._parse_verdict`.
-- Wall-clock deadline via :func:`turnstone.core.deadline.run_with_deadline`,
+- Wall-clock deadline via :func:`turnstone.core.deadline.run_abortable_with_deadline`,
   which runs the call on a *daemon* worker and polls the cancel event each
   second.  A timeout or cancel abandons the call rather than waiting it out,
   and the daemon worker can never block process or interpreter exit — unlike
@@ -46,14 +46,15 @@ from turnstone.core import fence
 from turnstone.core.deadline import (
     DeadlineCancelledError,
     DeadlineExceededError,
-    run_with_deadline,
+    run_abortable_with_deadline,
 )
 from turnstone.core.judge import (
     _CHARS_PER_TOKEN,
     _positive_window,
-    _resolve_model_capabilities,
 )
 from turnstone.core.log import get_logger
+from turnstone.core.model_turn import model_turn, resolve_capabilities, resolve_lane
+from turnstone.core.trajectory import Turn
 
 if TYPE_CHECKING:
     import threading
@@ -268,8 +269,15 @@ class OutputGuardJudge:
         session_model: str,
         model_registry: Any | None = None,
         session_capabilities: ModelCapabilities | None = None,
+        session_model_alias: str = "",
+        config_store: Any | None = None,
     ) -> None:
         self._config = config
+        # Carried into the per-evaluation ModelLane so extra_params, the
+        # live operator flags, and the temperature ladder resolve from the
+        # registry like every other lane.
+        self._model_registry = model_registry
+        self._config_store = config_store
         # Caller's resolved session-model caps (config/registry-aware): the wire
         # capabilities + window when this judge inherits the session model, and
         # the alias path's window fallback.  The window comes ONLY from these
@@ -303,8 +311,17 @@ class OutputGuardJudge:
                     )
                     self._model = model_name
                     self._judge_model_alias = config.output_guard_model
-                    self._capabilities = _resolve_model_capabilities(
-                        self._provider, self._model, model_cfg
+                    self._lane_alias = config.output_guard_model
+                    # Shared lane resolver (model_turn); ModelConfig.context_window
+                    # stays separate and is sized into the guard window below.
+                    # ``cfg=model_cfg`` reuses the config resolve() already
+                    # fetched — one lookup, one generation.
+                    self._capabilities = resolve_capabilities(
+                        self._provider,
+                        self._model,
+                        config.output_guard_model,
+                        model_registry,
+                        cfg=model_cfg,
                     )
                     self._judge_context_window = _positive_window(
                         getattr(model_cfg, "context_window", None),
@@ -331,7 +348,18 @@ class OutputGuardJudge:
                 session_client, session_provider.provider_name
             )
             self._model = session_model
+            # AUDIT label keeps its pre-#827 fallback semantics: "" here so
+            # recorded verdicts show ``judge_model = self._model`` (the raw
+            # model id), not the session alias — threading the alias into
+            # this field would silently change recorded judge_model values
+            # across the upgrade on default-config installs.
             self._judge_model_alias = ""
+            # LANE alias inherits the session's registry alias so the lane
+            # resolves extra_params / replay flag / temperature exactly like
+            # every other lane on the same model (see IntentJudge's fallback
+            # for the rationale).  Lane resolution and audit labeling are
+            # different roles — hence two fields.
+            self._lane_alias = session_model_alias
             # Wire caps: the caller's resolved session caps, or the provider's
             # static table as a last resort for degraded / legacy callers.
             self._capabilities = (
@@ -428,7 +456,7 @@ class OutputGuardJudge:
         field leave it at its default — the prompt skips empty sections.
 
         Timeout enforcement is real wall-clock: the upstream call runs on a
-        daemon worker via :func:`~turnstone.core.deadline.run_with_deadline`
+        daemon worker via :func:`~turnstone.core.deadline.run_abortable_with_deadline`
         and is abandoned on the timeout / cancel path, so a hung upstream LLM
         call neither blocks return nor pins interpreter exit.
         """
@@ -442,11 +470,10 @@ class OutputGuardJudge:
         start = time.monotonic()
         verdict_id = uuid.uuid4().hex
         timeout = max(self._config.output_guard_llm_timeout, 1.0)
-        judge_messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": self._user_prompt(
+        judge_turns = [
+            Turn.system(_SYSTEM_PROMPT),
+            Turn.user(
+                self._user_prompt(
                     output,
                     func_name=func_name,
                     tool_description=tool_description,
@@ -454,8 +481,8 @@ class OutputGuardJudge:
                     heuristic_risk=heuristic_risk,
                     heuristic_flags=heuristic_flags,
                     heuristic_annotations=heuristic_annotations,
-                ),
-            },
+                )
+            ),
         ]
 
         # Oversize guard.  The heuristic stage has already run and its verdict
@@ -466,7 +493,7 @@ class OutputGuardJudge:
         # warning, and return a LABELLED error verdict so the skip surfaces as a
         # distinct ``llm_error`` audit row (reason = "output_too_large…") the
         # operator can see, rather than a silent no-op.
-        prompt_chars = sum(len(str(m["content"])) for m in judge_messages)
+        prompt_chars = sum(len(t.text) for t in judge_turns)
         est_tokens = int(prompt_chars / _CHARS_PER_TOKEN)
         if est_tokens > self._judge_context_window * _MAX_PROMPT_RATIO:
             log.warning(
@@ -499,20 +526,38 @@ class OutputGuardJudge:
         # worker is non-daemon, and concurrent.futures joins it from an atexit
         # hook regardless of shutdown(wait=False) — so a wedged upstream call
         # would otherwise hang shutdown.)
+        # Single-shot lane: constructor-frozen capabilities (window-coupled,
+        # refreshed on judge swap — see IntentJudge's lane note), extra_params
+        # / live flags / temperature ladder from the registry like every
+        # other lane.  ``_lane_alias``, not the audit label.
+        lane = resolve_lane(
+            self._provider,
+            client,
+            self._model,
+            alias=self._lane_alias,
+            registry=self._model_registry,
+            capabilities=self._capabilities,
+            config_store=self._config_store,
+        )
+        # Sampling deliberately not pinned (house rule) — the lane inherits
+        # the guard model's full assignment scheme, effort included: a
+        # code-chosen effort is an unvetted token on local vocabularies
+        # and can flip template thinking toggles the operator never
+        # engaged.  On a thinking model whose effort the operator leaves
+        # unbounded, a pass that consumes the whole 512-token cap parses
+        # to a labelled llm_error verdict (heuristic tier stands) — the
+        # remediation is an effort value on the guard's model alias.
+        # The abort wiring closes the abandoned worker's HTTP stream on the
+        # timeout/cancel paths so the daemon thread exits promptly instead
+        # of blocking on the read until the upstream's next chunk.
         try:
-            result = run_with_deadline(
-                lambda: self._provider.create_completion(
-                    client=client,
-                    model=self._model,
-                    messages=judge_messages,
+            result = run_abortable_with_deadline(
+                lambda ref: model_turn(
+                    lane,
+                    judge_turns,
                     tools=None,
                     max_tokens=512,
-                    temperature=0.0,
-                    reasoning_effort="low",
-                    # Operator-declared capabilities reach the wire like every
-                    # other lane — from the output_guard alias's definition, or
-                    # the session model on fallback.  See IntentJudge for why.
-                    capabilities=self._capabilities,
+                    cancel_ref=ref,
                 ),
                 timeout=timeout,
                 cancel_event=cancel_event,

@@ -1,14 +1,16 @@
-"""Tests for ChatSession synthetic ``reasoning_text`` block stamping (Phase 3 path 3).
+"""Tests for the synthetic ``reasoning_text`` block stamping (Phase 3 path 3).
 
 Path 3 covers OpenAI Chat Completions endpoints — vLLM with
 ``--reasoning-parser``, llama.cpp with ``reasoning_format``, Gemini's
 ``/v1beta/openai/`` endpoint, and any other server that surfaces
 ``delta.reasoning_content`` Pydantic extras.  These have no native
-provider_blocks shape on the wire, so ``ChatSession._stream_response``
-captures the streamed reasoning text into ``reasoning_parts`` and
-``_maybe_synth_reasoning_block`` stamps it onto ``_provider_content``
-as a synthetic ``{type: "reasoning_text"}`` block at the end of the
-turn.
+provider_blocks shape on the wire, so the captured reasoning text is
+stamped onto ``_provider_content`` as a synthetic
+``{type: "reasoning_text"}`` block at the end of the turn by
+``model_turn.synth_reasoning_block`` — the one synthesizer every lane
+runs (the main loop reaches it through ``ChatSession._stream_response``
+→ ``_finalize_provider_blocks``; agents and judges through
+``model_turn``).
 
 These tests pin:
 1. The synthesizer fires only when no native blocks were emitted AND
@@ -28,6 +30,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from tests._session_helpers import make_session as _make_session
+from turnstone.core.model_turn import _server_type_of, synth_reasoning_block
 from turnstone.core.providers._anthropic import (
     ANTHROPIC_VALID_BLOCK_TYPES,
     AnthropicProvider,
@@ -35,63 +38,53 @@ from turnstone.core.providers._anthropic import (
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
 
 
-class TestMaybeSynthReasoningBlock:
-    """Direct unit tests for ``ChatSession._maybe_synth_reasoning_block``."""
+class TestSynthReasoningBlock:
+    """Direct unit tests for ``model_turn.synth_reasoning_block`` — the one
+    synthesizer every lane runs (main loop via the session's finalize
+    wrapper; agents and judges via ``model_turn``)."""
 
     def test_no_synth_when_provider_blocks_present(self) -> None:
         # Anthropic / OpenAI Responses path — native blocks already
         # carry the reasoning, no synth needed.
-        session = _make_session()
         existing = [{"type": "thinking", "thinking": "x"}]
-        out = session._maybe_synth_reasoning_block(existing, ["should not be added"])
+        out = synth_reasoning_block(existing, ["should not be added"])
         assert out is existing
 
     def test_no_synth_when_reasoning_parts_empty(self) -> None:
-        session = _make_session()
-        out = session._maybe_synth_reasoning_block([], [])
-        assert out == []
+        assert synth_reasoning_block([], []) == []
 
     def test_no_synth_when_reasoning_parts_only_whitespace(self) -> None:
-        session = _make_session()
-        out = session._maybe_synth_reasoning_block([], ["   ", "\n\t"])
-        assert out == []
+        assert synth_reasoning_block([], ["   ", "\n\t"]) == []
 
     def test_synth_creates_reasoning_text_block(self) -> None:
-        session = _make_session()
-        out = session._maybe_synth_reasoning_block([], ["thought ", "process"])
+        out = synth_reasoning_block([], ["thought ", "process"])
         assert len(out) == 1
         assert out[0]["type"] == "reasoning_text"
         assert out[0]["text"] == "thought process"
 
     def test_synth_omits_source_when_no_server_type(self) -> None:
-        session = _make_session()
         # No registry / no server_compat → source field omitted.
-        out = session._maybe_synth_reasoning_block([], ["text"])
+        out = synth_reasoning_block([], ["text"])
         assert "source" not in out[0]
 
     def test_synth_includes_source_when_server_type_resolvable(self) -> None:
-        session = _make_session()
-        session._registry = SimpleNamespace(
+        registry = SimpleNamespace(
             get_config=lambda alias: SimpleNamespace(
                 capabilities={},
                 server_compat={"server_type": "vllm"},
             )
         )
-        session._model_alias = "qwen3-32b"
-        out = session._maybe_synth_reasoning_block([], ["text"])
+        out = synth_reasoning_block([], ["text"], registry=registry, alias="qwen3-32b")
         assert out[0]["source"] == "vllm"
 
     def test_synth_handles_registry_exception(self) -> None:
-        # _resolve_server_type silently returns "" on any lookup error
+        # The defensive config fetch degrades to None on any lookup error
         # — synth still fires but omits the source field.
         class BrokenRegistry:
             def get_config(self, alias: str) -> Any:
                 raise KeyError(alias)
 
-        session = _make_session()
-        session._registry = BrokenRegistry()
-        session._model_alias = "missing"
-        out = session._maybe_synth_reasoning_block([], ["text"])
+        out = synth_reasoning_block([], ["text"], registry=BrokenRegistry(), alias="missing")
         assert out[0]["text"] == "text"
         assert "source" not in out[0]
 
@@ -102,7 +95,6 @@ class TestMaybeSynthReasoningBlock:
         # content extra), the synthesizer must APPEND the synthetic
         # reasoning block rather than skip synthesis — otherwise the
         # reasoning text is shown live but lost on page reload.
-        session = _make_session()
         existing = [
             {
                 "id": "call_1",
@@ -111,7 +103,7 @@ class TestMaybeSynthReasoningBlock:
                 "thought_signature": "sig123",
             }
         ]
-        out = session._maybe_synth_reasoning_block(existing, ["I should search"])
+        out = synth_reasoning_block(existing, ["I should search"])
         assert len(out) == 2
         assert out[0] is existing[0]  # tool_call fidelity block survives intact
         assert out[1]["type"] == "reasoning_text"
@@ -122,21 +114,19 @@ class TestMaybeSynthReasoningBlock:
         # even though provider_blocks contains ALSO non-reasoning items
         # (e.g. message blocks).  The reasoning-bearing block satisfies
         # the persistence contract on its own.
-        session = _make_session()
         existing = [
             {"type": "reasoning", "summary": [{"text": "openai reasoning"}]},
             {"type": "message", "role": "assistant", "content": "answer"},
         ]
-        out = session._maybe_synth_reasoning_block(existing, ["live reasoning text"])
+        out = synth_reasoning_block(existing, ["live reasoning text"])
         assert out is existing
 
     def test_no_synth_when_non_reasoning_blocks_but_reasoning_parts_empty(self) -> None:
         # Google tool_calls with no reasoning streamed — return as-is.
-        session = _make_session()
         existing = [
             {"id": "call_1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
         ]
-        out = session._maybe_synth_reasoning_block(existing, [])
+        out = synth_reasoning_block(existing, [])
         assert out is existing
 
 
@@ -224,10 +214,11 @@ class TestStreamResponseSynthBlockIntegration:
     """Integration test: drives a fake reasoning-emitting stream
     through ``ChatSession._stream_response`` and asserts the
     synthesizer wires up correctly.  Pins the call site at
-    ``session.py`` (where ``_maybe_synth_reasoning_block`` is invoked
-    on the assembled provider_blocks before stamping ``_provider_content``)
-    — without this, a future refactor that drops the synthesizer call
-    would silently break path-3 capture (vLLM/llama.cpp/Gemini-compat
+    ``session.py`` (where ``model_turn.synth_reasoning_block`` is
+    invoked — via ``_finalize_provider_blocks`` — on the assembled
+    provider_blocks before stamping ``_provider_content``) — without
+    this, a future refactor that drops the synthesizer call would
+    silently break path-3 capture (vLLM/llama.cpp/Gemini-compat
     reasoning would be visible live but invisible on history reload).
     """
 
@@ -309,58 +300,32 @@ class TestStreamResponseSynthBlockIntegration:
         assert provider_content[0]["source"] == "vllm"
 
 
-class TestResolveServerType:
-    """Direct unit tests for the helper that pulls server_type from
-    the active model's capabilities dict."""
+class TestServerTypeOf:
+    """Direct unit tests for ``model_turn._server_type_of``, the one
+    reader of ``server_compat.server_type`` (the Phase 5 vLLM gate and
+    the synth-block source tagging both go through it)."""
 
-    def test_returns_empty_when_no_registry(self) -> None:
-        session = _make_session()
-        session._registry = None
-        assert session._resolve_server_type() == ""
-
-    def test_returns_empty_when_no_alias(self) -> None:
-        session = _make_session()
-        session._registry = SimpleNamespace(
-            get_config=lambda alias: SimpleNamespace(capabilities={}, server_compat={})
-        )
-        session._model_alias = ""
-        assert session._resolve_server_type() == ""
-
-    def test_returns_server_type_when_present(self) -> None:
+    def test_reads_server_type_when_present(self) -> None:
         # Mirrors production ModelConfig shape: server_compat lives at
         # the top-level dataclass field, NOT inside capabilities.  Both
         # model_registry loader paths pop("server_compat") out of caps
         # before construction (see model_registry.py:401, 485).
-        session = _make_session()
-        session._registry = SimpleNamespace(
-            get_config=lambda alias: SimpleNamespace(
-                capabilities={},
-                server_compat={"server_type": "llama.cpp"},
-            )
+        cfg = SimpleNamespace(
+            capabilities={},
+            server_compat={"server_type": "llama.cpp"},
         )
-        session._model_alias = "local-model"
-        assert session._resolve_server_type() == "llama.cpp"
+        assert _server_type_of(cfg) == "llama.cpp"
 
     def test_returns_empty_when_server_compat_missing(self) -> None:
-        session = _make_session()
-        session._registry = SimpleNamespace(
-            get_config=lambda alias: SimpleNamespace(
-                capabilities={"context_window": 32768},
-                server_compat={},
-            )
+        cfg = SimpleNamespace(
+            capabilities={"context_window": 32768},
+            server_compat={},
         )
-        session._model_alias = "local-model"
-        assert session._resolve_server_type() == ""
+        assert _server_type_of(cfg) == ""
 
-    def test_returns_empty_on_exception(self) -> None:
-        class BrokenRegistry:
-            def get_config(self, alias: str) -> Any:
-                raise RuntimeError("boom")
-
-        session = _make_session()
-        session._registry = BrokenRegistry()
-        session._model_alias = "x"
-        assert session._resolve_server_type() == ""
+    def test_returns_empty_on_non_dict_server_compat(self) -> None:
+        assert _server_type_of(SimpleNamespace(server_compat=None)) == ""
+        assert _server_type_of(SimpleNamespace()) == ""
 
 
 class TestFinalizeProviderBlocks:

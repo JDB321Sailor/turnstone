@@ -260,7 +260,7 @@ def _make_provider_factory(module_path: str, class_name: str) -> Callable[[], LL
 #   (present when ``include=["reasoning.encrypted_content"]`` is
 #   requested AND the response carries raw reasoning text).
 # * ``"reasoning_text"`` — synthetic, stamped by
-#   ``ChatSession._maybe_synth_reasoning_block`` for Chat Completions
+#   ``model_turn.synth_reasoning_block`` for Chat Completions
 #   paths (vLLM, llama.cpp, Gemini-compat) where reasoning surfaces
 #   only as ``reasoning_delta`` chunks with no native block shape.
 _anthropic_factory = _make_provider_factory(
@@ -387,8 +387,8 @@ def attach_vllm_chat_reasoning_field(
     All three gates (provider isinstance, ``server_type == "vllm"``,
     operator flag ``replay_reasoning_to_model``) MUST be checked by the
     caller — this helper assumes the decision has already been made.
-    See ``ChatSession._maybe_attach_vllm_chat_reasoning`` for the
-    integration point.
+    See ``model_turn.maybe_attach_vllm_chat_reasoning`` for the
+    integration point (every lane routes through it).
     """
     out: list[dict[str, Any]] = []
     for msg in messages:
