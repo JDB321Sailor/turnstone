@@ -278,7 +278,7 @@ section_tls() {
     CF_TOKEN=""
     AWS_KEY_ID=""
     AWS_SECRET=""
-    DUCKDNS_TOKEN=""
+    DUCKDNS_TOKEN_VAL=""
 
     if ask "Enable TLS (mutual TLS between Turnstone services)?" TURNSTONE_SETUP_TLS n; then
         MTLS_ENABLED=1
@@ -301,7 +301,7 @@ section_tls() {
             prompt_value AWS_SECRET TURNSTONE_SETUP_AWS_SECRET_ACCESS_KEY "AWS secret access key"
             ;;
         duckdns)
-            prompt_value DUCKDNS_TOKEN TURNSTONE_SETUP_DUCKDNS_TOKEN "Duck DNS API token"
+            prompt_value DUCKDNS_TOKEN_VAL TURNSTONE_SETUP_DUCKDNS_TOKEN "Duck DNS API token"
             ;;
     esac
 }
@@ -484,7 +484,7 @@ write_env_file() {
                     echo "AWS_ACCESS_KEY_ID=$AWS_KEY_ID"
                     echo "AWS_SECRET_ACCESS_KEY=$AWS_SECRET"
                     ;;
-                duckdns) echo "DUCKDNS_API_TOKEN=$DUCKDNS_TOKEN" ;;
+                duckdns) echo "DUCKDNS_API_TOKEN=$DUCKDNS_TOKEN_VAL" ;;
             esac
         fi
         if [ "$LLM_ENABLED" = 1 ]; then
