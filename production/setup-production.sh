@@ -304,6 +304,14 @@ section_tls() {
             prompt_value DUCKDNS_TOKEN_VAL TURNSTONE_SETUP_DUCKDNS_TOKEN "Duck DNS API token"
             ;;
     esac
+
+    # The public-DNS path builds a local Caddy image with the DNS plugin.
+    # Compose builds with buildx when available; without it, it falls back
+    # to the deprecated classic builder (slower, prints a WARN, and will be
+    # removed in a future Docker release).
+    if ! docker buildx version >/dev/null 2>&1; then
+        warn "the Docker buildx plugin is not installed; 'docker compose up' will fall back to the legacy builder to build the Caddy DNS image. Install docker-buildx-plugin to silence the compose WARN: https://docs.docker.com/build/install-buildx/"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -440,10 +448,15 @@ EOF
             done
         fi
         if [ "$PUBLIC_DNS_ENABLED" = 1 ]; then
+            # pull_policy: build — the image only exists locally (built from
+            # ./caddy). Without it, `docker compose up` first tries to pull
+            # the tag from a registry and prints a confusing
+            # "pull access denied for turnstone-caddy" error.
             cat <<'EOF'
   caddy:
     build: ./caddy
     image: turnstone-caddy:dns
+    pull_policy: build
     ports:
       - "80:80"
 EOF
