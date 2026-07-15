@@ -31,6 +31,12 @@ OUT_CONFIG_DIR="$SCRIPT_DIR/config"
 OUT_OIDC_ENV="$OUT_CONFIG_DIR/turnstone-oidc.env"
 OUT_SEARXNG_DIR="$SCRIPT_DIR/searxng"
 OUT_ENV="$SCRIPT_DIR/.env"
+OUT_ANSWERS="$SCRIPT_DIR/setup-production.env"
+
+# Persistent answers file state. load_answers_file() sets AUTORUN from the
+# file; write_answers_file() preserves it unchanged after a run.
+AUTORUN="false"
+declare -A _ANSWERS  # populated by each prompt helper during the run
 
 IMAGE_REPO_API="https://api.github.com/repos/turnstonelabs/turnstone"
 
@@ -44,6 +50,8 @@ info() { printf '%s==>%s %s\n' "$GREEN" "$RESET" "$*"; }
 warn() { printf '%swarning:%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
 die() { printf '%serror:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+# Returns true when the script must not attempt interactive prompts.
+_no_tty() { [ "$AUTORUN" = "true" ] || [ ! -r /dev/tty ]; }
 
 on_error() {
     local rc=$?
@@ -59,30 +67,41 @@ trap on_error ERR
 ask() {
     local prompt="$1" envvar="$2" default="${3:-y}" ans hint
     if [ -n "$envvar" ] && [[ -v $envvar ]]; then
-        case "${!envvar}" in [Yy]*|1|true|TRUE) return 0 ;; *) return 1 ;; esac
+        case "${!envvar}" in
+            [Yy]*|1|true|TRUE) _ANSWERS["$envvar"]="y"; return 0 ;;
+            *)                  _ANSWERS["$envvar"]="n"; return 1 ;;
+        esac
     fi
     [ "$default" = y ] && hint="Y/n" || hint="y/N"
-    if [ ! -r /dev/tty ]; then
+    if _no_tty; then
         warn "non-interactive shell; assuming '$default' for: $prompt"
-        [ "$default" = y ]
-        return
+        if [ "$default" = y ]; then
+            [ -n "$envvar" ] && _ANSWERS["$envvar"]="y"; return 0
+        else
+            [ -n "$envvar" ] && _ANSWERS["$envvar"]="n"; return 1
+        fi
     fi
     printf '%s%s%s [%s] ' "$BOLD" "$prompt" "$RESET" "$hint" >/dev/tty
     read -r ans </dev/tty || ans=""
     ans="${ans:-$default}"
-    case "$ans" in [Yy]*) return 0 ;; *) return 1 ;; esac
+    case "$ans" in
+        [Yy]*) [ -n "$envvar" ] && _ANSWERS["$envvar"]="y"; return 0 ;;
+        *)     [ -n "$envvar" ] && _ANSWERS["$envvar"]="n"; return 1 ;;
+    esac
 }
 
 prompt_value() {
     local outvar="$1" envvar="$2" prompt="$3" default="${4:-}" value=""
     if [ -n "$envvar" ] && [[ -v $envvar ]]; then
         printf -v "$outvar" '%s' "${!envvar}"
+        [ -n "$envvar" ] && _ANSWERS["$envvar"]="${!envvar}"
         return
     fi
-    if [ ! -r /dev/tty ]; then
+    if _no_tty; then
         if [ -n "$default" ]; then
             warn "non-interactive shell; using default for: $prompt"
             printf -v "$outvar" '%s' "$default"
+            [ -n "$envvar" ] && _ANSWERS["$envvar"]="$default"
             return
         fi
         die "missing required input for: $prompt. Set ${envvar}."
@@ -97,6 +116,7 @@ prompt_value() {
         value="${value:-$default}"
         if [ -n "$value" ]; then
             printf -v "$outvar" '%s' "$value"
+            [ -n "$envvar" ] && _ANSWERS["$envvar"]="$value"
             return
         fi
         printf 'A value is required.\n' >/dev/tty
@@ -107,15 +127,17 @@ prompt_optional() {
     local outvar="$1" envvar="$2" prompt="$3" value=""
     if [ -n "$envvar" ] && [[ -v $envvar ]]; then
         printf -v "$outvar" '%s' "${!envvar}"
+        [ -n "$envvar" ] && _ANSWERS["$envvar"]="${!envvar}"
         return
     fi
-    if [ ! -r /dev/tty ]; then
+    if _no_tty; then
         printf -v "$outvar" '%s' ""
         return
     fi
     printf '%s%s%s [leave blank to skip]: ' "$BOLD" "$prompt" "$RESET" >/dev/tty
     read -r value </dev/tty || value=""
     printf -v "$outvar" '%s' "$value"
+    [ -n "$envvar" ] && _ANSWERS["$envvar"]="$value"
 }
 
 prompt_choice() {
@@ -126,14 +148,16 @@ prompt_choice() {
         for choice in "$@"; do
             if [ "${!envvar}" = "$choice" ]; then
                 printf -v "$outvar" '%s' "$choice"
+                [ -n "$envvar" ] && _ANSWERS["$envvar"]="$choice"
                 return
             fi
         done
         die "invalid value '${!envvar}' for ${envvar} (expected one of: $*)"
     fi
-    if [ ! -r /dev/tty ]; then
+    if _no_tty; then
         warn "non-interactive shell; using default '$default' for: $prompt"
         printf -v "$outvar" '%s' "$default"
+        [ -n "$envvar" ] && _ANSWERS["$envvar"]="$default"
         return
     fi
     while :; do
@@ -143,6 +167,7 @@ prompt_choice() {
         for choice in "$@"; do
             if [ "$value" = "$choice" ]; then
                 printf -v "$outvar" '%s' "$choice"
+                [ -n "$envvar" ] && _ANSWERS["$envvar"]="$choice"
                 return
             fi
         done
@@ -158,6 +183,206 @@ gen_hex() {
     else
         head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Answers file: load prior answers (Bug fix: preserves existing secrets) and
+# write current answers back after a successful run.
+# ---------------------------------------------------------------------------
+
+load_answers_file() {
+    if [ ! -f "$OUT_ANSWERS" ]; then
+        return
+    fi
+    local _line _key _value
+    while IFS= read -r _line; do
+        # Skip comments and blank lines.
+        [[ "$_line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${_line//[[:space:]]/}" ]]  && continue
+        [[ "$_line" == *=* ]] || continue
+        _key="${_line%%=*}"
+        _value="${_line#*=}"
+        if [ "$_key" = "AUTORUN" ]; then
+            AUTORUN="$_value"
+            continue
+        fi
+        # Only load non-empty values; never override already-exported vars.
+        if [ -n "$_value" ] && [ -n "$_key" ] && ! [[ -v "$_key" ]]; then
+            printf -v "$_key" '%s' "$_value"
+            export "$_key"
+        fi
+    done <"$OUT_ANSWERS"
+    if [ "$AUTORUN" = "true" ]; then
+        info "AUTORUN=true: running non-interactively using $OUT_ANSWERS"
+    fi
+}
+
+write_answers_file() {
+    # Preserve the AUTORUN flag exactly as set by the user — never modify it.
+    local _autorun="false"
+    if [ -f "$OUT_ANSWERS" ]; then
+        local _al
+        while IFS= read -r _al; do
+            if [[ "$_al" =~ ^AUTORUN=(.*)$ ]]; then
+                _autorun="${BASH_REMATCH[1]}"
+                break
+            fi
+        done <"$OUT_ANSWERS"
+    fi
+    info "Saving answers to $OUT_ANSWERS"
+    local _a  # shorthand: print one answer line safely
+    _a() { printf '%s=%s\n' "$1" "${_ANSWERS[$1]:-}"; }
+    (
+        umask 177
+        {
+        cat <<'HDR'
+# Turnstone production deployment answers file.
+# Generated and updated by setup-production.sh after each successful run.
+# Secrets are stored here — keep this file private (chmod 600, gitignored).
+#
+# AUTORUN flag
+#   false (default): script prompts interactively; values below are pre-filled defaults.
+#   true: fully non-interactive — all required values for enabled sections must be filled
+#         in below; a missing required value causes an immediate error naming the variable.
+#   Only YOU should change this flag; setup-production.sh never modifies it.
+#
+# Precedence (highest to lowest):
+#   1. Exported shell environment variable  (e.g. TURNSTONE_SETUP_OIDC=n ./setup-production.sh)
+#   2. Value in this file
+#   3. Interactive prompt / built-in default
+HDR
+        printf 'AUTORUN=%s\n' "$_autorun"
+        cat <<'S1'
+
+# ---------------------------------------------------------------------------
+# Deployment mode
+# ---------------------------------------------------------------------------
+# production or development  (default: production)
+# Choosing development ends the script; use ./run.sh for the dev stack.
+S1
+        _a TURNSTONE_SETUP_MODE
+        cat <<'S2'
+
+# ---------------------------------------------------------------------------
+# Image tag
+# ---------------------------------------------------------------------------
+# Track the rolling image or pin a release.  Values: latest | pinned  (default: latest)
+S2
+        _a TURNSTONE_SETUP_IMAGE_CHANNEL
+        printf '%s\n' "# Specific release tag when IMAGE_CHANNEL=pinned (e.g. v1.2.3)."
+        _a TURNSTONE_SETUP_IMAGE_TAG
+        cat <<'S3'
+
+# ---------------------------------------------------------------------------
+# OIDC single sign-on (optional)
+# ---------------------------------------------------------------------------
+# Enable OIDC SSO?  Values: y | n  (default: n)
+S3
+        _a TURNSTONE_SETUP_OIDC
+        printf '%s\n' "# Identity provider type.  Values: authentik | generic  (default: generic)"
+        _a TURNSTONE_SETUP_OIDC_PROVIDER
+        cat <<'S3A'
+# --- Authentik path (only when OIDC_PROVIDER=authentik) ---
+# Authentik base URL (e.g. https://authentik.example.com)
+S3A
+        _a TURNSTONE_SETUP_AUTHENTIK_URL
+        printf '%s\n' "# Authentik application slug"
+        _a TURNSTONE_SETUP_AUTHENTIK_SLUG
+        cat <<'S3B'
+# --- Generic path (only when OIDC_PROVIDER=generic) ---
+# OIDC issuer URL (must serve /.well-known/openid-configuration)
+S3B
+        _a TURNSTONE_OIDC_ISSUER
+        cat <<'S3C'
+# --- Both provider paths ---
+# OIDC client ID
+S3C
+        _a TURNSTONE_OIDC_CLIENT_ID
+        printf '%s\n' "# OIDC client secret (sensitive — file is kept 600)"
+        _a TURNSTONE_OIDC_CLIENT_SECRET
+        printf '%s\n' "# Login button label (generic only, default: SSO)"
+        _a TURNSTONE_OIDC_PROVIDER_NAME
+        printf '%s\n' "# OAuth scopes (generic only, default: openid email profile)"
+        _a TURNSTONE_OIDC_SCOPES
+        printf '%s\n' "# ID-token claim holding group/role values (generic only, default: groups)"
+        _a TURNSTONE_OIDC_ROLE_CLAIM
+        printf '%s\n' "# Claim value / group → Turnstone admin role  (default: admin / turnstone-admins)"
+        _a TURNSTONE_SETUP_OIDC_ADMIN_VALUE
+        printf '%s\n' "# Claim value / group → general user access  (default: users / turnstone-users)"
+        _a TURNSTONE_SETUP_OIDC_USER_VALUE
+        printf '%s\n' "# Extra trusted OIDC endpoint hostnames, comma-separated (optional, generic only)"
+        _a TURNSTONE_OIDC_TRUSTED_ENDPOINT_HOSTS
+        printf '%s\n' "# Public origin browsers use to reach Turnstone  (default: https://localhost:8443)"
+        _a TURNSTONE_OIDC_REDIRECT_BASE
+        printf '%s\n' "# Does the OIDC provider resolve to a private/internal address?  Values: y | n  (default: n)"
+        _a TURNSTONE_SETUP_OIDC_PRIVATE
+        printf '%s\n' "# Disable password logins once SSO works (SSO-only mode)?  Values: y | n  (default: n)"
+        _a TURNSTONE_SETUP_OIDC_SSO_ONLY
+        cat <<'S4'
+
+# ---------------------------------------------------------------------------
+# TLS (optional)
+# ---------------------------------------------------------------------------
+# Enable mutual TLS between Turnstone services?  Values: y | n  (default: n)
+S4
+        _a TURNSTONE_SETUP_TLS
+        printf '%s\n' "# Serve the dashboard at a public DNS name with a browser-trusted certificate?  Values: y | n  (default: n)"
+        _a TURNSTONE_SETUP_PUBLIC_DNS
+        cat <<'S4A'
+# --- Public DNS settings (only when TURNSTONE_SETUP_PUBLIC_DNS=y) ---
+# Public DNS hostname (e.g. turnstone.example.com)
+S4A
+        _a TURNSTONE_SETUP_DOMAIN
+        printf '%s\n' "# Email address for Let's Encrypt registration"
+        _a TURNSTONE_SETUP_ACME_EMAIL
+        printf '%s\n' "# DNS challenge provider.  Values: cloudflare | route53 | duckdns  (default: cloudflare)"
+        _a TURNSTONE_SETUP_DNS_PROVIDER
+        printf '%s\n' "# Cloudflare DNS API token with Zone:DNS:Edit permission  (cloudflare only)"
+        _a CF_DNS_API_TOKEN
+        printf '%s\n' "# AWS access key ID for Route 53 DNS challenge  (route53 only)"
+        _a TURNSTONE_SETUP_AWS_ACCESS_KEY_ID
+        printf '%s\n' "# AWS secret access key for Route 53 DNS challenge  (route53 only)"
+        _a TURNSTONE_SETUP_AWS_SECRET_ACCESS_KEY
+        printf '%s\n' "# Duck DNS API token  (duckdns only)"
+        _a TURNSTONE_SETUP_DUCKDNS_TOKEN
+        cat <<'S5'
+
+# ---------------------------------------------------------------------------
+# LLM backend (optional)
+# ---------------------------------------------------------------------------
+# Configure a default LLM backend now?  Values: y | n  (default: n)
+# Backends can also be connected later in the console Models tab.
+S5
+        _a TURNSTONE_SETUP_LLM
+        printf '%s\n' "# OpenAI-compatible base URL  (default: http://host.docker.internal:8000/v1)"
+        _a LLM_BASE_URL
+        printf '%s\n' "# API key for the LLM backend  (default: dummy)"
+        _a OPENAI_API_KEY
+        printf '%s\n' "# Default model alias (optional, leave blank to skip)"
+        _a MODEL
+        cat <<'S6'
+
+# ---------------------------------------------------------------------------
+# Channel gateway (optional)
+# ---------------------------------------------------------------------------
+# Connect chat channels (Discord / Slack)?  Values: y | n  (default: n)
+S6
+        _a TURNSTONE_SETUP_CHANNELS
+        printf '%s\n' "# Configure Discord?  Values: y | n  (default: n)"
+        _a TURNSTONE_SETUP_DISCORD
+        printf '%s\n' "# Discord bot token  (Discord only)"
+        _a TURNSTONE_DISCORD_TOKEN
+        printf '%s\n' "# Discord guild (server) ID  (Discord only, default: 0)"
+        _a TURNSTONE_DISCORD_GUILD
+        printf '%s\n' "# Configure Slack?  Values: y | n  (default: n)"
+        _a TURNSTONE_SETUP_SLACK
+        printf '%s\n' "# Slack bot token starting with xoxb-  (Slack only)"
+        _a TURNSTONE_SLACK_TOKEN
+        printf '%s\n' "# Slack app-level token starting with xapp-  (Slack only)"
+        _a TURNSTONE_SLACK_APP_TOKEN
+        } >"$OUT_ANSWERS"
+    )
+    chmod 600 "$OUT_ANSWERS"
 }
 
 check_prereqs() {
@@ -478,9 +703,32 @@ write_env_file() {
     if [ "$MTLS_ENABLED" = 1 ]; then compose_chain="$compose_chain:tls.compose.yaml"; fi
 
     info "Generating secrets and writing $OUT_ENV"
-    local jwt_secret pg_password
-    jwt_secret="${TURNSTONE_JWT_SECRET:-$(gen_hex)}"
-    pg_password="${POSTGRES_PASSWORD:-$(gen_hex)}"
+    local jwt_secret pg_password existing_jwt="" existing_pg=""
+
+    # Preserve existing secrets from a prior .env so a rerun does not
+    # regenerate them and break an existing Postgres data volume.
+    if [ -f "$OUT_ENV" ]; then
+        existing_jwt="$(grep -m1 '^TURNSTONE_JWT_SECRET=' "$OUT_ENV" | cut -d= -f2-)" || true
+        existing_pg="$(grep -m1 '^POSTGRES_PASSWORD=' "$OUT_ENV" | cut -d= -f2-)" || true
+    fi
+
+    jwt_secret="${TURNSTONE_JWT_SECRET:-${existing_jwt:-$(gen_hex)}}"
+    pg_password="${POSTGRES_PASSWORD:-${existing_pg:-$(gen_hex)}}"
+
+    if [ -n "${TURNSTONE_JWT_SECRET:-}" ]; then
+        info "TURNSTONE_JWT_SECRET: using exported environment variable"
+    elif [ -n "$existing_jwt" ]; then
+        warn "TURNSTONE_JWT_SECRET: preserving existing value from $OUT_ENV (not regenerated)"
+    else
+        info "TURNSTONE_JWT_SECRET: generated new random value"
+    fi
+    if [ -n "${POSTGRES_PASSWORD:-}" ]; then
+        info "POSTGRES_PASSWORD: using exported environment variable"
+    elif [ -n "$existing_pg" ]; then
+        warn "POSTGRES_PASSWORD: preserving existing value from $OUT_ENV (not regenerated)"
+    else
+        info "POSTGRES_PASSWORD: generated new random value"
+    fi
 
     {
         echo "# Generated deployment settings. Keep this file private (contains secrets)."
@@ -540,6 +788,10 @@ main() {
     info "Turnstone deployment setup"
     echo
 
+    # Load the persistent answers file before any prompts so that prior
+    # answers serve as defaults and AUTORUN=true skips all interactive input.
+    load_answers_file
+
     # Split point: a development stack needs none of the questions below.
     local mode
     prompt_choice mode TURNSTONE_SETUP_MODE \
@@ -567,6 +819,7 @@ main() {
     write_oidc_env
     write_override
     write_env_file
+    write_answers_file
     print_done
 }
 
