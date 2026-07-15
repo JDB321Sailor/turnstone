@@ -603,10 +603,11 @@ copy_stack_files() {
 # `command:` key of the `console:` service under `services:` — every
 # other service (e.g. tls-init, channel) keeps its command untouched.
 sanitize_tls_overlay() {
-    [ -f "$OUT_TLS_OVERLAY" ] || return 0
+    [ -f "$OUT_TLS_OVERLAY" ] || die "TLS overlay $OUT_TLS_OVERLAY is missing; the copy from $SRC_TLS_OVERLAY failed"
     local tmp
     tmp="$(mktemp)" || die "mktemp failed while sanitizing $OUT_TLS_OVERLAY"
     if ! awk '
+        BEGIN { in_services = 0; in_console = 0; skipping = 0; blanks = 0 }
         function indent_of(line,    n) {
             n = 0
             while (substr(line, n + 1, 1) == " ") n++
