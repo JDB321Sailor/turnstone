@@ -42,11 +42,6 @@ services:
       TURNSTONE_TLS_ENABLED: "true"
       TURNSTONE_TLS_SANS: "console"
       TURNSTONE_CONSOLE_URL: "http://console:8090"
-    command:
-      - turnstone-console
-      - --host=0.0.0.0
-      - --port=8090
-      - --poll-interval=${CONSOLE_POLL_INTERVAL:-10}
 
   # Server: auto-provisions certs via console ACME, serves HTTPS
   server:
