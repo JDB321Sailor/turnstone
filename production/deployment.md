@@ -294,17 +294,46 @@ about a failed first attempt is permanent — pick the right rerun below.
 ### `FATAL: password authentication failed for user "turnstone"`
 
 **Cause:** The `POSTGRES_PASSWORD` in `.env` does not match the password
-stored in the Postgres data volume (`postgres-data`). This happens when an
-existing volume is paired with a newly-generated password — the Postgres
-image only applies `POSTGRES_PASSWORD` on first initialisation and never
-updates an existing data directory.
+stored in the Postgres data volume (`turnstone_postgres-data`). This happens
+when an existing volume is paired with a newly-generated password — the
+Postgres image only applies `POSTGRES_PASSWORD` on first initialisation of an
+empty data directory and never updates an existing one.
 
-**This should no longer happen** after the first run with the current
-version of the script, because `setup-production.sh` automatically
-preserves the existing `POSTGRES_PASSWORD` from `.env` on every rerun.
+**Common scenario — fresh clone on a host that previously ran Turnstone:**
+After `git clone` and `./setup-production.sh`, no `.env` exists yet, so
+the script would normally generate a fresh random password. If the Docker
+named volume `turnstone_postgres-data` still exists from a prior deployment,
+that new password would not match the one stored in the volume.
 
-If you are recovering from a state where the passwords diverged (e.g. after
-running an older version of the script), choose one of these remedies:
+**How `setup-production.sh` now handles this:**
+
+Before generating a new `POSTGRES_PASSWORD` the script checks whether the
+volume `turnstone_postgres-data` (or `${COMPOSE_PROJECT_NAME}_postgres-data`
+if that variable is set) already exists:
+
+- **Interactive run (TTY present):** you are warned and offered three choices:
+  - **enter** — type the existing password; it is stored in `.env` and the
+    volume is reused with all its data intact.
+  - **wipe** — the volume is removed (all data deleted) after explicit
+    confirmation, and a fresh password is generated.
+  - **abort** — the script exits with instructions.
+
+- **Non-interactive run (`AUTORUN=true` or no TTY) without a supplied
+  password:** the script exits immediately with an error that names the volume
+  and lists the three remediation options. Supply the password in one of these
+  ways then rerun:
+  1. Export it before running: `export POSTGRES_PASSWORD=<existing-password>`
+  2. Add it to `setup-production.env`:
+     ```
+     POSTGRES_PASSWORD=<existing-password>
+     ```
+  3. Or remove the stale volume first (destroys all data):
+     ```bash
+     docker volume rm turnstone_postgres-data
+     ```
+
+**If you are already in a broken state** (passwords diverged before this
+version of the script), choose one of these remedies:
 
 1. **Restore the old password** — if you have the old `POSTGRES_PASSWORD`
    value, put it back in `production/.env` then run `docker compose up -d`.

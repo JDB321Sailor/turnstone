@@ -380,6 +380,18 @@ S6
         _a TURNSTONE_SLACK_TOKEN
         printf '%s\n' "# Slack app-level token starting with xapp-  (Slack only)"
         _a TURNSTONE_SLACK_APP_TOKEN
+        cat <<'S7'
+
+# ---------------------------------------------------------------------------
+# Secrets (normally generated automatically — only set these to pre-supply
+# an existing value, e.g. to pair with an already-initialised data volume)
+# ---------------------------------------------------------------------------
+# Postgres password.
+# Required in non-interactive (AUTORUN=true) mode when the Docker named
+# volume turnstone_postgres-data already exists and no .env is present.
+# Leave blank to have the script generate a fresh value (or detect it).
+S7
+        _a POSTGRES_PASSWORD
         } >"$OUT_ANSWERS"
     )
     chmod 600 "$OUT_ANSWERS"
@@ -788,7 +800,76 @@ write_env_file() {
     fi
 
     jwt_secret="${TURNSTONE_JWT_SECRET:-${existing_jwt:-$(gen_hex)}}"
-    pg_password="${POSTGRES_PASSWORD:-${existing_pg:-$(gen_hex)}}"
+
+    # Resolve POSTGRES_PASSWORD. When a fresh random value would be generated
+    # (no exported variable and no existing .env value), check for a stale
+    # Docker named volume that was initialised with a different password —
+    # Postgres only applies POSTGRES_PASSWORD on first data-directory init.
+    local _pg_source=""
+    if [ -n "${POSTGRES_PASSWORD:-}" ]; then
+        pg_password="$POSTGRES_PASSWORD"
+        _pg_source="env"
+    elif [ -n "$existing_pg" ]; then
+        pg_password="$existing_pg"
+        _pg_source="existing"
+    else
+        local _pg_vol="${COMPOSE_PROJECT_NAME:-turnstone}_postgres-data"
+        if docker volume inspect "$_pg_vol" >/dev/null 2>&1; then
+            # Volume exists — a freshly generated password would not match the
+            # one used when the volume was initialised, breaking auth.
+            if _no_tty; then
+                die "Postgres data volume '$_pg_vol' already exists but no POSTGRES_PASSWORD is \
+available. A newly-generated password will not match the one used when the volume \
+was initialised, causing 'FATAL: password authentication failed for user \"turnstone\"'. \
+Remedies — choose one and rerun: \
+(1) export POSTGRES_PASSWORD=<existing-password> before running the script, \
+(2) add POSTGRES_PASSWORD=<existing-password> to $OUT_ANSWERS, or \
+(3) remove the stale volume first (destroys all data): docker volume rm $_pg_vol"
+            else
+                warn "Postgres data volume '$_pg_vol' already exists."
+                {
+                    printf '\n'
+                    printf '  Generating a fresh random POSTGRES_PASSWORD would not match the\n'
+                    printf '  password used to initialise the existing data directory, causing:\n'
+                    printf '    FATAL: password authentication failed for user "turnstone"\n'
+                    printf '\n'
+                    printf '  How to proceed:\n'
+                    printf '    enter  — supply the existing POSTGRES_PASSWORD to reuse this volume\n'
+                    printf '    wipe   — remove the volume and all its data, generate a new password\n'
+                    printf '    abort  — exit; handle this manually\n'
+                    printf '\n'
+                } >/dev/tty
+                local _pg_action
+                prompt_choice _pg_action POSTGRES_VOLUME_ACTION \
+                    "Action for existing volume '$_pg_vol'" enter \
+                    enter wipe abort
+                case "$_pg_action" in
+                    enter)
+                        prompt_value pg_password POSTGRES_PASSWORD \
+                            "Existing POSTGRES_PASSWORD (will be stored in $OUT_ENV)"
+                        _pg_source="entered"
+                        ;;
+                    wipe)
+                        warn "Volume '$_pg_vol' and ALL its data will be permanently deleted."
+                        if ! ask "Confirm deletion of volume '$_pg_vol'?" "" n; then
+                            die "Deletion not confirmed. Aborting."
+                        fi
+                        docker volume rm "$_pg_vol" \
+                            || die "Could not remove '$_pg_vol'. A container may be using it — run 'docker compose down' first, then rerun this script."
+                        info "Volume '$_pg_vol' removed. A fresh password will be generated."
+                        pg_password="$(gen_hex)"
+                        _pg_source="generated"
+                        ;;
+                    abort)
+                        die "Aborting. To proceed manually: (1) export POSTGRES_PASSWORD=<existing-password> and rerun, or (2) docker volume rm $_pg_vol to start fresh."
+                        ;;
+                esac
+            fi
+        else
+            pg_password="$(gen_hex)"
+            _pg_source="generated"
+        fi
+    fi
 
     if [ -n "${TURNSTONE_JWT_SECRET:-}" ]; then
         info "TURNSTONE_JWT_SECRET: using exported environment variable"
@@ -797,13 +878,12 @@ write_env_file() {
     else
         info "TURNSTONE_JWT_SECRET: generated new random value"
     fi
-    if [ -n "${POSTGRES_PASSWORD:-}" ]; then
-        info "POSTGRES_PASSWORD: using exported environment variable"
-    elif [ -n "$existing_pg" ]; then
-        warn "POSTGRES_PASSWORD: preserving existing value from $OUT_ENV (not regenerated)"
-    else
-        info "POSTGRES_PASSWORD: generated new random value"
-    fi
+    case "$_pg_source" in
+        env)      info "POSTGRES_PASSWORD: using exported environment variable" ;;
+        existing) warn "POSTGRES_PASSWORD: preserving existing value from $OUT_ENV (not regenerated)" ;;
+        entered)  info "POSTGRES_PASSWORD: using entered existing password (volume reused)" ;;
+        *)        info "POSTGRES_PASSWORD: generated new random value" ;;
+    esac
 
     {
         echo "# Generated deployment settings. Keep this file private (contains secrets)."
