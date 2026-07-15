@@ -160,6 +160,60 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Fixed
 
+- **Static MCP servers: a pushed catalog change no longer wedges the shared
+  session (#839).** The static-path `*/list_changed` handler awaited its
+  catalog refresh inline in the SDK's receive loop, but the refresh's own
+  request can only be answered by that (now parked) loop — the refresh never
+  completed, and every user's in-flight calls on the shared per-node session
+  stalled behind it, unbounded, until the health loop's ping timeout tore the
+  transport down (which was also the only way the changed catalog ever
+  landed). Push refreshes now run as spawned tasks — debounced, coalesced per
+  (server, kind), bounded by the connect timeout, and serialized on the
+  per-server connect lock — and the manual and post-reconnect refreshes
+  publish under that same lock, so a slower publisher can no longer land a
+  staler catalog over a fresher one. Every teardown path now also clears the
+  notification debounce stamp, so a reconnected server's first push refreshes
+  immediately. Push-refresh debouncing is now per (server, kind) on BOTH the
+  static and per-user pool paths — a tools push no longer swallows a prompts
+  push arriving in the same 5-second window. A change genuinely lost to the
+  debounce window (a same-kind push landing after the prior refresh finished,
+  which the server will never re-announce) is recovered by an automatic
+  health-tick retry rather than staying invisible until an unrelated push or
+  a reconnect. The resource-refresh fan-out on both paths no longer orphans
+  its sibling list call when one of the pair fails fast — the real error
+  surfaces immediately (not masked as a 30-second timeout) and the surviving
+  sibling is cancelled and reaped, under a bounded grace, inside the scope. A
+  push refresh that fails while the connection stays up is likewise retried on
+  the next health-loop tick until one completes — previously a single
+  transient blip left the shared catalog stale for every user on the node
+  until an operator intervened. An operator `/mcp refresh` no longer parks
+  behind a busy per-server connect lock (a slow reconnect attempt could eat
+  the whole 30-second refresh budget and fail the pass for every healthy
+  server behind it) — the busy server is skipped on both the connected and
+  disconnected branches, reported distinctly as "skipped" rather than as a
+  false "no changes", the skip arms the automatic retry, and a
+  force-reconnect drops the session up front so queued push refreshes can't
+  starve it. Static-path resource and prompt catalogs are now size-capped
+  like the pool path's (and like static tools) at discovery and on every
+  refresh, so a misbehaving server's push can't balloon the node's merged
+  catalogs. Deleting or reconfiguring a server can no longer leave it
+  half-removed: the config removal and all cleanup are serialized under the
+  connect lock (a cancelled removal completes its cleanup rather than
+  stranding a live session and published catalog with the config already
+  gone), and `reconcile_sync` retries a removal that timed out instead of
+  marking it done — previously a DB-driven delete of a busy server could be a
+  silent, permanent no-op until process restart. A refresh outcome now
+  threads consistently to every operator surface off one source of truth
+  (the per-server `last_refresh_outcome`): a busy-skip and a genuine failure
+  are each reported distinctly from a real "no changes" — `/mcp refresh`
+  prints "skipped" or "failed" rather than a false "no changes", and the
+  node-internal refresh endpoint returns `202 skipped` instead of a
+  misleading `200 ok` for a refresh that never ran. A single-kind push
+  refresh no longer paints the whole server healthy: because the
+  error/outcome state is server-scoped, a successful tools push while the
+  prompts catalog is still broken (or vice versa) no longer clears the
+  failure — only a full refresh pass declares "ok".
+
 - **OpenAI Responses streaming: truncated and refused responses no longer
   vanish.** A response that hit `max_output_tokens` terminates the stream
   with `response.incomplete`, which the stream consumer did not handle —

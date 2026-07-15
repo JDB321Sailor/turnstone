@@ -3057,7 +3057,21 @@ class ChatSession:
             return
 
         lines: list[str] = []
-        for srv, (added, removed) in sorted(results.items()):
+        for srv, diff in sorted(results.items()):
+            if diff is None:
+                # No catalog produced — the refresh either was SKIPPED
+                # (lock held by a concurrent reconnect/push refresh, or
+                # removed mid-pass) or FAILED. Disambiguate via the
+                # authoritative outcome so the operator is never told a
+                # stale/broken server is current. Both are distinct from
+                # "no changes".
+                outcome = self._mcp_client.last_refresh_outcome(srv) or ""
+                if outcome.startswith("error"):
+                    lines.append(f"  {srv}: {RED}refresh failed{RESET} ({dim(outcome)})")
+                else:
+                    lines.append(f"  {srv}: {dim('skipped (busy — retry scheduled)')}")
+                continue
+            added, removed = diff
             if added or removed:
                 summary: list[str] = []
                 if added:
