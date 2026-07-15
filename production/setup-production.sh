@@ -814,7 +814,8 @@ write_env_file() {
         _pg_source="existing"
     else
         local _pg_vol="${COMPOSE_PROJECT_NAME:-turnstone}_postgres-data"
-        if docker volume inspect "$_pg_vol" >/dev/null 2>&1; then
+        local _vol_inspect_out
+        if _vol_inspect_out="$(docker volume inspect "$_pg_vol" 2>&1)"; then
             # Volume exists — a freshly generated password would not match the
             # one used when the volume was initialised, breaking auth.
             if _no_tty; then
@@ -855,7 +856,7 @@ Remedies — choose one and rerun: \
                             die "Deletion not confirmed. Aborting."
                         fi
                         docker volume rm "$_pg_vol" \
-                            || die "Could not remove '$_pg_vol'. A container may be using it — run 'docker compose down' first, then rerun this script."
+                            || die "Could not remove '$_pg_vol'. Ensure no containers are using it (run 'docker compose down' first) and that Docker has the required permissions, then rerun this script."
                         info "Volume '$_pg_vol' removed. A fresh password will be generated."
                         pg_password="$(gen_hex)"
                         _pg_source="generated"
@@ -866,8 +867,19 @@ Remedies — choose one and rerun: \
                 esac
             fi
         else
-            pg_password="$(gen_hex)"
-            _pg_source="generated"
+            # Distinguish "volume not found" from a real Docker error.
+            if echo "$_vol_inspect_out" | grep -qi "no such volume\|not found"; then
+                pg_password="$(gen_hex)"
+                _pg_source="generated"
+            else
+                # Unexpected Docker error; warn and proceed with a fresh
+                # password. If a stale volume exists this may still cause an
+                # auth failure, but the user will see the docker error output.
+                warn "Could not query Docker volume '$_pg_vol': $_vol_inspect_out"
+                warn "Proceeding with a fresh random password. If '$_pg_vol' exists with a different password, 'docker compose up -d' may fail with an auth error — rerun this script and supply POSTGRES_PASSWORD."
+                pg_password="$(gen_hex)"
+                _pg_source="generated"
+            fi
         fi
     fi
 

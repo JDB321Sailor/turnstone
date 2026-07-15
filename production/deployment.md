@@ -294,10 +294,11 @@ about a failed first attempt is permanent — pick the right rerun below.
 ### `FATAL: password authentication failed for user "turnstone"`
 
 **Cause:** The `POSTGRES_PASSWORD` in `.env` does not match the password
-stored in the Postgres data volume (`turnstone_postgres-data`). This happens
-when an existing volume is paired with a newly-generated password — the
-Postgres image only applies `POSTGRES_PASSWORD` on first initialisation of an
-empty data directory and never updates an existing one.
+stored in the Postgres data volume (`turnstone_postgres-data`, or
+`${COMPOSE_PROJECT_NAME}_postgres-data` if `COMPOSE_PROJECT_NAME` is set).
+This happens when an existing volume is paired with a newly-generated
+password — the Postgres image only applies `POSTGRES_PASSWORD` on first
+initialisation of an empty data directory and never updates an existing one.
 
 **Common scenario — fresh clone on a host that previously ran Turnstone:**
 After `git clone` and `./setup-production.sh`, no `.env` exists yet, so
