@@ -856,7 +856,7 @@ Remedies — choose one and rerun: \
                             die "Deletion not confirmed. Aborting."
                         fi
                         docker volume rm "$_pg_vol" \
-                            || die "Could not remove '$_pg_vol'. Ensure no containers are using it (run 'docker compose down' first) and that Docker has the required permissions, then rerun this script."
+                            || die "Could not remove '$_pg_vol'. Steps to resolve: (1) run 'docker compose down' to stop any containers using the volume, (2) verify Docker daemon permissions, (3) rerun this script."
                         info "Volume '$_pg_vol' removed. A fresh password will be generated."
                         pg_password="$(gen_hex)"
                         _pg_source="generated"
