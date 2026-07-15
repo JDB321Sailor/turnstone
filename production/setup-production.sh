@@ -36,7 +36,8 @@ OUT_ANSWERS="$SCRIPT_DIR/setup-production.env"
 # Persistent answers file state. load_answers_file() sets AUTORUN from the
 # file; write_answers_file() preserves it unchanged after a run.
 AUTORUN="false"
-declare -A _ANSWERS  # populated by each prompt helper during the run
+declare -A _ANSWERS        # populated by each prompt helper during the run
+declare -A _FILE_DEFAULTS  # answers-file values, used as prompt defaults
 
 IMAGE_REPO_API="https://api.github.com/repos/turnstonelabs/turnstone"
 
@@ -61,8 +62,15 @@ on_error() {
 trap on_error ERR
 
 # ---------------------------------------------------------------------------
-# Prompt helpers. Every prompt can be pre-answered by exporting the named
-# environment variable, which allows scripted / non-interactive runs.
+# Prompt helpers. Every value is resolved through three precedence tiers
+# (highest to lowest):
+#   1. Environment variable exported by the user before invocation
+#      (e.g. TURNSTONE_SETUP_OIDC=n ./setup-production.sh) — used as-is,
+#      the prompt is skipped.
+#   2. Value from the answers file (_FILE_DEFAULTS). With AUTORUN=true (or
+#      no readable TTY) it is used as-is and the prompt is skipped; with
+#      AUTORUN=false it only becomes the displayed default of the prompt.
+#   3. Interactive prompt / built-in default.
 # ---------------------------------------------------------------------------
 ask() {
     local prompt="$1" envvar="$2" default="${3:-y}" ans hint
@@ -70,6 +78,13 @@ ask() {
         case "${!envvar}" in
             [Yy]*|1|true|TRUE) _ANSWERS["$envvar"]="y"; return 0 ;;
             *)                  _ANSWERS["$envvar"]="n"; return 1 ;;
+        esac
+    fi
+    # Answers-file value becomes the default answer (tier 2/3).
+    if [ -n "$envvar" ] && [ -n "${_FILE_DEFAULTS[$envvar]:-}" ]; then
+        case "${_FILE_DEFAULTS[$envvar]}" in
+            [Yy]*|1|true|TRUE) default="y" ;;
+            *)                 default="n" ;;
         esac
     fi
     [ "$default" = y ] && hint="Y/n" || hint="y/N"
@@ -96,6 +111,10 @@ prompt_value() {
         printf -v "$outvar" '%s' "${!envvar}"
         [ -n "$envvar" ] && _ANSWERS["$envvar"]="${!envvar}"
         return
+    fi
+    # Answers-file value becomes the bracketed default (tier 2/3).
+    if [ -n "$envvar" ] && [ -n "${_FILE_DEFAULTS[$envvar]:-}" ]; then
+        default="${_FILE_DEFAULTS[$envvar]}"
     fi
     if _no_tty; then
         if [ -n "$default" ]; then
@@ -124,18 +143,28 @@ prompt_value() {
 }
 
 prompt_optional() {
-    local outvar="$1" envvar="$2" prompt="$3" value=""
+    local outvar="$1" envvar="$2" prompt="$3" default="" value=""
     if [ -n "$envvar" ] && [[ -v $envvar ]]; then
         printf -v "$outvar" '%s' "${!envvar}"
         [ -n "$envvar" ] && _ANSWERS["$envvar"]="${!envvar}"
         return
     fi
+    # Answers-file value becomes the bracketed default (tier 2/3).
+    if [ -n "$envvar" ] && [ -n "${_FILE_DEFAULTS[$envvar]:-}" ]; then
+        default="${_FILE_DEFAULTS[$envvar]}"
+    fi
     if _no_tty; then
-        printf -v "$outvar" '%s' ""
+        printf -v "$outvar" '%s' "$default"
+        [ -n "$envvar" ] && _ANSWERS["$envvar"]="$default"
         return
     fi
-    printf '%s%s%s [leave blank to skip]: ' "$BOLD" "$prompt" "$RESET" >/dev/tty
+    if [ -n "$default" ]; then
+        printf '%s%s%s [%s]: ' "$BOLD" "$prompt" "$RESET" "$default" >/dev/tty
+    else
+        printf '%s%s%s [leave blank to skip]: ' "$BOLD" "$prompt" "$RESET" >/dev/tty
+    fi
     read -r value </dev/tty || value=""
+    value="${value:-$default}"
     printf -v "$outvar" '%s' "$value"
     [ -n "$envvar" ] && _ANSWERS["$envvar"]="$value"
 }
@@ -153,6 +182,22 @@ prompt_choice() {
             fi
         done
         die "invalid value '${!envvar}' for ${envvar} (expected one of: $*)"
+    fi
+    # Answers-file value becomes the default choice (tier 2/3), validated
+    # against the choice list so a stale/invalid file value cannot leak in.
+    if [ -n "$envvar" ] && [ -n "${_FILE_DEFAULTS[$envvar]:-}" ]; then
+        local _fd_valid=0
+        for choice in "$@"; do
+            if [ "${_FILE_DEFAULTS[$envvar]}" = "$choice" ]; then
+                _fd_valid=1
+                break
+            fi
+        done
+        if [ "$_fd_valid" = 1 ]; then
+            default="${_FILE_DEFAULTS[$envvar]}"
+        else
+            warn "ignoring invalid answers-file value '${_FILE_DEFAULTS[$envvar]}' for ${envvar} (expected one of: $*)"
+        fi
     fi
     if _no_tty; then
         warn "non-interactive shell; using default '$default' for: $prompt"
@@ -206,10 +251,11 @@ load_answers_file() {
             AUTORUN="$_value"
             continue
         fi
-        # Only load non-empty values; never override already-exported vars.
-        if [ -n "$_value" ] && [ -n "$_key" ] && ! [[ -v "$_key" ]]; then
-            printf -v "$_key" '%s' "$_value"
-            export "$_key"
+        # Only load non-empty values. File values are kept separate from
+        # the environment so they act as prompt defaults (precedence 2),
+        # never masquerading as user-exported variables (precedence 1).
+        if [ -n "$_value" ] && [ -n "$_key" ]; then
+            _FILE_DEFAULTS["$_key"]="$_value"
         fi
     done <"$OUT_ANSWERS"
     if [ "$AUTORUN" = "true" ]; then
