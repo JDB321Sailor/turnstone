@@ -855,6 +855,10 @@ write_env_file() {
     if [ -n "${POSTGRES_PASSWORD:-}" ]; then
         pg_password="$POSTGRES_PASSWORD"
         _pg_source="env"
+    elif [ -n "${_FILE_DEFAULTS[POSTGRES_PASSWORD]:-}" ]; then
+        pg_password="${_FILE_DEFAULTS[POSTGRES_PASSWORD]}"
+        _ANSWERS[POSTGRES_PASSWORD]="$pg_password"
+        _pg_source="file"
     elif [ -n "$existing_pg" ]; then
         pg_password="$existing_pg"
         _pg_source="existing"
@@ -938,6 +942,7 @@ Remedies — choose one and rerun: \
     fi
     case "$_pg_source" in
         env)      info "POSTGRES_PASSWORD: using exported environment variable" ;;
+        file)     info "POSTGRES_PASSWORD: using value from $OUT_ANSWERS" ;;
         existing) warn "POSTGRES_PASSWORD: preserving existing value from $OUT_ENV (not regenerated)" ;;
         entered)  info "POSTGRES_PASSWORD: using entered existing password (volume reused)" ;;
         *)        info "POSTGRES_PASSWORD: generated new random value" ;;
