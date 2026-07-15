@@ -584,8 +584,83 @@ copy_stack_files() {
     cp "$SRC_SEARXNG_DIR"/* "$OUT_SEARXNG_DIR/"
     if [ "$MTLS_ENABLED" = 1 ]; then
         cp "$SRC_TLS_OVERLAY" "$OUT_TLS_OVERLAY"
+        sanitize_tls_overlay
     else
         rm -f "$OUT_TLS_OVERLAY"
+    fi
+}
+
+# The upstream TLS overlay overrides the console service command with a
+# `--poll-interval` flag that the current turnstone-console CLI no longer
+# accepts, which crash-loops the console ("unrecognized arguments").
+# Dropping the whole `command:` override is safe: without it the console
+# falls back to the base compose command (turnstone-console
+# --host=0.0.0.0 --port=8090), which is exactly what the override ran.
+#
+# The removal is structure-aware (YAML indentation based), not tied to
+# line numbers or file order, so it keeps working if the upstream file
+# is reordered, reformatted, or grows/shrinks. It only touches the
+# `command:` key of the `console:` service under `services:` — every
+# other service (e.g. tls-init, channel) keeps its command untouched.
+sanitize_tls_overlay() {
+    [ -f "$OUT_TLS_OVERLAY" ] || die "TLS overlay $OUT_TLS_OVERLAY is missing; the copy from $SRC_TLS_OVERLAY failed"
+    local tmp
+    tmp="$(mktemp)" || die "mktemp failed while sanitizing $OUT_TLS_OVERLAY"
+    if ! awk '
+        BEGIN { in_services = 0; in_console = 0; skipping = 0; blanks = 0 }
+        function indent_of(line,    n) {
+            n = 0
+            while (substr(line, n + 1, 1) == " ") n++
+            return n
+        }
+        {
+            line = $0
+            trimmed = line
+            sub(/^[ \t]+/, "", trimmed)
+            is_blank = (trimmed == "")
+            is_comment = (substr(trimmed, 1, 1) == "#")
+            is_content = (!is_blank && !is_comment)
+            ind = indent_of(line)
+
+            # While removing the console command block: swallow every line
+            # indented deeper than the `command:` key. Blank lines are held
+            # back until we know whether the block continues after them.
+            if (skipping) {
+                if (is_blank) { blanks++; next }
+                if (ind > cmd_indent) { blanks = 0; next }
+                skipping = 0
+                while (blanks > 0) { print ""; blanks-- }
+            }
+
+            # Leave the console service / services section when a content
+            # line appears at the same or shallower indentation.
+            if (in_console && is_content && ind <= console_indent) in_console = 0
+            if (in_services && is_content && ind <= services_indent) in_services = 0
+
+            if (is_content && ind == 0 && trimmed ~ /^services:[ \t]*(#.*)?$/) {
+                in_services = 1
+                services_indent = ind
+            } else if (in_services && !in_console && is_content && trimmed ~ /^console:[ \t]*(#.*)?$/) {
+                in_console = 1
+                console_indent = ind
+            } else if (in_console && is_content && trimmed ~ /^command:([ \t].*)?$/) {
+                skipping = 1
+                cmd_indent = ind
+                blanks = 0
+                next
+            }
+            print
+        }
+    ' "$OUT_TLS_OVERLAY" >"$tmp"; then
+        rm -f "$tmp"
+        die "Failed to sanitize $OUT_TLS_OVERLAY"
+    fi
+    mv "$tmp" "$OUT_TLS_OVERLAY"
+    # Belt and braces: the removed override carried the unsupported
+    # --poll-interval flag. If it is still present the console would
+    # crash-loop, so fail loudly rather than deploy a broken stack.
+    if grep -q -- '--poll-interval' "$OUT_TLS_OVERLAY"; then
+        die "Sanitizing $OUT_TLS_OVERLAY failed: unsupported --poll-interval flag is still present"
     fi
 }
 
