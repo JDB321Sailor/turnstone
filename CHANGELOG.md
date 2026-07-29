@@ -18,6 +18,21 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Added
 
+- **Compaction is visible now: lifecycle events, a progress bar, and a
+  persistent transcript card.** Context compaction (manual `/compact` and
+  auto) emits a first-class `compaction` SSE event
+  (`start` / `progress` / `end` — see the API reference) instead of loose
+  info lines. The web UI renders an in-transcript card with a real progress
+  bar (determinate `part k of N` during chunked summarization, indeterminate
+  for single-call compactions) that settles into a result card — token delta
+  plus the summary behind a fold — in both the interactive pane and the
+  coordinator viewer. The result survives reloads: the persisted compaction
+  marker now projects through `/history` as a `role="system"`,
+  `source="compaction"` entry (resume/export/search unchanged), stamped with
+  the end event's id so repaint and SSE replay can't double-render. The
+  marker's `meta` additionally records `before_tokens` / `after_tokens` /
+  `trigger`. Python and TypeScript SDKs gain a typed `CompactionEvent`.
+
 - **One provider transport: every model call now streams (#831).**
   The per-adapter non-streaming entry (`create_completion`) is retired;
   single-shot lanes — judges, titles, compaction, web-fetch extraction,
@@ -113,6 +128,15 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Changed
 
+- **Breaking (1.8): compaction feedback moved from `info` events to the
+  typed `compaction` SSE event.** Pre-1.8 SSE/SDK clients that ignore
+  unknown event types no longer see compaction lines (they are
+  deliberately not dual-emitted — dual emission would double-render on
+  every current client). Consume the `compaction` lifecycle event (see
+  the API reference and the `CompactionEvent` SDK type); embedders
+  driving `ChatSession` through a duck-typed `SessionUI` are unaffected
+  (the classic `on_info` lines are restored for them — see Fixed).
+
 - **Sampling knobs (temperature, reasoning effort) now ride one assignment
   scheme: per-model alias value → operator-stored global setting → the
   model definition's declared default (effort only) → field omitted.**
@@ -159,6 +183,148 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   current model.
 
 ### Fixed
+
+- **A failed worker-thread spawn no longer wedges the workstream — at
+  either spawn site — and never masquerades as success.** If
+  `Thread.start()` itself raised (thread exhaustion, out-of-memory), the
+  dispatcher had already claimed the worker slot but the flag's only
+  clearer lived in the never-started thread — the workstream looked idle
+  forever while every subsequent message queued behind a worker that
+  didn't exist, until an operator force-cancel. The claim is now rolled
+  back under the lock and the error propagates, so the workstream is
+  dispatchable again as soon as resources recover. Affected every
+  dispatch path (sends, wakes, retries, deferred-send drain, init). The
+  same failure at the deferred-send drain's own spawn rolls back the
+  just-accepted entry and answers the retryable `queue_full` (previously
+  a 500 landed *after* the entry was registered — an invisible,
+  unretractable phantom that later dispatched as duplicate turns), and a
+  `/command` whose worker never spawned now answers **503**
+  `{"status": "error"}` instead of the generic 200 ok that told SDK
+  callers their `/clear` or `/resume` had applied.
+
+- **Manual `/compact` from the web UI: no phantom user turn, no frozen
+  server, cancellable.** A slash command typed into the web composer no
+  longer renders as a user chat bubble (it echoes as a distinct command
+  chip — commands aren't conversation turns and were never persisted as
+  such). `/compact` itself now dispatches onto the workstream's worker
+  slot instead of running inline on the server's event loop — previously a
+  long compaction froze every SSE stream on the node for its whole
+  duration, which is also why its own progress only ever arrived as one
+  burst after the fact. The manual path carries `send()`'s full generation
+  discipline (`compact_now()`): a force-abandoned compaction goes stale
+  instead of swapping history under a successor turn — and retires at its
+  next checkpoint instead of running out its remaining summary calls,
+  with its late lifecycle events fenced off (`compaction_id` on every
+  event, `superseded` on end events — both in the SDKs) so they can't
+  animate, tear down, re-title, or falsely narrate a successor's card or
+  activity pill; a cancel aimed at it is consumed on exit (previously it
+  bricked every `/compact` retry until the next message); a Stop click on
+  an idle session can't pre-abort the next compaction; a Stop that lands
+  in the completion tail — after the last cancel check, or during a retry
+  backoff (which now aborts immediately instead of sleeping it out) — is
+  honored rather than silently eaten; and Stop now aborts the in-flight
+  summary HTTP call itself (the compaction lane registers its stream in
+  the same abort seam the main loop uses), so cancelling a compaction is
+  immediate instead of waiting out a model call.
+
+- **Sends during a command window are deferred, ordered, bounded, and
+  honestly rendered — never silently truncated or lost.** Messages sent
+  while any slash command holds the worker slot are **deferred**: answered
+  `{"status": "queued", "msg_id"}` immediately and dispatched as ordinary
+  full-fidelity sends (attachments and sender identity included) when the
+  command finishes — never routed through the mid-turn interjection
+  queue, whose semantics are turn-shaped: previously a send during a
+  manual `/compact` was silently truncated to 2,000 characters, a second
+  participant in a shared workstream was locked out with a misleading
+  "another participant's turn" 409 for the whole compaction, and a
+  message queued across a `/resume`/`/new` could be answered into the
+  post-swap workstream. Because the response is immediate,
+  timeout-bounded callers — the coordinator's `send_message`, the console
+  proxy, SDKs, anything behind a stock reverse proxy — can no longer lose
+  a message to a multi-minute command window; the deferred send is
+  retractable until dispatch via the same `DELETE .../send` used for
+  queued interjections (node-local, in-memory — the API reference
+  documents the at-most-once durability contract). Deferred responses
+  carry `"deferred": true`; the pending list is the **order authority**
+  (a fresh send — or a coordinator dispatch, or a queued-nudge wake —
+  lines up behind acknowledged entries instead of overtaking them, with
+  the two-term barrier defined once on the workstream so the wake gate
+  also honors a claimed entry whose dispatch is mid-flight, and the gate
+  re-arms at the drain's exit even when everything pending was
+  retracted); acceptance is **bounded** (10 pending per workstream — the
+  interjection queue's own backpressure contract; the 11th answers the
+  retryable `queue_full` instead of pinning attachment bytes without
+  limit and then running one unattended turn per entry); a dispatch
+  crash re-queues the entry instead of eating an acknowledged message,
+  and a drain thread that fails to *start* rolls the acceptance back and
+  answers `queue_full` rather than parking a phantom the client can
+  neither see nor retract; each dispatch emits a pane-tier
+  `message_dispatched` event (`folded: true` for interjection fold-ins)
+  so queued-bubble UI keeps its retract affordance exactly until the
+  message truly leaves — including when the send was accepted by a pane
+  that believed the workstream idle, which now renders a real queued
+  chip instead of a sent-looking bubble, releases the composer (a
+  deferred send has no running worker to wait on), and cleans up fully
+  when the send is refused or the chip retracted instead of stranding
+  the pane in Stop mode. Dismissing a queued bubble — interjection or
+  deferred — is a server-confirmed `DELETE`, and retracting a deferred
+  send that carried attachments tells the user they were discarded
+  instead of silently expiring them.
+
+- **Slash commands hold the worker slot with a loud contract.**
+  A `/compact` raced against an in-flight turn is refused with an
+  explicit busy response. Every other slash command runs through the same
+  worker slot too — mutual exclusion against sends, a running compaction,
+  and each other, with a busy answer replacing the old silent interleave —
+  while the endpoint still awaits quick commands' completion off-loop
+  (without parking an executor thread per request); the post-command pane
+  refreshes (`clear_ui` after `/clear`/`/new`/`/resume`, the
+  workstream-name sync) ride the worker itself, so a command that
+  outlives the endpoint's 25s response backstop still refreshes every
+  pane on completion (the backstop sits under the console proxy's 30s
+  client timeout so the degraded `running` answer can actually traverse
+  a proxied pane, which now surfaces it instead of silence; the
+  `/command` response contract — `ok` / `running`, with busy refusals
+  answering a loud HTTP 409 rather than a silent 200 — is now documented
+  in the API reference and the OpenAPI spec).
+
+- **Compaction status stays truthful across every UI surface.** Manual
+  compaction
+  success also refreshes the status line/context pill immediately (parity
+  with auto-compaction), compaction failures keep feeding the typed
+  `error` event and the node error counter (while a CLI Ctrl-C reports as
+  cancelled, not a failure), one Stop prints one notice (a cancelled
+  auto-compaction no longer stacks "Compaction cancelled." on top of
+  send's own "[Generation cancelled]"), the workstream activity pill
+  shows "Compacting context…" for the whole summarize phase, restores
+  cleanly afterwards, and can no longer be stranded by a force-stopped
+  compaction (a new turn's generation claim breaks a stale latch). Every
+  retry backoff on the session (stream retries, task agents, notify
+  delivery, compaction) now aborts immediately on Stop via one shared
+  cancel-aware helper instead of sleeping out its exponential delay.
+
+- **Compaction failures report exactly once, to the right owner.** A
+  compaction failure reports
+  exactly once (auto-compaction errors defer to the turn's fatal handler
+  instead of doubling the red row and the error metric), failed-end
+  notice suppression is computed once by the emitter (a `notice` bool on
+  the end event — in the SDKs — replaces hand-synced client policy), and
+  a manual `/compact` failure no longer crashes the CLI REPL. `/compact`
+  on a workstream showing the `error` badge restores the badge on exit
+  instead of stamping `idle` over it (the compaction neither retried nor
+  resolved the failed turn). A force-cancelled initial send that
+  completes late still delivers its scheduled-run completion
+  notification (the only completion signal unattended workstreams have);
+  the other post-command pane refreshes and error notices remain
+  owner-guarded, so a force-cancelled wedged command that unwedges late
+  can't wipe panes or inject stray notices into a successor turn.
+
+- **Pre-1.8 embedder UIs keep their compaction lines.** Embedders
+  driving `ChatSession` with a pre-1.8 duck-typed `SessionUI`
+  (no `on_compaction` hook) get the classic `on_info` compaction lines
+  back — threshold notice, `part k/N`, retry waits, token delta +
+  summary box — instead of silent history swaps. (See the breaking
+  event-contract note under **Changed** for SSE/SDK clients.)
 
 - **Static MCP servers: a pushed catalog change no longer wedges the shared
   session (#839).** The static-path `*/list_changed` handler awaited its

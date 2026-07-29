@@ -73,6 +73,241 @@ export function buildWatchResultCard(meta, content) {
   return el;
 }
 
+// Compaction result card — the settled state of a context compaction.  Renders
+// from BOTH sources of the same fact: the live `compaction` end event and the
+// `/history` projection of the persisted marker row (role="system",
+// source="compaction"), so a reload paints the identical card.  `meta` carries
+// the structured fields ({before_tokens, after_tokens, trigger}); `summary` is
+// the produced summary text, offered behind a <details> fold rather than
+// inline — it exists for provenance, not for re-reading every visit.
+export function buildCompactionCard(meta, summary) {
+  const m = meta && typeof meta === "object" ? meta : {};
+  const el = document.createElement("div");
+  el.className = "msg compaction-card";
+  el.setAttribute("role", "article");
+  el.setAttribute("data-ts-role", "compaction");
+  el.setAttribute("aria-label", "context compacted");
+  const header = document.createElement("div");
+  header.className = "msg-compaction-header";
+  header.textContent =
+    "context compacted" + (m.trigger === "auto" ? " · auto" : "");
+  el.appendChild(header);
+  const before = Number(m.before_tokens);
+  const after = Number(m.after_tokens);
+  if (Number.isFinite(before) && Number.isFinite(after) && before > 0) {
+    const detail = document.createElement("div");
+    detail.className = "msg-compaction-detail";
+    detail.textContent =
+      "~" +
+      before.toLocaleString() +
+      " → ~" +
+      after.toLocaleString() +
+      " tokens";
+    el.appendChild(detail);
+  }
+  const text = String(summary == null ? "" : summary).trim();
+  if (text) {
+    const fold = document.createElement("details");
+    fold.className = "msg-compaction-fold";
+    const label = document.createElement("summary");
+    label.textContent = "summary";
+    fold.appendChild(label);
+    const body = document.createElement("pre");
+    body.className = "msg-compaction-body";
+    body.textContent = text;
+    fold.appendChild(body);
+    el.appendChild(fold);
+  }
+  return el;
+}
+
+// In-progress compaction card — the transient affordance between the
+// `compaction` start and end events.  Starts with an indeterminate bar
+// (a single-batch summarization emits no progress events); the first
+// part-k-of-N progress event flips it determinate via
+// updateCompactionProgress.  The end event replaces the card with
+// buildCompactionCard (or a failure notice).
+export function buildCompactionProgressCard(isAuto) {
+  const el = document.createElement("div");
+  el.className = "msg compaction-card compaction-running";
+  el.setAttribute("role", "status");
+  el.setAttribute("data-ts-role", "compaction");
+  el.setAttribute("aria-label", "compacting context");
+  const header = document.createElement("div");
+  header.className = "msg-compaction-header";
+  header.textContent = "compacting context…" + (isAuto ? " · auto" : "");
+  el.appendChild(header);
+  const bar = document.createElement("div");
+  bar.className = "msg-compaction-bar indeterminate";
+  const fill = document.createElement("div");
+  fill.className = "msg-compaction-bar-fill";
+  bar.appendChild(fill);
+  el.appendChild(bar);
+  const note = document.createElement("div");
+  note.className = "msg-compaction-note";
+  note.textContent = "summarizing conversation…";
+  el.appendChild(note);
+  return el;
+}
+
+// Advance an in-progress compaction card from a `compaction` progress event.
+// Depth 0 = summarizing transcript batches (determinate part k of N); deeper
+// levels merge partial summaries — those update the note ONLY, never the bar:
+// an over-window depth-0 batch subdivides mid-loop (emitting depth>0 events
+// between depth-0 parts), so any width a merge event wrote would snap
+// backwards when the outer loop resumed.  The depth-0 width itself is
+// monotonic (max with the current fill) for the same reason.  A retry wait
+// ({retry_in, error}) and the truncated-summary warning annotate the note
+// without touching the bar.
+export function updateCompactionProgress(el, evt) {
+  const bar = el.querySelector(".msg-compaction-bar");
+  const fill = el.querySelector(".msg-compaction-bar-fill");
+  const note = el.querySelector(".msg-compaction-note");
+  if (!bar || !fill || !note) return;
+  if (evt.warning === "summary_truncated") {
+    note.textContent = "summary was truncated — continuing…";
+    return;
+  }
+  if (evt.retry_in != null) {
+    // retry_in is a server-emitted backoff (seconds) coerced with Number();
+    // validate it the way part/total below are, so a malformed value can't
+    // render "retrying in NaNs".  The error text is the load-bearing half —
+    // keep it whether or not the duration parses.
+    const secs = Number(evt.retry_in);
+    const err = String(evt.error || "error");
+    note.textContent =
+      Number.isFinite(secs) && secs >= 0
+        ? "retrying in " + Math.round(secs) + "s (" + err + ")…"
+        : "retrying (" + err + ")…";
+    return;
+  }
+  const part = Number(evt.part);
+  const total = Number(evt.total);
+  if (!Number.isFinite(part) || !Number.isFinite(total) || total < 1) return;
+  if (Number(evt.depth) > 0) {
+    note.textContent = "merging summaries (" + part + " of " + total + ")…";
+    return;
+  }
+  bar.classList.remove("indeterminate");
+  // part is emitted BEFORE its batch summarizes — show the k-1 completed
+  // fraction so the bar never claims work that hasn't happened yet.
+  const pct = Math.max(0, Math.min(100, ((part - 1) / total) * 100));
+  const current = parseFloat(fill.style.width) || 0;
+  fill.style.width = Math.max(current, pct) + "%";
+  note.textContent = "summarizing part " + part + " of " + total + "…";
+}
+
+// Shared compaction-lifecycle reducer — ONE state machine for the
+// interactive pane and the coordinator viewer (each previously carried a
+// hand-synced copy, and they drifted within their first diff).  `holder` is
+// the pane's mutable `{card}` slot (nulled wherever the transcript DOM is
+// wiped); `hooks` supplies the pane-specific seams:
+//   container      — the transcript element to append into
+//   renderedIds    — the pane's rendered-event-id Set (dedups the ok-end
+//                    card against the /history-projected marker row)
+//   onNotice(msg)  — render a non-error failure notice (info styling)
+//   scroll(force)  — the pane's scroll-to-bottom
+// reason="error" ends render NO notice here: the backend pairs them with a
+// typed `error` event, which each pane's existing error handler styles red
+// (and which feeds the node's error metrics) — emitting here too would show
+// the message twice.
+export function applyCompactionEvent(holder, evt, hooks) {
+  // Lifecycle ownership: events carry the backend's compaction_id and the
+  // holder remembers which compaction painted the live card, so a stale
+  // event — a force-abandoned compaction retiring after a successor
+  // started — can't animate or tear down the successor's card.  The id
+  // gates only while a live card exists (with no card there is nothing to
+  // protect), and a missing id on either side matches everything so
+  // replays from older backends keep working.
+  const owns =
+    !holder.card ||
+    holder.cid == null ||
+    evt.compaction_id == null ||
+    String(evt.compaction_id) === holder.cid;
+  if (evt.phase === "start") {
+    if (holder.card) holder.card.remove();
+    holder.card = buildCompactionProgressCard(evt.trigger === "auto");
+    holder.cid = evt.compaction_id != null ? String(evt.compaction_id) : null;
+    hooks.container.appendChild(holder.card);
+    hooks.scroll(true);
+    return;
+  }
+  if (evt.phase === "progress") {
+    if (!owns) return;
+    // Defensive create: a fresh connect mid-compaction (dead replay
+    // buffer) can see a progress event with no preceding start.  The
+    // `false` is deliberate: progress events carry no trigger field, so
+    // this card cannot know it should wear the "· auto" suffix —
+    // cosmetic, and threading trigger through the summarize stack for it
+    // is disproportionate.
+    if (!holder.card) {
+      holder.card = buildCompactionProgressCard(false);
+      holder.cid = evt.compaction_id != null ? String(evt.compaction_id) : null;
+      hooks.container.appendChild(holder.card);
+    }
+    updateCompactionProgress(holder.card, evt);
+    hooks.scroll(false);
+    return;
+  }
+  if (evt.phase === "end") {
+    if (owns) resetCompactionHolder(holder);
+    if (evt.ok) {
+      // The persisted marker row is stamped with THIS event's id, so
+      // whichever of /history repaint or live/replayed event renders
+      // first wins.  Rendered even for a non-owning end: a completed
+      // compaction's result is real regardless of whose card is live.
+      const eid = evt._event_id != null ? String(evt._event_id) : null;
+      if (eid && hooks.renderedIds.has(eid)) return;
+      hooks.container.appendChild(
+        buildCompactionCard(
+          {
+            before_tokens: evt.before_tokens,
+            after_tokens: evt.after_tokens,
+            trigger: evt.trigger,
+          },
+          evt.summary || "",
+        ),
+      );
+      if (eid) hooks.renderedIds.add(eid);
+      hooks.scroll(true);
+    } else if (owns && evt.notice) {
+      // cancelled / not_enough_messages / irreducible / empty_summary —
+      // informational, not an error state.  Whether the message is shown
+      // is the emitter's call: the backend stamps `notice` on failed ends
+      // (suppressing error-reason / superseded / cancelled-auto ends —
+      // see ChatSession._compaction_event, the single policy site), so
+      // this arm stays mechanical.  `owns` is the one pane-local clause
+      // the emitter cannot compute — card ownership via compaction_id vs
+      // holder.cid — and it guards a reachable divergence: a /resume
+      // swaps sessions and restarts generation counters, so an abandoned
+      // old-session end can arrive superseded=false against the new
+      // session's live card.  An end without the field (replayed from an
+      // older node) stays silent — these notices are informational.
+      // (A superseded OK end above still renders its result card — the
+      // history swap really happened.)
+      hooks.onNotice(evt.message || "Compaction skipped.");
+      hooks.scroll(true);
+    }
+    // No follow-scroll on the remaining paths: a non-owning failed end
+    // renders nothing (scrolling would yank the view with zero visual
+    // change — the round-7 finding), and an owning teardown only REMOVES
+    // the progress card, which needs no scroll chase.
+  }
+}
+
+// Retire a pane's in-progress compaction card (if any) and clear the
+// holder.  The teardown half of the lifecycle the reducer above owns —
+// exported so the panes' stream_end handlers (force-stop abandons the
+// compaction worker without an end event in flight) and transcript-wipe
+// sites share ONE implementation instead of four hand-synced copies.
+// Element.remove() on an already-detached node (a wipe that
+// replaceChildren()'d the transcript) is a harmless no-op.
+export function resetCompactionHolder(holder) {
+  if (holder.card) holder.card.remove();
+  holder.card = null;
+  holder.cid = null;
+}
+
 // Thin `.msg.user.system-nudge` marker — the visible-but-subtle anchor a
 // wake-driven empty user turn renders, so the operator-context `system` turns
 // that follow it land in the right place.  The caller handles empty-state

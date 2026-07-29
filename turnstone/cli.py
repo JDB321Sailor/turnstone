@@ -328,6 +328,13 @@ class TerminalUI(SessionUI):
         sys.stdout.write(f"{YELLOW}[{label}]{RESET} {content}\n")
         sys.stdout.flush()
 
+    # No on_compaction override: TerminalUI subclasses SessionUI
+    # explicitly, and the inherited protocol default body IS the
+    # terminal's classic rendering (render_compaction_event_as_info via
+    # on_info — see SessionUI.on_compaction).  A byte-identical override
+    # here silently forked the policy site: a future change to the
+    # default stopped applying to the CLI.
+
     def on_state_change(self, state: str) -> None:
         pass  # base TerminalUI ignores state changes
 

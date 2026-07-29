@@ -22,6 +22,7 @@ import os
 import queue
 import random
 import re
+import secrets
 import sys
 import textwrap
 import threading
@@ -57,6 +58,12 @@ from turnstone.core.auth import (
 )
 from turnstone.core.idle_nudge_watcher import wake_workstream_if_pending
 from turnstone.core.log import get_logger
+from turnstone.core.mcp_utils import (
+    public_server_status as _public_server_status,
+)
+from turnstone.core.mcp_utils import (
+    strip_server_status_for_read as _strip_server_status_for_read,
+)
 from turnstone.core.metrics import metrics as _metrics
 from turnstone.core.model_turn import resolve_effort_setting, resolve_temperature_setting
 from turnstone.core.ratelimit import resolve_client_ip
@@ -698,6 +705,14 @@ def _interactive_dispatch_retry(ws: Workstream, user_msg: str) -> None:
     the pre-lift inline behaviour). The shared dispatcher owns the
     ``_worker_running`` lifecycle, so the ``run`` closure needs no
     ``finally`` flag-clear of its own.
+
+    Deliberately NOT gated on the /send order barrier
+    (``ws._pending_sends``): a retry is an explicit user action that
+    rewinds a COMPLETED turn — dispatching it ahead of deferred sends is
+    an accepted overtake (the user just asked for exactly that turn to
+    run again), not the silent send-vs-send inversion the barrier exists
+    to prevent.  Deferred entries dispatch after it, order among
+    themselves preserved.
     """
     from turnstone.core import session_worker
 
@@ -715,8 +730,22 @@ def _interactive_dispatch_retry(ws: Workstream, user_msg: str) -> None:
                 ui.on_stream_end()
                 ui.on_state_change("idle")
         except Exception as exc:
+            # Deliberately NOT routed through session.ensure_error_recorded: on a
+            # REUSED session a pre-try raise after a prior errored turn finds
+            # _has_persisted_error stale-True (it is session-lifetime — cleared
+            # only by _emit_state idle/running, not per-turn), so the recorder
+            # would no-op and swallow the fresh error.  The DISPLAY string is
+            # sanitized inline (a credential-bearing base-URL in the exception
+            # text must not cross into the dashboard SSE, the confidentiality
+            # floor _record_fatal_error also enforces); the double state emit and
+            # the pre-try no-persist (a reused-session retry can then have the
+            # coordinator read a STALE last_error) still need the per-turn
+            # error-signal redesign and are tracked in #865, matching the /send
+            # and coord-send sibling closures.
             if ws.worker_thread is me:
-                ui.on_error(f"Error: {exc}")
+                from turnstone.core.memory import sanitize_error_text
+
+                ui.on_error(f"Error: {sanitize_error_text(str(exc))}")
                 ui.on_stream_end()
                 ui.on_state_change("error")
 
@@ -980,7 +1009,31 @@ async def global_events_sse(request: Request) -> Response:
 
     On connect, emits a ``node_snapshot`` event with the full node state
     (workstreams, health, aggregate) followed by real-time delta events.
-    The snapshot and listener registration are atomic — no events are lost.
+    Listener registration happens under the fan-out lock BEFORE the
+    snapshot is built (the O(workstreams) build must not stall the
+    fan-out thread), so no event is lost: a delta stamped while the
+    snapshot builds is both reflected in the (newer) snapshot and queued
+    behind it, and consumers absorb the double-representation because
+    the stream is state-of-world — app.js re-applies deltas over the
+    snapshot idempotently, the console collector rebuilds wholesale.
+    The visible cost is at most a transient stale tick during the build
+    window, healed by the next delta.
+
+    Resume contract (#881): every event's SSE ``id:`` is
+    ``"{boot_epoch}-{counter}"``, where ``boot_epoch`` is a per-process
+    nonce and ``counter`` is the process-local monotonic event id.  A
+    reconnect presenting a cursor (``Last-Event-ID`` header or
+    ``?last_event_id=``) whose epoch matches gets the ring replay
+    (``replay_ok`` past the counter, or a ``replay_truncated`` envelope
+    with ``reason="ring_evicted"`` when the ring has moved on); a cursor
+    from any other epoch — a prior boot, another node, a pre-#881
+    bare-int client — gets ``replay_truncated`` with
+    ``reason="boot_epoch"`` followed by a fresh ``node_snapshot``, since
+    the events it missed died with the process that minted it.
+    ``boot_epoch`` is not exclusively a foreign-epoch signal: a
+    same-epoch cursor over an EMPTY ring (impossible from our own ids —
+    forged or a bug) also draws it via the fail-safe branch below.  Clients
+    treat the cursor as an opaque string; only this handler parses it.
     """
     # -- Service-scope gate ---------------------------------------------------
     # The global stream carries cluster-wide workstream inventory across
@@ -1008,14 +1061,44 @@ async def global_events_sse(request: Request) -> Response:
     # Native EventSource sets the header on auto-reconnect; the
     # manual-reconnect path (which can't set custom headers on
     # ``new EventSource(url)``) uses the query-param fallback.
+    #
+    # Global ids are ``"{boot_epoch}-{counter}"`` (#881): the epoch half
+    # proves the cursor was minted by THIS process.  The counter reboots
+    # at 0 with the process, so without the epoch a pre-restart cursor is
+    # first invisibly "ahead" of the reborn ring (empty replay slice) and
+    # then, as the counter re-grows past it, aliases into the new id
+    # space — both draw ``replay_ok`` and silently skip the restart
+    # boundary.  Parse outcomes:
+    #   - no cursor            → ``last_event_id = None`` (fresh);
+    #   - epoch matches        → ``last_event_id = counter`` (ring logic);
+    #   - anything else        → ``cursor_stale = True`` (a cursor was
+    #     presented but is unusable: prior-boot epoch, another node's
+    #     epoch, a bare-int cursor from a pre-#881 client, or garbage)
+    #     → the ``replay_truncated`` + node_snapshot floor below.  A
+    #     present-but-unusable cursor must NOT fall back to ``fresh``:
+    #     fresh is the no-loss shape, and this caller has provably
+    #     lost the events between its cursor and this boot.
+    boot_epoch: str = request.app.state.global_boot_epoch
     last_event_id_raw = request.headers.get("Last-Event-ID") or request.query_params.get(
         "last_event_id"
     )
-    last_event_id: int | None
-    try:
-        last_event_id = int(last_event_id_raw) if last_event_id_raw else None
-    except (TypeError, ValueError):
-        last_event_id = None
+    last_event_id: int | None = None
+    cursor_stale = False
+    if last_event_id_raw:
+        cursor_epoch, sep, counter_raw = last_event_id_raw.partition("-")
+        if sep and cursor_epoch == boot_epoch:
+            try:
+                last_event_id = int(counter_raw)
+            except ValueError:
+                cursor_stale = True
+            else:
+                if last_event_id < 0:
+                    # Our counters start at 1; a negative counter can
+                    # only be forged.  Same floor as garbage.
+                    last_event_id = None
+                    cursor_stale = True
+        else:
+            cursor_stale = True
 
     # -- Atomic snapshot / replay-slice + listener registration ---------------
     client_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1000)
@@ -1025,50 +1108,93 @@ async def global_events_sse(request: Request) -> Response:
         request.app.state.global_event_buffer
     )
 
-    # Three replay shapes, matching :func:`make_events_handler`:
+    # Four replay shapes (the first three matching :func:`make_events_handler`):
     #   - ``last_event_id is None`` → ``"fresh"``: emit node_snapshot
     #     then live.
     #   - ``last_event_id`` + buffer covers gap → ``"replay_ok"``:
     #     emit buffered events past the id, SKIP node_snapshot, then
     #     live.
-    #   - ``last_event_id`` + buffer too short → ``"truncated"``: emit
-    #     a ``replay_truncated`` envelope then fall through to
-    #     ``"fresh"`` (node_snapshot is the recovery floor).
+    #   - ``last_event_id`` + buffer too short → ``"truncated"``
+    #     (``reason="ring_evicted"``, honest ``lost_count``): emit a
+    #     ``replay_truncated`` envelope then fall through to ``"fresh"``
+    #     (node_snapshot is the recovery floor).
+    #   - ``cursor_stale`` (#881) → ``"truncated"``
+    #     (``reason="boot_epoch"``): the cursor is from another boot —
+    #     the prior ring died with its process, so what was lost is
+    #     unknowable; the envelope omits ``lost_count`` /
+    #     ``earliest_available_id`` rather than guess.  The per-ws
+    #     stream never needs this arm: its counter is storage-seeded
+    #     across restarts, so plain counter comparison detects staleness
+    #     there (see ``register_listener_with_replay``); the global
+    #     counter is process-local and reboots at 0, hence the epoch.
     replay_status: str
+    truncated_reason = "ring_evicted"
     replay_events: list[dict[str, Any]] = []
     lost_count = 0
     earliest_available_id = 0
     snapshot: dict[str, Any] | None = None
 
     with listeners_lock:
-        if last_event_id is None:
+        if cursor_stale:
+            replay_status = "truncated"
+            truncated_reason = "boot_epoch"
+        elif last_event_id is None:
             replay_status = "fresh"
-            snapshot = _build_node_snapshot(request.app.state)
         else:
             buffered = list(event_buffer)
             if not buffered:
-                replay_status = "replay_ok"
+                # Same-epoch cursor against an empty ring is impossible
+                # by construction (ids are only minted by the fanout
+                # thread's single append site, first id 1, and the ring
+                # is never cleared — an id implies a non-empty ring), so
+                # a cursor landing here is forged or a bug.  Fail SAFE
+                # to the truncated floor: the snapshot rebuild is
+                # idempotent, whereas trusting the cursor would replay
+                # nothing and ghost the roster (#881's original lie).
+                replay_status = "truncated"
+                truncated_reason = "boot_epoch"
             else:
                 earliest_available_id = buffered[0][0]
                 if last_event_id < earliest_available_id - 1:
                     replay_status = "truncated"
                     lost_count = (earliest_available_id - 1) - last_event_id
-                    snapshot = _build_node_snapshot(request.app.state)
                 else:
                     replay_status = "replay_ok"
                     replay_events = [ev for eid, ev in buffered if eid > last_event_id]
         listeners.append(client_queue)
 
+    def _deregister() -> None:
+        """Remove this connection's queue from the fan-out list.
+
+        Idempotent (``in`` check under the lock).  Two owners share it:
+        the generator's ``finally`` on every stream exit, and the
+        registration-window guard below for exits that fire before the
+        generator exists.
+        """
+        with listeners_lock:
+            if client_queue in listeners:
+                listeners.remove(client_queue)
+
     async def event_generator() -> AsyncGenerator[dict[str, Any], None]:
         _metrics.record_sse_connect()
 
         def _format_event(event: dict[str, Any]) -> dict[str, str]:
-            """Strip ``_event_id`` from the wire dict, attach SSE ``id:``."""
+            """Strip ``_event_id`` from the wire dict, attach SSE ``id:``.
+
+            The id is ``"{boot_epoch}-{counter}"`` — GLOBAL-LANE ONLY
+            (#881).  Do not propagate the epoch tag to the per-ws
+            formatter in ``make_events_handler``: per-ws ids must stay
+            bare ints — their counter is storage-seeded across restarts
+            (epoch unnecessary), clients seed cursors from ``/history``'s
+            integer ``cursor``, and coordinator.js's counter-reset
+            detector does ``Number(event.lastEventId)`` comparisons that
+            an epoch prefix would turn into ``NaN`` and silently kill.
+            """
             ev_copy = dict(event)
             eid = ev_copy.pop("_event_id", None)
             out: dict[str, str] = {"data": json.dumps(ev_copy)}
             if eid is not None:
-                out["id"] = str(eid)
+                out["id"] = f"{boot_epoch}-{eid}"
             return out
 
         try:
@@ -1078,15 +1204,23 @@ async def global_events_sse(request: Request) -> Response:
             yield {"retry": random.randint(2500, 4500)}
 
             if replay_status == "truncated":
-                yield {
-                    "data": json.dumps(
-                        {
-                            "type": "replay_truncated",
-                            "lost_count": lost_count,
-                            "earliest_available_id": earliest_available_id,
-                        }
-                    )
+                # ``reason`` distinguishes an in-epoch ring overrun
+                # (``ring_evicted`` — ``lost_count`` /
+                # ``earliest_available_id`` are honest) from a
+                # cross-boot cursor (``boot_epoch`` — the prior ring
+                # died with its process, so the loss is unknowable and
+                # the numeric fields are OMITTED rather than invented).
+                # No first-party consumer reads the numeric fields
+                # (app.js reads only ``type`` and resyncs), so the
+                # conditional shape is wire-safe.
+                envelope: dict[str, Any] = {
+                    "type": "replay_truncated",
+                    "reason": truncated_reason,
                 }
+                if truncated_reason == "ring_evicted":
+                    envelope["lost_count"] = lost_count
+                    envelope["earliest_available_id"] = earliest_available_id
+                yield {"data": json.dumps(envelope)}
             if replay_status == "replay_ok":
                 for ev in replay_events:
                     yield _format_event(ev)
@@ -1111,11 +1245,62 @@ async def global_events_sse(request: Request) -> Response:
                     pass  # poll timeout, retry
         finally:
             _metrics.record_sse_disconnect()
-            with listeners_lock:
-                if client_queue in listeners:
-                    listeners.remove(client_queue)
+            _deregister()
 
-    return EventSourceResponse(event_generator(), ping=5)
+    # Registration-window guard (#881 round-2 review): from the append
+    # above until the return below, THIS frame owns the listener — the
+    # generator's ``finally`` (the normal owner) cannot run before the
+    # generator exists, so any exit in this window must de-register or
+    # the queue leaks into the fan-out loop forever (the fan-out thread
+    # never removes dead listeners; pre-#881 the append was the LAST
+    # statement of the locked block precisely so a raising snapshot
+    # build could not strand it).  Everything that can raise lives
+    # inside the try — the snapshot build (storage reads + per-ws
+    # locks), the log call, and response construction; the two ``def``s
+    # above are pure bindings and cannot.  ``BaseException``: the
+    # window is await-free today, so a cancellation cannot land inside
+    # it, but the guard must not silently narrow if a future edit
+    # introduces an await.  Ownership passes to the generator's
+    # ``finally`` once the return succeeds.
+    try:
+        if replay_status != "replay_ok":
+            # Snapshot built AFTER the lock: ``_build_node_snapshot``
+            # is an O(workstreams) walk taking each ws's ``_ws_lock``,
+            # and under ``global_listeners_lock`` it would stall the
+            # fanout thread's per-event stamping for EVERY listener —
+            # N-fold during a restart herd of stale-cursor reconnects,
+            # exactly when the reborn node is emitting its re-open
+            # events.  Registration already happened under the lock
+            # above, so every event from that instant on is queued to
+            # this listener: nothing is lost, and deltas stamped while
+            # the snapshot builds re-apply idempotently over the
+            # (newer) snapshot at the consumer (state-of-world
+            # contract — see the endpoint docstring).  ``replay_ok``
+            # is by design exactly the no-snapshot shape (truncated
+            # always carries the snapshot floor, fresh always
+            # snapshots), so this predicate and the generator's
+            # emission branch stay one rule.
+            snapshot = _build_node_snapshot(request.app.state)
+
+        if replay_status == "truncated":
+            # Envelope chokepoint log, analog of
+            # ``ws.events.replay_truncated`` on the per-ws lane — one
+            # line per gap detection, the operator signal that clients
+            # are being told to resync (a burst of ``reason=boot_epoch``
+            # right after startup is the restart herd healing; sustained
+            # ``reason=ring_evicted`` means the ring cap is being
+            # outrun).
+            log.info(
+                "global.events.replay_truncated",
+                reason=truncated_reason,
+                lost_count=lost_count if truncated_reason == "ring_evicted" else None,
+                cursor=(last_event_id_raw or "")[:64],
+            )
+
+        return EventSourceResponse(event_generator(), ping=5)
+    except BaseException:
+        _deregister()
+        raise
 
 
 async def dashboard(request: Request) -> JSONResponse:
@@ -1616,6 +1801,15 @@ async def metrics_endpoint(request: Request) -> Response:
     return Response(content, media_type="text/plain; version=0.0.4; charset=utf-8")
 
 
+# Quick-command completion backstop.  MUST stay strictly below the
+# console proxy's client timeout (console/server.py
+# _PROXY_CLIENT_TIMEOUT_S = 30) or the degraded ``running`` answer can
+# never traverse a proxied pane — the proxy aborts first, the pane's
+# dispatch swallows the 5xx, and the caller sees nothing at all.  The
+# inequality is pinned by a test importing both constants.
+_COMMAND_RESPONSE_BACKSTOP_S = 25
+
+
 def _capture_cancel_forensics(session: Any, ui: Any, *, was_running: bool) -> dict[str, Any]:
     """Snapshot in-flight session state for the cancel response.
 
@@ -1715,23 +1909,228 @@ async def command(request: Request) -> JSONResponse:
                 status_code=400,
             )
 
-        should_exit = ws.session.handle_command(cmd)
-        if should_exit:
-            ui.on_info("Session ended. You can close this tab.")
-        # Handle UI updates for workstream-changing commands
-        if cmd_word in ("/clear", "/new"):
-            ui._enqueue({"type": "clear_ui"})
-        elif cmd_word == "/resume":
-            # clear_ui signals the frontend to re-fetch history via REST.
-            ui._enqueue({"type": "clear_ui"})
-        # Sync in-memory workstream name after any command that can change it.
-        # This ensures /api/workstreams and future page loads see the right name.
-        if cmd_word in ("/name", "/resume"):
-            from turnstone.core.memory import get_workstream_display_name
+        from turnstone.core import session_worker
 
-            updated_name = get_workstream_display_name(ws.session.ws_id) if ws.session else None
-            if updated_name:
-                ws.name = updated_name
+        session = ws.session
+        cmd_ui = ui
+        busy_hit = False
+
+        def _reject_busy() -> None:
+            # Worker already running (a turn or another command is in
+            # flight).  Commands aren't queueable work — surface "busy"
+            # instead.  Server-side mirror of the composer's client guard,
+            # and a strict improvement for API callers: the old inline path
+            # let /clear & co. mutate the session mid-turn.
+            nonlocal busy_hit
+            busy_hit = True
+
+        def _dispatch_command(
+            run: Callable[[], None], thread_name: str, busy_hint: str
+        ) -> JSONResponse | None:
+            """Dispatch a command worker; return the refusal response or None.
+
+            One envelope for both command branches: the unknown-workstream
+            404 and the busy refusal differ only in the retry hint.  The
+            worker slot is claimed with ``worker_kind="command"`` — the
+            /send route DEFERS (never queues) while that kind holds the
+            slot, so the mid-turn interjection queue and its turn-shaped
+            semantics (length cap, cross-user guard) are unreachable for
+            the whole command window; messages sent mid-command are
+            answered ``queued`` immediately and dispatched as ordinary
+            full-fidelity sends by the pending-send drain when the window
+            closes.
+            """
+            try:
+                dispatched = session_worker.send(
+                    ws,
+                    enqueue=_reject_busy,
+                    run=run,
+                    thread_name=thread_name,
+                    worker_kind="command",
+                )
+            except Exception:
+                # Thread.start failed (exhaustion, MemoryError) — the
+                # dispatcher rolled the slot claim back and re-raised.
+                # Answer 503, NOT the endpoint's generic 200-ok arm: a
+                # command worker that never spawned must be as loud as
+                # the busy 409 below — a status-code-only SDK caller
+                # would otherwise believe its /clear//name//resume
+                # applied and silently run against un-changed state.
+                log.exception("command.worker_spawn_failed ws=%s", ws.id[:8])
+                return JSONResponse(
+                    {
+                        "status": "error",
+                        "error": "Command worker could not be started — retry shortly.",
+                    },
+                    status_code=503,
+                )
+            if not dispatched:
+                return JSONResponse({"error": "Unknown workstream"}, status_code=404)
+            if busy_hit:
+                # 409, not 200: the refusal is deliberate (mutual exclusion
+                # replaced the old inline mid-turn interleave) but it must
+                # be LOUD — a status-code-only SDK caller treats a 200 as
+                # "command ran" and silently loses the rename/clear/config
+                # change.  Same shape as /send's cross-user 409.
+                return JSONResponse(
+                    {
+                        "status": "busy",
+                        "error": (
+                            "Session is busy — wait for the current turn to "
+                            f"finish, then {busy_hint}."
+                        ),
+                    },
+                    status_code=409,
+                )
+            return None
+
+        if cmd_word == "/compact":
+            # Manual compaction runs LLM summary calls — seconds to minutes.
+            # It gets the send path's worker dispatch instead of an inline
+            # call so (a) the event loop stays free to stream the compaction
+            # progress events this very command produces (inline, they only
+            # flushed in one burst after the blocking call returned — the
+            # "no visible indicator" bug), and (b) a message sent
+            # mid-compaction takes the existing queue path instead of racing
+            # the history swap on a second worker.  compact_now() carries
+            # send()'s generation discipline, so a force-abandoned compact
+            # thread goes stale instead of swapping history under a
+            # successor, and a cancel aimed at it is consumed on exit.
+            # Fire-and-forget: the response returns as soon as the worker is
+            # dispatched and NO completion bound applies — a large context
+            # can legitimately compact for many minutes; progress streams
+            # over SSE and Stop cancels it.  (The 25s wait below is for the
+            # quick commands only.)
+
+            def _run_compact() -> None:
+                me = threading.current_thread()
+                # Snapshot for the exit restore: with the slot free to
+                # claim, only IDLE or ERROR are reachable here (the live
+                # states imply a held slot and _dispatch_command refuses
+                # busy).  ERROR is the user-investigatable badge (same
+                # carve-out the orphan reaper honors) and /compact neither
+                # retries nor resolves the failed turn — the old inline
+                # /compact never touched ws.state — so the badge must
+                # survive the window; everything else exits to idle.
+                prev_state = ws.state
+                try:
+                    cmd_ui.on_state_change("thinking")
+                    session.compact_now()
+                except GenerationCancelled:
+                    # User stopped it — including a Stop that landed in the
+                    # completion tail, which compact_now re-raises after
+                    # consuming.
+                    pass
+                finally:
+                    # Abandoned-worker guard — mirrors the send/retry
+                    # closures: a force-cancelled compact thread must not
+                    # touch state a successor worker now owns.
+                    if ws.worker_thread is me:
+                        try:
+                            # Backstop only: sends during the command window
+                            # DEFER in the /send route (they cannot reach the
+                            # interjection queue — see _dispatch_command), so
+                            # anything found here predates the window (a
+                            # message stranded by a dying send worker's
+                            # closing race).  Record it in the transcript
+                            # rather than leaving it invisible.
+                            if session.flush_queued_messages():
+                                log.warning("ws.compact.stranded_queue_flushed ws=%s", ws.id[:8])
+                        except Exception:
+                            log.exception("ws.compact.exit_seam_failed ws=%s", ws.id[:8])
+                        cmd_ui.on_state_change(
+                            "error" if prev_state is WorkstreamState.ERROR else "idle"
+                        )
+
+            refusal = _dispatch_command(
+                _run_compact, f"compact-worker-{ws.id[:8]}", "run /compact again"
+            )
+            if refusal is not None:
+                return refusal
+            return JSONResponse({"status": "ok"})
+
+        # Every other command ALSO runs on the workstream's worker slot —
+        # the inline call this replaced was serialized by the event loop
+        # itself (nothing else could interleave with it); to_thread alone
+        # would let /clear & co. race a running /compact worker, a live
+        # send, or another command.  The slot restores that mutual
+        # exclusion with an explicit busy answer, and the endpoint awaits
+        # completion off-loop so the response still reflects the outcome.
+        loop = asyncio.get_running_loop()
+        done = asyncio.Event()
+
+        def _run_cmd() -> None:
+            me = threading.current_thread()
+            try:
+                should_exit = session.handle_command(cmd)
+                # Post-command follow-ups run HERE, on the worker, not
+                # after the endpoint's done-wait: past the 25s backstop the
+                # endpoint has already answered {"status": "running"}, and
+                # follow-ups parked there were silently skipped — a slow
+                # /resume left every pane rendering the pre-resume
+                # transcript against a session whose history had changed,
+                # and the workstream list kept the stale name.
+                # Abandoned-worker guard, mirroring every sibling closure:
+                # a force-cancelled wedged command that unwedges minutes
+                # later must not fire clear_ui into a successor turn's live
+                # stream (every pane would wipe mid-answer) nor write a
+                # post-swap name from a stale session read.
+                if ws.worker_thread is me:
+                    if should_exit:
+                        cmd_ui.on_info("Session ended. You can close this tab.")
+                    if cmd_word in ("/clear", "/new", "/resume"):
+                        # clear_ui signals the frontend to re-fetch history
+                        # via REST.
+                        cmd_ui._enqueue({"type": "clear_ui"})
+                    if cmd_word in ("/name", "/resume"):
+                        # Sync the in-memory workstream name after any
+                        # command that can change it, so /api/workstreams
+                        # and future page loads see the right name.
+                        from turnstone.core.memory import get_workstream_display_name
+
+                        updated_name = get_workstream_display_name(session.ws_id)
+                        if updated_name:
+                            ws.name = updated_name
+            except Exception as e:
+                # Same guard: a late "Command error:" from an abandoned
+                # worker would land mid-successor-turn.
+                if ws.worker_thread is me:
+                    cmd_ui.on_error(f"Command error: {e}")
+            finally:
+                # Unblock the endpoint response.  Suppress the loop-closed
+                # RuntimeError (process shutdown mid-command): nobody is
+                # waiting anymore.  No queue drain here: sends during the
+                # command window DEFER in the /send route (the interjection
+                # queue is unreachable while worker_kind == "command"), so
+                # the pending-send drain dispatches them as ordinary sends
+                # when this worker exits — the stranded-message backstop
+                # lives on the /compact seam, the only command window long
+                # enough to matter.
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(done.set)
+
+        refusal = _dispatch_command(_run_cmd, f"command-worker-{ws.id[:8]}", "retry the command")
+        if refusal is not None:
+            return refusal
+        # Commands are quick (the long-runner, /compact, took the branch
+        # above); the bound is a backstop so a wedged command can't hold
+        # this request open forever — the worker keeps running, its output
+        # reaches the pane via SSE, and the post-command follow-ups run on
+        # the worker itself, so a late completion still refreshes the
+        # panes.  Loop-native wait (call_soon_threadsafe from the worker's
+        # finally): a thread parked in Event.wait via to_thread would hold
+        # a shared default-executor slot for the whole wait per wedged
+        # command.  The bound (_COMMAND_RESPONSE_BACKSTOP_S) sits strictly
+        # under the console proxy's client timeout so the degraded
+        # ``running`` answer can actually traverse a proxied pane — at 60s
+        # the proxy aborted first, the pane's dispatch swallowed the 5xx,
+        # and the user saw nothing at all (the same bounded-caller
+        # reasoning that redesigned /send's command-window path).
+        try:
+            async with asyncio.timeout(_COMMAND_RESPONSE_BACKSTOP_S):
+                await done.wait()
+        except TimeoutError:
+            return JSONResponse({"status": "running"})
     except Exception as e:
         ui.on_error(f"Command error: {e}")
 
@@ -1980,6 +2379,7 @@ async def _interactive_create_validate_request(
             status_code=400,
         )
     inherited_pid = False
+    resume_inherited_pid = False
     body_parent = body.get("parent_ws_id") or None
     if body_parent is not None:
         from turnstone.core.storage._registry import get_storage as _get_storage_for_parent
@@ -2007,6 +2407,60 @@ async def _interactive_create_validate_request(
         if not (body.get("project_id") or "") and parent_row.get("project_id"):
             body["project_id"] = parent_row.get("project_id")
             inherited_pid = True
+    # Fork/resume: a fork's project is STRUCTURALLY its source's, and only when
+    # the require_project gate is on (off is byte-identical — no resolve, no
+    # inherit, explicit project_id untouched). This DELIBERATELY DIVERGES from the
+    # sibling parent-coordinator block at :2244: that block DEFERS to an explicit
+    # body project_id (a coordinator spawn carries no history, so the
+    # spawn_workstream(project=…) escape hatch is legitimate), whereas a fork
+    # copies the SOURCE's conversation — which must never be re-filed under an
+    # unrelated project the caller merely owns — so here we DISCARD any explicit
+    # project_id up front and then inherit only the source's own project. An
+    # explicit body project_id can never influence a fork.
+    #
+    # No cross-tenant oracle, by construction: for a source that is inaccessible-
+    # private (attach 403 → resume_inherited_pid drop below), projectless, or
+    # nonexistent/unresolvable, body["project_id"] stays "" and the gate emits ONE
+    # uniform 400 — identical BODY *and* STATUS (the discard, not body-equalising,
+    # is what makes them indistinguishable). The residual side-channel is DB-query
+    # LATENCY only (an inaccessible-private source runs extra get_project/
+    # is_project_member); constant-time storage is out of scope.
+    #
+    # RAW/raising storage is deliberate — the swallowing memory.resolve_workstream
+    # would turn a transient DB error into None → a misleading "requires a project"
+    # 400, whereas a raise here surfaces an honest 500 (consistent with the parent
+    # block's sync get_workstream). resume_ws is only read, never mutated:
+    # post_install still performs the real fork (one extra indexed lookup on the
+    # rare fork path). Caveat (pre-existing to the resume mechanic): post_install
+    # re-resolves via the swallowing resolver, so a delete/blip between here and
+    # there degrades the fork to a fresh chat in the inherited project.
+    from turnstone.core.auth import require_project_enabled
+
+    if (
+        isinstance(resume_ws_id, str)
+        and resume_ws_id
+        and require_project_enabled(getattr(request.app.state, "config_store", None))
+    ):
+        # Discard any caller-supplied project_id FIRST: a fork is filed under its
+        # SOURCE's project, or (no accessible source project) refused — never a
+        # caller pick. This structural discard is what blocks the re-file and makes
+        # the {inaccessible/projectless/nonexistent}-source outcomes uniform. It
+        # gates on require_project_enabled (the flag) and NOT require_project_denies_
+        # create (flag + service/coordinator exemptions), DELIBERATELY: the
+        # exemptions waive the "must have a project" MANDATE, but fork-integrity — a
+        # fork's copied history must never be re-filed under an unrelated project —
+        # is a security invariant that binds every forker while the feature is on.
+        # The two require_project predicates differ here on purpose.
+        body["project_id"] = ""
+        from turnstone.core.storage._registry import get_storage as _get_storage_for_resume
+
+        _rstorage = _get_storage_for_resume()
+        if _rstorage is not None:
+            _canonical = _rstorage.resolve_workstream(resume_ws_id)
+            _src_row = _rstorage.get_workstream(_canonical) if _canonical else None
+            if _src_row and _src_row.get("project_id"):
+                body["project_id"] = _src_row["project_id"]
+                resume_inherited_pid = True
     # Project attach gate (explicit or parent-inherited): a private
     # project accepts new workstreams only from its owner/members, and a
     # nonexistent EXPLICIT project_id is a caller error rather than a
@@ -2024,7 +2478,19 @@ async def _interactive_create_validate_request(
         denied = ensure_project_attachable(uid, attach_pid)
         if denied is not None:
             status, message = denied
-            if inherited_pid and status == 400:
+            if resume_inherited_pid:
+                # Resume-inherited project: ANY denial (unknown 400, private
+                # 403, storage-blip/None 403) drops to a projectless create, so
+                # a private/inaccessible/dangling SOURCE is indistinguishable
+                # from a projectless or nonexistent one. Surfacing the 403 would
+                # leak that the resume_ws id sits under a private project the
+                # caller can't see (a cross-tenant oracle). The require_project
+                # gate then emits ONE uniform 400 downstream.
+                body["project_id"] = ""
+            elif inherited_pid and status == 400:
+                # Parent-inherited dangling project (deleted): the child simply
+                # isn't attached. A 403 here (revoked coordinator membership)
+                # still hard-returns below — deliberately loud, unlike resume.
                 body["project_id"] = ""
             else:
                 return JSONResponse({"error": message}, status_code=status)
@@ -2275,17 +2741,65 @@ async def _interactive_create_post_install(
             resolved_atts, staged_ord, _drop = _resolve_staged(attachment_ids, ws.id, uid)
 
         def _run_initial() -> None:
+            me = threading.current_thread()
             try:
                 session.send(
                     initial_message,
                     attachments=resolved_atts or None,
                     send_id=send_id if resolved_atts else None,
                 )
-            except (Exception, GenerationCancelled):
-                if isinstance(ws.ui, WebUI):
+            except GenerationCancelled:
+                # Defense-in-depth, effectively unreachable on the init path:
+                # send self-handles an in-turn cancel and self-emits idle
+                # (session.py:6474), and an orphaned/superseded cancel returns
+                # WITHOUT re-raising — so this arm carries no direct unit test,
+                # its non-triggering being send's own contract.  Kept for
+                # symmetry with the _run/_run_cmd/_run_compact siblings and to
+                # settle a stray GenerationCancelled to idle rather than leak it.
+                if ws.worker_thread is me and isinstance(ws.ui, WebUI):
                     ws.ui.on_stream_end()
                     ws.ui.on_state_change("idle")
+            except Exception as exc:
+                # A failed first turn settles to state=error, NOT idle.  The old
+                # combined arm stamped idle unconditionally, clobbering the
+                # error row send had just written, so the coord's wait/inspect
+                # (which reads last_error only for state=="error") saw an empty
+                # "successful" turn ("no recent assistant output") and the real
+                # failure stayed invisible until a manual nudge re-ran it.
+                # ensure_error_recorded is a no-op when send already recorded
+                # the error in-line (no double state emit) and the recorder when
+                # a pre-try exception bypassed send's handler (so state=error
+                # always carries a last_error).  Owner-guarded like every
+                # sibling closure: a late-unwedging abandoned init must not stamp
+                # over a successor.
+                #
+                # Settling to error (not idle) is deliberately terminal for
+                # automated wakes: a watch/schedule nudge enqueued during a
+                # failed init is not re-delivered at worker exit
+                # (wake_workstream_if_pending is idle-gated) — a failed first
+                # turn is a non-ready terminal, not the idle ready-set that
+                # timer/watch wakes recur to; explicit user/coordinator action
+                # reactivates it.  A self-healing wake-from-error would be a
+                # separate wake-gate change, out of scope here.
+                if ws.worker_thread is me and isinstance(ws.ui, WebUI):
+                    ws.ui.on_stream_end()
+                    session.ensure_error_recorded(exc)
             finally:
+                # Deliberately NOT owner-gated, unlike the except arms above
+                # and the _run_cmd/_run_compact follow-ups: those mutate
+                # live slot/UI state a successor now owns, while the notify
+                # is workstream-scoped — an outward signal that this
+                # workstream's initial turn ran to completion and its
+                # answer is in the transcript.  _fire_notify_targets has
+                # exactly ONE call site (here); successor turns never
+                # notify, so there is no successor duplicate for an owner
+                # gate to prevent — gating it turned force-cancel into
+                # permanent notification loss for scheduled/unattended
+                # workstreams (the empty-content fallback covers the
+                # error/cancel exits, as it always did).  Outcome-honesty —
+                # a failed or force-cancelled init still notifies the
+                # empty-content "(Task completed)" fallback, not "Failed:" —
+                # is deferred to #865.
                 try:
                     last_content = _extract_last_assistant_content(session)
                     _fire_notify_targets(ws, last_content)
@@ -2311,6 +2825,15 @@ async def _interactive_create_post_install(
             # message were delivered.
             nonlocal init_enqueued
             init_enqueued = True
+            if ws.worker_kind == "command":
+                # A command worker (e.g. a minutes-long /compact) holds the
+                # raced slot: the interjection queue is turn-shaped (length
+                # cap, and the text would cross a /resume identity swap) and
+                # must stay unreachable during command windows — same rule
+                # as the /send route's defer.  queue.Full is the existing
+                # backpressure surface: the create reports the first message
+                # as undelivered (``queue_full``) and the client retries.
+                raise queue.Full()
             session.queue_message(initial_message)
             if resolved_atts:
                 log.warning(
@@ -2330,6 +2853,9 @@ async def _interactive_create_post_install(
         # creation) unless a caller-supplied ws_id is raced — hence
         # ``_enqueue_init`` preserves the message and leaves the staged
         # attachments recoverable instead of assuming the branch is dead.
+        # No /send order-barrier pre-check for the same by-construction
+        # reason: a freshly created workstream cannot have deferred sends
+        # pending (``ws._pending_sends`` only ever grows via that route).
         init_ok = session_worker.send(
             ws,
             enqueue=_enqueue_init,
@@ -2814,7 +3340,7 @@ def _project_request_uid(request: Request) -> tuple[str, JSONResponse | None]:
 
 async def list_projects(request: Request) -> JSONResponse:
     """GET /v1/api/projects — projects the caller owns, is a member of, or public."""
-    from turnstone.core.auth import require_permission
+    from turnstone.core.auth import require_permission, require_project_enabled
     from turnstone.core.storage import get_storage
 
     err = require_permission(request, "project.read")
@@ -2830,7 +3356,17 @@ async def list_projects(request: Request) -> JSONResponse:
     )
     storage = get_storage()
     rows = storage.list_projects_for_user(uid, include_archived=include_archived) if storage else []
-    return JSONResponse({"projects": [_project_view(r) for r in rows], "total": len(rows)})
+    # Advisory only — the create gate on the enforcing node is authoritative.
+    # Read via the SAME predicate so advisory and gate can't drift in logic
+    # (they still read per-process ConfigStore caches, which converge at rest).
+    cs = getattr(request.app.state, "config_store", None)
+    return JSONResponse(
+        {
+            "projects": [_project_view(r) for r in rows],
+            "total": len(rows),
+            "require_project": require_project_enabled(cs),
+        }
+    )
 
 
 async def create_project(request: Request) -> JSONResponse:
@@ -3352,59 +3888,10 @@ def internal_mcp_reload(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok", **result})
 
 
-_SERVER_STATUS_PUBLIC_KEYS: tuple[str, ...] = (
-    "connected",
-    "tools",
-    "resources",
-    "prompts",
-    "error",
-    "transport",
-    "circuit_open",
-    "consecutive_failures",
-)
-
-_READ_STATUS_PUBLIC_KEYS: tuple[str, ...] = tuple(
-    k for k in _SERVER_STATUS_PUBLIC_KEYS if k != "error"
-)
-
-
-def _strip_server_status(full: dict[str, Any]) -> dict[str, Any]:
-    """Project a status dict to the approve-scope public-safe key set.
-
-    The full status dict embeds ``command`` (stdio argv) and ``url``
-    (remote MCP endpoint) which are admin-only context. Approve-scoped
-    callers (refresh/reconnect) get the verbose ``error`` text so an
-    operator triaging a failure sees the underlying exception.
-
-    Read-scope callers must use :func:`_strip_server_status_for_read`
-    instead — error strings can carry stdio binary paths
-    (``FileNotFoundError: ... '/usr/local/bin/...'``) or internal MCP
-    URLs (``httpx.ConnectError: ... 'https://internal/...'``) and
-    those are equivalent to leaking ``command``/``url``.
-    """
-    return {k: full[k] for k in _SERVER_STATUS_PUBLIC_KEYS if k in full}
-
-
-def _strip_server_status_for_read(full: dict[str, Any]) -> dict[str, Any]:
-    """Project a status dict for read-scope callers.
-
-    Drops the verbose ``error`` text and replaces it with a coarse
-    ``has_error: bool`` so dashboards can light up a failure indicator
-    without leaking the underlying exception detail.
-    """
-    out = {k: full[k] for k in _READ_STATUS_PUBLIC_KEYS if k in full}
-    out["has_error"] = bool(full.get("error"))
-    return out
-
-
-def _public_server_status(mcp_mgr: Any, name: str) -> dict[str, Any]:
-    """Strip ``command``/``url`` from ``get_server_status`` before returning over the wire."""
-    # aggregate=True: the operator refresh/reconnect endpoints are approve-scoped
-    # cluster actions with no single requesting user, so oauth_user servers report
-    # the any-user warm-pool view (matching the admin console) rather than the
-    # per-user default — which, with user_id=None, would render a warm, in-use
-    # server as disconnected/empty right after a successful refresh.
-    return _strip_server_status(mcp_mgr.get_server_status(name, aggregate=True))
+# Wire-safety status projections live in core/mcp_utils (#725: the
+# console's coordinator-facing arms present the same schema); imported
+# at the top of this module under the established private names so
+# every endpoint body below stays byte-identical.
 
 
 def internal_mcp_status(request: Request) -> JSONResponse:
@@ -3881,14 +4368,19 @@ def _aggregate_emitter_thread(
     mgr: SessionManager,
     global_queue: queue.Queue[dict[str, Any]],
     interval: float = 10.0,
+    stop: threading.Event | None = None,
 ) -> None:
     """Periodically emit aggregate token/tool_call totals on the global SSE queue.
 
     Runs as a daemon thread so the console receives periodic updates without
-    having to poll ``/v1/api/dashboard``.
+    having to poll ``/v1/api/dashboard``.  ``stop`` (#885) is the lifespan
+    shutdown signal — ``wait(interval)`` doubles as the tick sleep, so a
+    set wakes the thread immediately instead of stranding shutdown behind
+    a sleep.
     """
-    while True:
-        time.sleep(interval)
+    if stop is None:
+        stop = threading.Event()
+    while not stop.wait(interval):
         total_tokens = 0
         total_tool_calls = 0
         active_count = 0
@@ -3925,6 +4417,7 @@ def _idle_cleanup_thread(
     timeout_sec: float,
     global_queue: queue.Queue[dict[str, Any]],
     rate_limiter: Any = None,
+    stop: threading.Event | None = None,
 ) -> None:
     """Periodically close IDLE workstreams and clean up rate limiter buckets.
 
@@ -3933,14 +4426,27 @@ def _idle_cleanup_thread(
     ``reason="closed"``. The old manual emission here (``reason="idle"``)
     is gone — the frontend didn't differentiate "idle" from "closed"
     anyway and the duplicate event caused spurious UI flicker.
+
+    ``stop`` (#885): lifespan shutdown signal, same ``wait``-as-sleep
+    pattern as :func:`_aggregate_emitter_thread`.
     """
     del global_queue  # adapter handles the emission
+    if stop is None:
+        stop = threading.Event()
     check_every = min(300.0, timeout_sec / 4)  # check at 1/4 of timeout, max 5 min
-    while True:
-        time.sleep(check_every)
+    while not stop.wait(check_every):
         mgr.close_idle(timeout_sec)
         if rate_limiter is not None:
             rate_limiter.cleanup()
+
+
+# Shutdown sentinel for ``_global_fanout_thread`` (#885): the lifespan
+# puts THIS object on the global queue and the thread exits when it draws
+# it.  Identity-checked (``is``), so an event that merely equals it can't
+# spoof a shutdown; dict-typed so the queue's type stays honest.  FIFO
+# gives clean drain semantics — everything enqueued before the sentinel
+# still stamps + fans out.
+_FANOUT_SHUTDOWN: dict[str, Any] = {"type": "_fanout_shutdown"}
 
 
 def _global_fanout_thread(
@@ -3961,10 +4467,14 @@ def _global_fanout_thread(
     event lands in ONLY the buffer or ONLY the listener queue across
     the registration boundary.  Mirrors :meth:`SessionUIBase._enqueue`'s
     contract for the global lane.
+
+    Exits when it draws :data:`_FANOUT_SHUTDOWN` from the queue (#885).
     """
     while True:
         try:
             event = source_queue.get()
+            if event is _FANOUT_SHUTDOWN:
+                return
             with lock:
                 counter_holder[0] += 1
                 event_id = counter_holder[0]
@@ -3989,6 +4499,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     # Dedicated executor for SSE queue polling so it doesn't compete
     # with the default asyncio executor (which caps at ~32 workers).
     app.state.sse_executor = ThreadPoolExecutor(max_workers=200, thread_name_prefix="sse")
+    # Lifespan daemon-thread shutdown (#885): one shared Event for the
+    # sleep-loop threads plus the queue sentinel for the fanout; refs
+    # kept so the shutdown tail below can join them.  ``daemon=True``
+    # stays — it is the backstop if a join times out, not the shutdown
+    # mechanism.
+    daemon_stop = threading.Event()
     # Start global event fan-out thread
     fanout = threading.Thread(
         target=_global_fanout_thread,
@@ -4006,10 +4522,12 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     agg_emitter = threading.Thread(
         target=_aggregate_emitter_thread,
         args=(app.state.workstreams, app.state.global_queue),
+        kwargs={"stop": daemon_stop},
         daemon=True,
     )
     agg_emitter.start()
     # Start idle cleanup thread if configured
+    cleanup: threading.Thread | None = None
     if app.state.idle_timeout > 0:
         cleanup = threading.Thread(
             target=_idle_cleanup_thread,
@@ -4019,6 +4537,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 app.state.global_queue,
                 app.state.rate_limiter,
             ),
+            kwargs={"stop": daemon_stop},
             daemon=True,
         )
         cleanup.start()
@@ -4237,6 +4756,26 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     from turnstone.core.oidc import close_oidc_state
 
     await close_oidc_state(app.state)
+    # Stop the lifespan daemon threads (#885).  Sessions are already
+    # closed above, so their final ws_closed events sit ahead of the
+    # sentinel in the queue and still fan out (FIFO drain); the Event
+    # wakes the sleep-loop threads immediately.  Joins are bounded and
+    # off-loop; a thread that outlives its budget is logged and left to
+    # the daemon flag rather than wedging shutdown.
+    daemon_stop.set()
+    # The sentinel put stays inline (unlike the off-loop joins below): the
+    # fanout consumer is still alive here — it exits only on drawing this
+    # sentinel — and fans out with non-blocking put_nowait, so the bounded
+    # queue drains fast and put() returns at once; timeout=1 is a ceiling
+    # that never binds. Off-loop is reserved for the multi-second joins.
+    with contextlib.suppress(queue.Full):
+        app.state.global_queue.put(_FANOUT_SHUTDOWN, timeout=1)
+    for _t in (fanout, agg_emitter, cleanup):
+        if _t is None:
+            continue
+        await asyncio.to_thread(_t.join, 5)
+        if _t.is_alive():
+            log.warning("server.daemon_thread_join_timeout", thread=_t.name)
     app.state.sse_executor.shutdown(wait=True, cancel_futures=True)
 
 
@@ -4312,7 +4851,7 @@ def create_app(
         magic-mocked ``ws.user_id``."""
         return _require_ws_access(request, ws_id)
 
-    def _interactive_spawn_metrics(_request: Request, ui: Any) -> None:
+    def _interactive_spawn_metrics(ui: Any) -> None:
         """Per-conversation metrics fired once per send that spawns a
         fresh worker. Coord wires its own
         :func:`turnstone.console.server._coord_spawn_metrics` (the
@@ -4371,6 +4910,7 @@ def create_app(
         sse_executor_lookup=lambda request: request.app.state.sse_executor,
         create_supports_attachments=True,
         create_supports_user_id_override=True,
+        create_gate_require_project=True,
         create_validate_request=_interactive_create_validate_request,
         create_build_kwargs=_interactive_create_build_kwargs,
         create_post_install=_interactive_create_post_install,
@@ -4630,6 +5170,23 @@ def create_app(
     # Single-element list as a mutable int holder so the fanout
     # thread can ``counter_holder[0] += 1`` under the lock.
     app.state.global_event_id_holder = [0]
+    # Per-process boot epoch for the global SSE lane (#881).  The
+    # counter above reboots at 0 with the process (unlike the per-ws
+    # counters, which ``_seed_event_id_from_storage`` seeds from
+    # ``MAX(conversations.event_id)``), so a bare integer cursor from a
+    # prior boot is indistinguishable from — and eventually aliases
+    # into — the new id space.  Every global SSE ``id:`` is therefore
+    # stamped ``"{epoch}-{counter}"``; a reconnect cursor whose epoch
+    # differs from the live process is stale by construction and draws
+    # the ``replay_truncated`` + node_snapshot recovery floor in
+    # :func:`global_events_sse`.  Hex nonce (never contains ``-``), so
+    # ``partition("-")`` splits the id unambiguously.  64 bits: the
+    # equality check is the ONLY thing standing between a prior-boot
+    # cursor and a silent ``replay_ok``-empty alias, and the collision
+    # event is per same-node restart-pair — 2^-64 keeps a
+    # fleet-lifetime of restarts engineered far below threshold where
+    # 32 bits left it merely unlikely (review round 4).
+    app.state.global_boot_epoch = secrets.token_hex(8)
     app.state.skip_permissions = skip_permissions
     app.state.jwt_secret = jwt_secret
     app.state.auth_storage = auth_storage

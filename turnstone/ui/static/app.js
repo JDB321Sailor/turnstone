@@ -16,12 +16,15 @@ let workstreams = {};
 let currentWsId = null;
 let globalEvtSource = null;
 let globalRetryDelay = 1000;
-// Saved high-water mark for the manual-reconnect path (the
-// EventSource constructor can't set custom headers, so the
-// browser-native ``Last-Event-ID`` header is unavailable on
-// reconnect — we thread it via ``?last_event_id=N`` instead).  Updated
-// from ``globalEvtSource.lastEventId`` on every onmessage; native
-// auto-reconnect uses the header directly on the same source object.
+// Resume cursor for the global stream — the last SSE id observed, an
+// OPAQUE ``"{boot_epoch}-{counter}"`` string (#881).  Captured from the
+// MessageEvent in the global onmessage, presented as ``?last_event_id=``
+// on manual reconnects, and cleared when the record is dead: on a
+// ``replay_truncated`` envelope (the gap is being healed), on a
+// ``node_snapshot`` (the recovery floor — required, not belt-and-braces:
+// that id-less frame re-captures the connection's stale cursor on native
+// reconnects, see the branch comment) and on logout (roster identity
+// reset).  Never parsed here — only the server can interpret it.
 let globalLastEventId = null;
 let dashboardVisible = false;
 let _historyNavigation = false;
@@ -105,6 +108,12 @@ setInterval(pollHealth, 30000);
 // ===========================================================================
 
 window.onLoginSuccess = function () {
+  // Deferred (follow-up): a cold in-place login leaves the dashboard composer
+  // caches (models/skills/projects/personas) warmed pre-auth as empty (401 ->
+  // fail-open) until the Dashboard pane is re-focused (loadDashboard ->
+  // _loadDashboardOptionsLists) or the page reloads. The CONSOLE force-re-warms
+  // all four in its onLoginSuccess; the ui relies on the re-focus repaint and is
+  // NOT force-warmed here (out of the composer-cache scope) — revisit if it bites.
   initWorkstreams();
 };
 
@@ -116,6 +125,10 @@ window.onLogout = function () {
     globalEvtSource.close();
     globalEvtSource = null;
   }
+  // Roster identity reset — the next principal starts cursorless
+  // (fresh snapshot) rather than resuming from this session's stream
+  // position.
+  globalLastEventId = null;
   fireRender();
 };
 
@@ -336,80 +349,55 @@ function showNewWsModal(forkFromWsId) {
   if (skillLabel) skillLabel.hidden = !!_forkFromWsId;
   if (skillSelect) skillSelect.hidden = !!_forkFromWsId;
 
-  // Populate model dropdown
+  // Model + judge pickers — HIDDEN for a fork: a fork inherits its source's
+  // model + judge (like skill/persona/project), and submitNewWs gates both on
+  // !_forkFromWsId.  For a fresh create, paint from the warm cache with the
+  // resolved-default annotation ("Default — gpt-5"), FRESH on open (the reused
+  // dialog has no prior pick to carry over), then refresh-and-repaint.
+  const modelLabel = document.querySelector('label[for="new-ws-model"]');
+  const judgeLabel = document.querySelector('label[for="new-ws-judge-model"]');
   const modelSelect = document.getElementById("new-ws-model");
   const judgeSelect = document.getElementById("new-ws-judge-model");
-  const curModel = ""; // (focused-pane model prefill was PaneManager-only; dead in the L-shell)
-  modelSelect.textContent = "";
-  judgeSelect.textContent = "";
-  const defaultOpt = document.createElement("option");
-  defaultOpt.value = "";
-  defaultOpt.textContent = curModel
-    ? "Default (" + curModel + ")"
-    : "Default model";
-  modelSelect.appendChild(defaultOpt);
-  const defJudgeOpt = document.createElement("option");
-  defJudgeOpt.value = "";
-  defJudgeOpt.textContent = "Default (agent model)";
-  judgeSelect.appendChild(defJudgeOpt);
-  authFetch("/v1/api/models")
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      (data.models || []).forEach(function (m) {
-        const opt = document.createElement("option");
-        opt.value = m.alias;
-        opt.textContent =
-          m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
-        modelSelect.appendChild(opt);
+  if (modelLabel) modelLabel.hidden = !!_forkFromWsId;
+  if (judgeLabel) judgeLabel.hidden = !!_forkFromWsId;
+  if (modelSelect) modelSelect.hidden = !!_forkFromWsId;
+  if (judgeSelect) judgeSelect.hidden = !!_forkFromWsId;
+  if (!_forkFromWsId) {
+    _paintModelSelects(modelSelect, judgeSelect, { freshOnOpen: true });
+  }
 
-        const judgeOpt = document.createElement("option");
-        judgeOpt.value = m.alias;
-        judgeOpt.textContent = opt.textContent;
-        judgeSelect.appendChild(judgeOpt);
-      });
-    })
-    .catch(function () {
-      /* ignore — default model still works */
-    });
-
+  // Skill picker — hidden for a fork (inherited + submit-gated), so skip its
+  // paint too (no wasted /v1/api/skills fetch + hidden-select rebuild); a fresh
+  // create paints fresh-on-open from the warm cache, then refreshes.
   const tplSelect = document.getElementById("new-ws-skill");
-  const tplDefaultOpt = document.createElement("option");
-  tplDefaultOpt.value = "";
-  tplDefaultOpt.textContent = "Use defaults";
-  tplSelect.replaceChildren(tplDefaultOpt);
-  authFetch("/v1/api/skills")
-    .then(function (r) {
-      return r.json();
-    })
-    .then(function (data) {
-      (data.skills || []).forEach(function (t) {
-        const opt = document.createElement("option");
-        opt.value = t.name;
-        let label = t.name;
-        if (t.is_default) label += " (default)";
-        if (t.origin === "mcp") label += " [MCP]";
-        opt.textContent = label;
-        tplSelect.appendChild(opt);
-      });
-    })
-    .catch(function () {
-      /* ignore */
-    });
+  if (!_forkFromWsId) {
+    _paintSkillSelect(tplSelect, { freshOnOpen: true });
+  }
 
   // Project picker — populated from the shared projects cache, refreshed on
-  // open so a project created elsewhere appears.  Hidden when forking: a fork
-  // inherits its parent's project.
+  // open. Fresh creates SHOW it; forks HIDE it — a fork's project is its
+  // source's, enforced server-side (an explicit body project_id is discarded for
+  // a fork), so the frontend never sends a project for a fork.
+  //
+  // By design there is NO in-modal project picker for a fork: under
+  // require_project a fork of a PROJECTLESS source is refused by the node with a
+  // 400 and no project field (matches the setting help "forking a chat that has
+  // no project is refused just like starting a fresh chat without one") — the
+  // operator files the source under a project first. Do NOT "restore" a fork
+  // project picker here without re-opening the cross-project re-file hole it caused.
   const projLabel = document.querySelector('label[for="new-ws-project"]');
   const projSelect = document.getElementById("new-ws-project");
+  const projHint = projLabel ? projLabel.querySelector(".label-hint") : null;
   if (projLabel) projLabel.hidden = !!_forkFromWsId;
   if (projSelect) projSelect.hidden = !!_forkFromWsId;
-  if (projSelect && !_forkFromWsId && window.TurnstoneProjects) {
-    window.TurnstoneProjects.refreshProjects().then(function () {
-      _populateProjectSelect(projSelect);
-    });
-  }
+  // Paint the picker + its required/optional hint from the warm cache, then
+  // refresh-and-repaint — shared with the dashboard via _paintProjectPicker so
+  // the two can't drift; skips for a fork (its picker is hidden above,
+  // inheritance is server-enforced).
+  _paintProjectPicker(projSelect, projHint, {
+    fork: !!_forkFromWsId,
+    freshOnOpen: true,
+  });
 
   // Persona picker — hidden when forking (a fork resumes the source's
   // stamped persona; the create handler skips resolution on resume_ws).
@@ -417,10 +405,11 @@ function showNewWsModal(forkFromWsId) {
   const personaSelect = document.getElementById("new-ws-persona");
   if (personaLabel) personaLabel.hidden = !!_forkFromWsId;
   if (personaSelect) personaSelect.hidden = !!_forkFromWsId;
-  if (personaSelect && !_forkFromWsId && window.TurnstonePersonas) {
-    window.TurnstonePersonas.refreshPersonas().then(function () {
-      _populatePersonaSelect(personaSelect);
-    });
+  // Fresh-on-open (the reused dialog has no prior pick); the async repaint
+  // preserves a mid-window pick and re-applies the kind default only when nothing
+  // valid is selected.  Shared with the dashboard via _paintPersonaSelect.
+  if (!_forkFromWsId) {
+    _paintPersonaSelect(personaSelect, { freshOnOpen: true });
   }
 
   document.getElementById("new-ws-name").value = "";
@@ -479,6 +468,9 @@ function _ensureStandaloneProjectCreator(sel) {
     },
     onClose: function () {
       if (sel.value === _PROJECT_NEW) sel.value = "";
+      // Under require_project a fresh picker must not be left blank after a
+      // cancelled "+ New project…" — snap back to a valid project.
+      _reconcileRequiredProjectSelection(sel);
     },
   });
   if (sel.parentNode) sel.parentNode.insertBefore(creator.el, sel.nextSibling);
@@ -494,18 +486,18 @@ function _ensureStandaloneProjectCreator(sel) {
 // — this dialog only creates interactive workstreams), preselecting the kind
 // default so a zero-touch create behaves exactly like today.  No-op when the
 // personas bridge is absent (module still loading / pre-seed database).
-function _populatePersonaSelect(sel) {
+function _populatePersonaSelect(sel, opts) {
   if (!sel || !window.TurnstonePersonas) return;
-  const previous = sel.value;
+  // A fresh modal open has no prior selection to preserve — render the kind
+  // default; a repaint (fresh=false) keeps a mid-window pick.
+  const fresh = !!(opts && opts.fresh);
+  const previous = fresh ? "" : sel.value;
   const placeholder = sel.options.length ? sel.options[0] : null;
   sel.replaceChildren();
   if (placeholder) sel.appendChild(placeholder);
   const choices = window.TurnstonePersonas.personaChoices("interactive");
   choices.forEach(function (c) {
-    const opt = document.createElement("option");
-    opt.value = c.value;
-    opt.textContent = c.text;
-    sel.appendChild(opt);
+    _appendOption(sel, c.value, c.text, false);
   });
   const stillValid = choices.some(function (c) {
     return c.value === previous;
@@ -518,28 +510,255 @@ function _populatePersonaSelect(sel) {
   }
 }
 
-// Fill a project <select> from the shared projects cache, preserving its first
-// <option> (the "No project" placeholder) and the current selection, and append
-// the "+ New project…" sentinel.  No-op when the projects bridge is absent
-// (project.read denied / still loading).
-function _populateProjectSelect(sel) {
-  if (!sel || !window.TurnstoneProjects) return;
-  _ensureStandaloneProjectCreator(sel);
-  const previous = sel.value;
-  const placeholder = sel.options.length ? sel.options[0] : null;
-  sel.replaceChildren();
-  if (placeholder) sel.appendChild(placeholder);
-  window.TurnstoneProjects.projectChoices().forEach(function (c) {
-    const opt = document.createElement("option");
-    opt.value = c.value;
-    opt.textContent = c.text;
-    sel.appendChild(opt);
+// Add one <option> to a project <select>.
+function _appendOption(sel, value, text, disabled) {
+  const opt = document.createElement("option");
+  opt.value = value;
+  opt.textContent = text;
+  if (disabled) opt.disabled = true;
+  sel.appendChild(opt);
+}
+
+// True when *val* is currently an <option> value on *sel*.
+function _optionExists(sel, val) {
+  for (let i = 0; i < sel.options.length; i++) {
+    if (sel.options[i].value === val) return true;
+  }
+  return false;
+}
+
+// Paint a FRESH-create project picker (+ its required/optional label hint) from
+// the warm cache SYNCHRONOUSLY, then refresh-and-repaint.  Shared by the new-ws
+// modal and the dashboard composer so the two paths can't drift and silently
+// re-introduce the empty-dropdown / mislabel FOUC this exists to prevent.  A fork
+// skips entirely (a fork inherits its source's project server-side; the modal
+// hides the picker for forks).  Both paints reuse _populateProjectSelect, so the
+// #867 strict-picker invariant (never auto-select a real project) holds on each.
+// The sync-then-refresh tail routes through _paintFromCache (the fork skip and
+// the hint stay bespoke here); returns its async-repaint promise.
+function _paintProjectPicker(sel, hint, opts) {
+  if ((opts && opts.fork) || !sel || !window.TurnstoneProjects)
+    return Promise.resolve();
+  // paint(fresh): a fresh open renders the actual default (no prior selection);
+  // the async repaint MUST pass fresh=false, or it clobbers a project the user
+  // picked during the refresh round-trip — under require_project that reconciles
+  // the select back to "" and submit then sends no project -> a 400.
+  const paint = function (fresh) {
+    const strict = !!window.TurnstoneProjects.requireProject();
+    if (hint) hint.textContent = strict ? "required" : "optional";
+    _populateProjectSelect(sel, { requireProject: strict, fresh: fresh });
+  };
+  return _paintFromCache(window.TurnstoneProjects.refreshProjects, paint, opts);
+}
+
+// One chokepoint for the composer paint discipline, shared by the three
+// cache-backed wrappers below and _paintProjectPicker's tail: sync-paint NOW
+// from the warm cache, then refresh-and-repaint.  The sync paint mirrors the
+// caller's freshOnOpen (a reused-dialog open renders the actual defaults); the
+// async repaint is ALWAYS fresh:false — it must preserve a pick made during
+// the fetch window, never re-blank.  Returns the async-repaint promise
+// (already-resolved when there is nothing to refresh) so a caller can act
+// after the repaint lands — the dashboard chains its Options-chip recompute.
+//
+// `refresh` may be absent (bridge missing): the sync populate no-ops and the
+// refresh is skipped.  If the module graph itself failed to load (a failed
+// /shared/models.js, skills.js, personas.js, projects.js, or list_cache.js
+// fetch at page load), that picker stays empty until a reload — an ACCEPTED
+// tradeoff of the shared-cache architecture, the same class the projects/
+// personas pickers + rail have carried since #867/#868.  Do NOT add a
+// per-picker retry (a cache-busted dynamic re-import creates a second cache
+// instance with split-brain state) or an inline-fetch fallback (it resurrects
+// the dual-path this refactor deleted); surfacing a failed bridge, if ever
+// wanted, belongs in the app shell for all bridges at once.
+function _paintFromCache(refresh, repaint, opts) {
+  repaint(!!(opts && opts.freshOnOpen));
+  if (!refresh) return Promise.resolve();
+  return refresh().then(function () {
+    repaint(false);
   });
-  const newOpt = document.createElement("option");
-  newOpt.value = _PROJECT_NEW;
-  newOpt.textContent = "+ New project…";
-  sel.appendChild(newOpt);
-  if (previous && previous !== _PROJECT_NEW) sel.value = previous;
+}
+
+// Paint the model + judge pickers from the warm cache then refresh-and-repaint,
+// collapsing the identical sync-then-refresh dance the modal and dashboard both
+// need.
+function _paintModelSelects(modelSel, judgeSel, opts) {
+  return _paintFromCache(
+    window.TurnstoneModels && window.TurnstoneModels.refreshModels,
+    function (fresh) {
+      _populateModelSelect(modelSel, judgeSel, { fresh: fresh });
+    },
+    opts,
+  );
+}
+
+// Skill twin of _paintModelSelects.
+function _paintSkillSelect(sel, opts) {
+  return _paintFromCache(
+    window.TurnstoneSkills && window.TurnstoneSkills.refreshSkills,
+    function (fresh) {
+      _populateSkillSelect(sel, { fresh: fresh });
+    },
+    opts,
+  );
+}
+
+// Persona twin of _paintModelSelects.  _populatePersonaSelect keeps the kind
+// default when nothing valid is selected, so the fresh:false repaint can't
+// clobber a mid-window pick.
+function _paintPersonaSelect(sel, opts) {
+  return _paintFromCache(
+    window.TurnstonePersonas && window.TurnstonePersonas.refreshPersonas,
+    function (fresh) {
+      _populatePersonaSelect(sel, { fresh: fresh });
+    },
+    opts,
+  );
+}
+
+// Fill the model + judge-model <select>s from the shared models cache.  One list
+// feeds BOTH selects with the same "alias (model)" labels; each placeholder is
+// annotated with the server-resolved default alias ("Default — gpt-5"), resolved
+// once via the cache's modelLabel.  A fresh open renders the default (no prior
+// selection); a repaint preserves each select's mid-window pick independently.
+// No-op when the models bridge is absent (still loading) — the async refresh then
+// fills it, exactly as before this cache existed.
+function _populateModelSelect(modelSel, judgeSel, opts) {
+  if (!modelSel || !window.TurnstoneModels) return;
+  const fresh = !!(opts && opts.fresh);
+  const M = window.TurnstoneModels;
+  const choices = M.modelChoices();
+  const defaults = M.modelDefaults();
+  const prevModel = fresh ? "" : modelSel.value;
+  const prevJudge = fresh || !judgeSel ? "" : judgeSel.value;
+  const modelDefault = M.modelLabel(defaults.default_alias || "");
+  const judgeDefault = M.modelLabel(defaults.judge_default_alias || "");
+  modelSel.replaceChildren();
+  _appendOption(
+    modelSel,
+    "",
+    modelDefault ? "Default — " + modelDefault : "Default model",
+    false,
+  );
+  if (judgeSel) {
+    judgeSel.replaceChildren();
+    _appendOption(
+      judgeSel,
+      "",
+      judgeDefault ? "Default — " + judgeDefault : "Default (agent model)",
+      false,
+    );
+  }
+  choices.forEach(function (c) {
+    _appendOption(modelSel, c.value, c.text, false);
+    if (judgeSel) _appendOption(judgeSel, c.value, c.text, false);
+  });
+  // Preserve a mid-window pick on EACH select independently so the async repaint
+  // can't clobber a fast user's choice (a fresh open zeroed both above).
+  if (prevModel && _optionExists(modelSel, prevModel)) {
+    modelSel.value = prevModel;
+  }
+  if (judgeSel && prevJudge && _optionExists(judgeSel, prevJudge)) {
+    judgeSel.value = prevJudge;
+  }
+}
+
+// Fill a skill <select> from the shared skills cache, keeping the static
+// "Use defaults" placeholder (option 0) and preserving a mid-window pick.  The
+// ui label appends " [MCP]" for MCP-origin skills (the console launcher does
+// not — which is why the cache returns raw rows).  No-op when the bridge is
+// absent.
+function _populateSkillSelect(sel, opts) {
+  if (!sel || !window.TurnstoneSkills) return;
+  const fresh = !!(opts && opts.fresh);
+  const previous = fresh ? "" : sel.value;
+  sel.replaceChildren();
+  _appendOption(sel, "", "Use defaults", false);
+  window.TurnstoneSkills.getSkills().forEach(function (t) {
+    let label = t.name;
+    if (t.is_default) label += " (default)";
+    if (t.origin === "mcp") label += " [MCP]";
+    _appendOption(sel, t.name, label, false);
+  });
+  if (previous && _optionExists(sel, previous)) sel.value = previous;
+}
+
+// Fill a project <select> from the shared projects cache.  The picker MODE is
+// passed EXPLICITLY by each caller as {requireProject}; a re-populate from the
+// inline "+ New project…" creator passes nothing and reuses the mode stamped on
+// the element at open time.  This helper NEVER reads the _forkFromWsId module
+// global — the dashboard picker shares it.  No-op when the projects bridge is
+// absent (project.read denied / still loading).  Forks don't reach this helper:
+// their picker is hidden and their project is inherited server-side.
+//
+// Option 0 (placeholder) by mode:
+//   - gate off:            "No project" (value "" -> a projectless create).
+//   - gate on + projects:  "Select a project…" (value "") — the user must
+//                          consciously pick; we never auto-select a project they
+//                          didn't choose (it could silently file the chat under a
+//                          shared one).
+//   - gate on + none:      a DISABLED "No projects available" notice (value "").
+function _populateProjectSelect(sel, opts) {
+  if (!sel || !window.TurnstoneProjects) return;
+  const mode = opts || sel._projMode || {};
+  // Stamp ONLY the picker mode onto the element (the inline "+ New project…"
+  // creator's no-opts repaint reuses it); `fresh` is read from the LIVE opts
+  // per-call and deliberately NOT stamped, so a fresh:true modal open can't
+  // persist into a later preserve-repaint.
+  sel._projMode = { requireProject: !!mode.requireProject };
+  const strict = !!mode.requireProject;
+  const fresh = !!(opts && opts.fresh);
+  _ensureStandaloneProjectCreator(sel);
+  const previous = fresh ? "" : sel.value;
+  const choices = window.TurnstoneProjects.projectChoices();
+  sel.replaceChildren();
+  if (!strict) {
+    _appendOption(sel, "", "No project", false);
+  } else if (choices.length === 0) {
+    _appendOption(sel, "", "No projects available", true);
+  } else {
+    // strict + has projects: a "Select a project…" prompt (value "") so the user
+    // must consciously pick — never auto-file under an unchosen (possibly shared)
+    // project. Zero-touch submit sends no project and the gate returns the 400.
+    _appendOption(sel, "", "Select a project…", false);
+  }
+  choices.forEach(function (c) {
+    _appendOption(sel, c.value, c.text, false);
+  });
+  _appendOption(sel, _PROJECT_NEW, "+ New project…", false);
+  if (previous && previous !== _PROJECT_NEW && _optionExists(sel, previous)) {
+    sel.value = previous;
+  }
+  // Reuse the choices we already built — reconcile needs the same real-project
+  // list and would otherwise recompute projectChoices() a second time.
+  _reconcileRequiredProjectSelection(sel, choices);
+}
+
+// Under require_project the picker keeps a VALID selection — an already-chosen
+// real project, else the "Select a project…" prompt (value "", installed by
+// populate), else (no projects) the disabled "No projects available" notice. It
+// must NOT auto-select a real project the user didn't choose — that silently
+// files a required chat under a possibly-shared project. No-op when the gate is
+// off.  Idempotent — only sets the SELECTION, never adds options.
+function _reconcileRequiredProjectSelection(sel, choices) {
+  if (!sel) return;
+  const mode = sel._projMode || {};
+  if (!mode.requireProject) return;
+  // _populateProjectSelect threads in the projectChoices() list it already built;
+  // the inline "+ New project…" creator's onClose caller passes none, so recompute
+  // from the cache in that case.
+  const real =
+    choices ||
+    (window.TurnstoneProjects ? window.TurnstoneProjects.projectChoices() : []);
+  if (real.length === 0) {
+    sel.value = ""; // the disabled "No projects available" notice
+    return;
+  }
+  const isReal = real.some(function (c) {
+    return c.value === sel.value;
+  });
+  // Keep a real pick; otherwise rest on the "Select a project…" prompt (value
+  // ""), never auto-selecting an unchosen project.
+  if (!isReal) sel.value = "";
 }
 
 function submitNewWs() {
@@ -558,12 +777,24 @@ function submitNewWs() {
   const initEl = document.getElementById("new-ws-initial-message");
   const initial_message = initEl ? initEl.value.trim() : "";
   if (name) body.name = name;
-  if (model) body.model = model;
-  if (judge_model) body.judge_model = judge_model;
+  // Forks DELIBERATELY inherit their source's model + judge: the selects are
+  // hidden for a fork (showNewWsModal) and never sent here — matching the
+  // skill/persona/project fork guards. A fork resumes the source session
+  // (resume_ws), which already carries its model, so there is intentionally no
+  // fork model/judge override. Do NOT drop these !_forkFromWsId guards without
+  // also un-hiding the selects (a bare gate-removal ships a hidden-select's stale
+  // value).
+  if (model && !_forkFromWsId) body.model = model;
+  if (judge_model && !_forkFromWsId) body.judge_model = judge_model;
   if (skill && !_forkFromWsId) body.skill = skill;
-  // A fork inherits its parent's project (the picker is hidden); only a fresh
-  // create carries an explicit project_id.
-  if (project_id && !_forkFromWsId) body.project_id = project_id;
+  // Only a FRESH create sends a project_id; a fork's project is its source's,
+  // enforced server-side (the picker is hidden for forks, and any explicit pid is
+  // discarded for a fork on the node). No _PROJECT_NEW guard: the select's change
+  // handler resets the sentinel to "" before opening the creator, so it can't
+  // reach submit (the dashboard quick-create path likewise doesn't filter it).
+  if (project_id && !_forkFromWsId) {
+    body.project_id = project_id;
+  }
   // Persona likewise — a fork resumes the source's stamped persona.
   if (persona && !_forkFromWsId) body.persona = persona;
   if (_forkFromWsId) body.resume_ws = _forkFromWsId;
@@ -597,7 +828,19 @@ function submitNewWs() {
     .then(function (data) {
       window.TurnstoneHatch.setBusy(dlg, false);
       if (data.error) {
-        _newWsError(data.error);
+        // A projectless-source fork can't satisfy require_project in this modal
+        // (no picker, and a pick would be discarded server-side), so the generic
+        // "choose a project" text points at an impossible remedy — surface the
+        // real one (file the source under a project first) instead.
+        if (_forkFromWsId && data.code === "require_project") {
+          _newWsError(
+            "This chat isn't filed under a project, so it can't be forked while " +
+              "this deployment requires one. File the source chat under a project " +
+              "first, then fork it.",
+          );
+        } else {
+          _newWsError(data.error);
+        }
         return;
       }
       if (data.ws_id) {
@@ -1304,112 +1547,48 @@ function _refreshDashboardSubmitLabel() {
   btn.textContent = hasText || hasFiles ? "Send" : "Create";
 }
 
-// Format a resolved alias with its model suffix the same way as the
-// dropdown rows ("alias (model)", or just "alias" when they coincide).
-// Returns "" when alias is empty or unknown so callers fall back to a
-// neutral placeholder.
-function _resolveModelLabel(alias, models) {
-  if (!alias) return "";
-  for (let i = 0; i < (models || []).length; i++) {
-    const m = models[i];
-    if (m.alias === alias) {
-      return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
-    }
-  }
-  return "";
-}
-
 function _loadDashboardOptionsLists() {
-  // Models
+  // Models + skills — paint from the warm cache (model placeholders annotated
+  // with the server-resolved default) then refresh-and-repaint, via the shared
+  // wrappers (same paths the modal uses).  The dashboard composer is persistent
+  // (not a reused dialog), so freshOnOpen:false — it preserves a pick across a
+  // repaint.  Previously fetch-once (guarded on options.length); now
+  // refresh-on-open via the coalesced caches, matching the project/persona pickers.
+  //
+  // EVERY paint chains a recompute of the collapsed Options chip on its async
+  // repaint: a repaint can drop a server-removed pick (the select falls back to
+  // its placeholder) or revert the persona to its kind default WITHOUT firing
+  // 'change' — the optionsPanel change listener covers user edits only — and
+  // the chip must always name what submit will send.  The project paint is
+  // chained for symmetry/future chip coverage; _refreshDashboardOptionsSummary
+  // reads persona/model/judge/skill only today.
   const modelSel = document.getElementById("dashboard-model");
   const judgeSel = document.getElementById("dashboard-judge-model");
-  if (modelSel && modelSel.options.length <= 1) {
-    authFetch("/v1/api/models")
-      .then(function (r) {
-        return r.json();
-      })
-      .then(function (data) {
-        (data.models || []).forEach(function (m) {
-          const opt = document.createElement("option");
-          opt.value = m.alias;
-          opt.textContent =
-            m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
-          modelSel.appendChild(opt);
-          if (judgeSel) {
-            const jOpt = document.createElement("option");
-            jOpt.value = m.alias;
-            jOpt.textContent = opt.textContent;
-            judgeSel.appendChild(jOpt);
-          }
-        });
-        // Surface the resolved defaults in the placeholder rows so the
-        // panel shows which model actually runs when left untouched —
-        // mirrors the coordinator launcher.  The judge tracks the
-        // per-workstream agent model unless judge.model is explicitly
-        // configured, so keep the "(agent model)" wording in that case
-        // rather than advertising a fixed alias the judge won't use.
-        const modelDefault = _resolveModelLabel(
-          data.default_alias || "",
-          data.models || [],
-        );
-        modelSel.options[0].textContent = modelDefault
-          ? "Default — " + modelDefault
-          : "Default model";
-        if (judgeSel) {
-          const judgeDefault = _resolveModelLabel(
-            data.judge_default_alias || "",
-            data.models || [],
-          );
-          judgeSel.options[0].textContent = judgeDefault
-            ? "Default — " + judgeDefault
-            : "Default (agent model)";
-        }
-      })
-      .catch(function () {
-        /* default model still works */
-      });
-  }
-  // Skills
+  _paintModelSelects(modelSel, judgeSel, { freshOnOpen: false }).then(
+    _refreshDashboardOptionsSummary,
+  );
   const skillSel = document.getElementById("dashboard-skill");
-  if (skillSel && skillSel.options.length <= 1) {
-    authFetch("/v1/api/skills")
-      .then(function (r) {
-        return r.json();
-      })
-      .then(function (data) {
-        (data.skills || []).forEach(function (t) {
-          const opt = document.createElement("option");
-          opt.value = t.name;
-          let label = t.name;
-          if (t.is_default) label += " (default)";
-          if (t.origin === "mcp") label += " [MCP]";
-          opt.textContent = label;
-          skillSel.appendChild(opt);
-        });
-      })
-      .catch(function () {
-        /* ignore */
-      });
-  }
+  _paintSkillSelect(skillSel, { freshOnOpen: false }).then(
+    _refreshDashboardOptionsSummary,
+  );
 
-  // Project picker — refresh the shared cache then repaint (also feeds the
-  // rail's group-by-project).  Re-fetched each time the options open so a
-  // project created elsewhere appears without a page reload.
+  // Project picker — paint from the warm cache then refresh-and-repaint (also
+  // feeds the rail's group-by-project). Dashboard quick-create is ALWAYS a fresh
+  // create (never a fork); shared with the modal via _paintProjectPicker.
   const projSel = document.getElementById("dashboard-project");
-  if (projSel && window.TurnstoneProjects) {
-    window.TurnstoneProjects.refreshProjects().then(function () {
-      _populateProjectSelect(projSel);
-    });
-  }
+  const projLabel = document.querySelector('label[for="dashboard-project"]');
+  const projHint = projLabel ? projLabel.querySelector(".label-hint") : null;
+  _paintProjectPicker(projSel, projHint, { fork: false }).then(
+    _refreshDashboardOptionsSummary,
+  );
 
-  // Persona picker — same refresh-on-open policy; kind default preselected
-  // so a zero-touch launch behaves exactly like today.
+  // Persona picker — via the shared wrapper; the dashboard is a persistent panel
+  // so freshOnOpen:false (preserve a pick across a repaint), kind default when
+  // nothing valid is selected.
   const personaSel = document.getElementById("dashboard-persona");
-  if (personaSel && window.TurnstonePersonas) {
-    window.TurnstonePersonas.refreshPersonas().then(function () {
-      _populatePersonaSelect(personaSel);
-    });
-  }
+  _paintPersonaSelect(personaSel, { freshOnOpen: false }).then(
+    _refreshDashboardOptionsSummary,
+  );
 }
 
 // localStorage key for the dashboard composer's Options-panel disclosure
@@ -1587,11 +1766,20 @@ function connectGlobalSSE() {
     globalEvtSource.close();
     globalEvtSource = null;
   }
-  // Manual-reconnect path threads ``?last_event_id=N`` because the
-  // EventSource constructor can't set headers; native auto-reconnect
-  // on the same source uses the header directly.
+  // Manual reconnects present the stored cursor (an opaque
+  // ``"{boot_epoch}-{counter}"`` string) via the query param — a
+  // ``new EventSource(url)`` cannot set the ``Last-Event-ID`` header.
+  // Safe since #881: a cursor from another boot (or another node, or a
+  // pre-epoch client) mismatches the server's live epoch and draws
+  // ``replay_truncated`` + a fresh node_snapshot — the ghost-roster
+  // shape that once forced these reconnects cursorless (a stale cursor
+  // drew ``replay_ok``-empty with NO snapshot against the reborn ring)
+  // can no longer occur.  A live cursor skips the wholesale snapshot
+  // rebuild and replays just the missed deltas.  Native auto-reconnect
+  // keeps its browser-internal header either way; the string guard is
+  // the house cursor-guard idiom (see test_app_js.py).
   let globalUrl = "/v1/api/events/global";
-  if (globalLastEventId) {
+  if (globalLastEventId != null && globalLastEventId !== "") {
     globalUrl += "?last_event_id=" + encodeURIComponent(globalLastEventId);
   }
   globalEvtSource = new EventSource(globalUrl);
@@ -1599,16 +1787,21 @@ function connectGlobalSSE() {
     globalRetryDelay = 1000;
   };
   globalEvtSource.onmessage = function (e) {
-    // Capture lastEventId BEFORE JSON.parse (see Pane.connectSSE
-    // onmessage for full rationale).
-    if (globalEvtSource && globalEvtSource.lastEventId) {
-      globalLastEventId = globalEvtSource.lastEventId;
+    // Cursor capture BEFORE the parse, mirroring the browser: native
+    // reconnect's header cursor advances past every id-bearing frame
+    // whether or not its JSON parses, and the manual cursor must agree
+    // with it (both recover a lost frame the same way — the resync
+    // below).  MessageEvent property, never the EventSource object
+    // (which has no such property — see the test_app_js.py tripwire).
+    if (e.lastEventId != null && e.lastEventId !== "") {
+      globalLastEventId = e.lastEventId;
     }
-    // Guarded parse: the cursor above has already advanced past this frame,
-    // so a parse failure is a permanently-lost roster mutation — resync the
-    // roster from REST instead of silently drifting (a dropped ws_created
-    // renders as a conversation that never appears; a dropped ws_closed as
-    // a ghost row forever).
+    // Guarded parse: the cursor (native header and stored copy alike)
+    // has already advanced past this frame, so a parse failure is a
+    // permanently-lost roster mutation — resync the roster from REST
+    // instead of silently drifting (a dropped ws_created renders as a
+    // conversation that never appears; a dropped ws_closed as a ghost
+    // row forever).
     let data = null;
     try {
       data = JSON.parse(e.data);
@@ -1625,11 +1818,29 @@ function connectGlobalSSE() {
       // through their own Tier-2 streams.  Eviction is safe here (and only
       // here): the snapshot is serialized with ws_created/ws_closed on the
       // stream itself.
+      //
+      // The pre-snapshot cursor is dead in every case that draws a
+      // snapshot (fresh has none; truncated's is spent) — and this frame
+      // is id-less, so on a NATIVE reconnect the capture above just
+      // re-stored the connection's stale pre-restart cursor, undoing the
+      // truncated branch's clear (id-less frames inherit the persisted
+      // last-event-ID string; a manual reconnect's fresh EventSource
+      // starts empty and the "" guard blocks it).  Clear it here so a
+      // manual reconnect racing in before the next id-bearing frame goes
+      // cursorless instead of re-presenting the dead cursor for a
+      // redundant truncated round.
+      globalLastEventId = null;
       applyRosterSnapshot(data.workstreams || [], { evict: true });
     } else if (data.type === "replay_truncated") {
-      // Events between our cursor and the buffer head are gone for good.
-      // The node_snapshot that follows rebuilds the roster; refetch too so
-      // recovery doesn't depend on event ordering.
+      // Events between our cursor and the buffer head (reason
+      // "ring_evicted"), or everything since another boot minted the
+      // cursor (reason "boot_epoch"), are gone for good.  The cursor is
+      // spent — clear it so a manual reconnect racing in before the
+      // next id-bearing frame draws a fresh snapshot instead of
+      // re-presenting the dead cursor for a redundant truncated round.
+      // The node_snapshot that follows rebuilds the roster; refetch too
+      // so recovery doesn't depend on event ordering.
+      globalLastEventId = null;
       resyncRoster();
     } else if (data.type === "ws_state") {
       updateTabIndicator(data.ws_id, data.state, {

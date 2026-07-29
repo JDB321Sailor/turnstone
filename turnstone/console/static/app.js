@@ -5,12 +5,25 @@ window.onLoginSuccess = function () {
   if (typeof _refreshHomeComposerVisibility === "function") {
     _refreshHomeComposerVisibility();
   }
-  // Re-populate the home-composer skill dropdown now that auth has
-  // landed.  The initial page-load pass runs before login completes,
-  // so /v1/api/skills 401s; without this re-run the dropdown stays
-  // empty.
-  if (typeof _populateHomeSkillDropdown === "function") {
-    _populateHomeSkillDropdown();
+  // Re-warm ALL FOUR home-composer caches now that auth has landed.  The initial
+  // page-load pass runs before login completes, so /v1/api/{skills,models,
+  // projects,personas} all 401 (fail-open: the caches keep their empty state);
+  // without this re-run the launcher dropdowns — and the rail's group-by-project +
+  // the saved-coordinator project/persona columns — stay empty until a reload.
+  // {force:true} so a still-in-flight failing pre-auth fetch yields a trailing
+  // AUTHENTICATED refetch rather than coalescing onto the 401 (skills/personas
+  // have no *_changed event to recover otherwise).
+  if (typeof _refreshAndPopulateSkills === "function") {
+    _refreshAndPopulateSkills({ force: true });
+  }
+  if (typeof _refreshAndPopulateModels === "function") {
+    _refreshAndPopulateModels({ force: true });
+  }
+  if (typeof _refreshAndPopulateProjects === "function") {
+    _refreshAndPopulateProjects({ force: true });
+  }
+  if (typeof _refreshAndPopulatePersonas === "function") {
+    _refreshAndPopulatePersonas({ force: true });
   }
   // Active-coordinators list is SSE-driven via the console pseudo-node
   // (#9) — no poller to restart after login.  The home-view renderer
@@ -425,9 +438,11 @@ function handleClusterEvent(data) {
     // Server emits this when a model definition or a role-assignment
     // setting (model.default_alias, judge.model, coordinator.model_alias,
     // coordinator.reasoning_effort) changes.  Refresh anything that
-    // renders model aliases so labels stay accurate without a reload.
-    if (typeof _populateHomeModelDropdowns === "function") {
-      _populateHomeModelDropdowns();
+    // renders model aliases so labels stay accurate without a reload.  Pass
+    // {force:true} so a burst of changes converges to the latest (the coalesced
+    // open/startup path stays plain — see _refreshAndPopulateModels).
+    if (typeof _refreshAndPopulateModels === "function") {
+      _refreshAndPopulateModels({ force: true });
     }
     if (typeof _sklcInvalidateModelsCache === "function") {
       _sklcInvalidateModelsCache();
@@ -1474,22 +1489,59 @@ function _ensureHomeComposerInit() {
   _homeComposerInit = true;
   _mountHomeCoordComposer();
   _wireLauncherToggle();
-  _populateHomeSkillDropdown();
-  _populateHomeModelDropdowns();
+  _refreshAndPopulateSkills();
+  _refreshAndPopulateModels();
   _refreshAndPopulateProjects();
   _refreshAndPopulatePersonas();
   _ensureHomeProjectCreator();
   _refreshHomeComposerVisibility();
 }
 
+// One chokepoint for the launcher paint discipline shared by the four
+// _refreshAndPopulate* wrappers below: sync-paint NOW from the warm cache (no
+// empty flash for the refresh round-trip), then refresh-and-repaint (callOpts
+// threads {force:true} for invalidation callers — models_changed,
+// onLoginSuccess).  `refresh` absent = bridge missing (module still loading /
+// pre-auth): the wrapper no-ops and onLoginSuccess re-runs each once auth
+// lands.  If the module graph itself failed to load, the picker stays empty
+// until a reload — the ACCEPTED shared-cache tradeoff; see _paintFromCache in
+// ui/static/app.js for the full ruling (no per-picker retry, no inline-fetch
+// fallback).
+function _paintHomeFromCache(refresh, populate, callOpts) {
+  if (!refresh) return;
+  populate();
+  refresh(callOpts).then(function () {
+    populate();
+  });
+}
+
+// Restore a launcher-composer option pick after a choices rebuild IF it is
+// still a valid choice; returns whether it was restored (the persona caller
+// reverts to the kind default otherwise).  Console-composer setter idiom
+// ONLY — the ui twin (_populatePersonaSelect etc.) works on raw <select>
+// elements via sel.value/_optionExists and is deliberately NOT unified
+// across files.
+function _restorePick(fieldId, previous, choices) {
+  const still =
+    previous &&
+    choices.some(function (c) {
+      return c.value === previous;
+    });
+  if (still) _homeCoordComposer.setOptionValue(fieldId, previous);
+  return !!still;
+}
+
 // Refresh the shared personas cache (window.TurnstonePersonas — also feeds
 // the saved-list / rail labels) then repaint the launcher's Persona picker.
 // Safe when the bridge is absent (module still loading): the picker keeps
 // its "Default" placeholder, which the server resolves to the kind default.
-function _refreshAndPopulatePersonas() {
+function _refreshAndPopulatePersonas(callOpts) {
   const TP = window.TurnstonePersonas;
-  if (!TP) return;
-  TP.refreshPersonas().then(_populateHomePersonaDropdown);
+  _paintHomeFromCache(
+    TP && TP.refreshPersonas,
+    _populateHomePersonaDropdown,
+    callOpts,
+  );
 }
 
 // Populate the launcher's Persona picker for the ACTIVE kind, preselecting
@@ -1503,14 +1555,7 @@ function _populateHomePersonaDropdown() {
   const previous = _homeCoordComposer.getOptionValue("persona");
   const choices = TP.personaChoices(_launcherKind);
   _homeCoordComposer.setOptionChoices("persona", choices);
-  const stillValid =
-    previous &&
-    choices.some(function (c) {
-      return c.value === previous;
-    });
-  if (stillValid) {
-    _homeCoordComposer.setOptionValue("persona", previous);
-  } else {
+  if (!_restorePick("persona", previous, choices)) {
     const dflt = TP.defaultPersona(_launcherKind);
     if (dflt) _homeCoordComposer.setOptionValue("persona", dflt.name);
   }
@@ -1520,25 +1565,52 @@ function _populateHomePersonaDropdown() {
 // rail's group-by-project) then repaint the launcher's Project picker.  Safe
 // when the bridge is absent (project.read denied / module still loading): the
 // picker simply keeps its "No project" placeholder.
-function _refreshAndPopulateProjects() {
+function _refreshAndPopulateProjects(callOpts) {
   const TP = window.TurnstoneProjects;
-  if (!TP) return;
-  TP.refreshProjects().then(_populateHomeProjectDropdown);
+  _paintHomeFromCache(
+    TP && TP.refreshProjects,
+    _populateHomeProjectDropdown,
+    callOpts,
+  );
 }
 
 // Populate the launcher's Project picker from the shared cache, preserving the
 // current pick across the rebuild (same reason as _populateLauncherNodes) and
 // always appending the "+ New project…" sentinel after the live list.
+//
+// Under server.require_project BOTH launcher kinds are authoritatively gated
+// server-side: interactive at the node create endpoint (refusal surfaced by
+// the console proxy, create_workstream), coordinator at the console's own
+// create mount (refusal rendered inline by _createCoordinator). The picker
+// mirrors the interactive dashboard's soft treatment — retitle the
+// placeholder so projectless reads as a prompt, never auto-select a real
+// project the operator didn't choose — and leaves enforcement to the
+// server's coded 400 (the composer has no per-option disable, so the
+// placeholder stays selectable; picking it just surfaces the server's
+// message).
 function _populateHomeProjectDropdown() {
   if (!_homeCoordComposer) return;
   const TP = window.TurnstoneProjects;
   if (!TP) return;
   const previous = _homeCoordComposer.getOptionValue("project");
   const choices = TP.projectChoices();
+  const strict = !!TP.requireProject();
+  _homeCoordComposer.setOptionPlaceholder(
+    "project",
+    strict
+      ? choices.length
+        ? "Select a project…"
+        : "No projects available"
+      : "No project",
+  );
   choices.push({ value: _PROJECT_NEW, text: "+ New project…" });
   _homeCoordComposer.setOptionChoices("project", choices);
-  if (previous && previous !== _PROJECT_NEW)
-    _homeCoordComposer.setOptionValue("project", previous);
+  // Validate before restoring (via _restorePick, like the other pickers): a
+  // since-deleted project must fall back to the "No project" placeholder, not
+  // a blank selectedIndex=-1 select.  The "+ New project…" sentinel is never
+  // restored — it is a command, not a state (and it IS in `choices`, so the
+  // validity check alone would not exclude it).
+  if (previous !== _PROJECT_NEW) _restorePick("project", previous, choices);
 }
 
 // The inline "+ New project…" creator (project_creator.js), mounted once into
@@ -1701,87 +1773,101 @@ function _mountHomeCoordComposer() {
   });
 }
 
+// Refresh the shared skills cache then repaint the launcher's Skill picker.
+// Sync paint from the warm cache first (no empty flash for the round-trip),
+// then refresh-and-repaint to catch a skill created elsewhere.  Safe when the
+// bridge is absent (module still loading / 401 pre-auth — onLoginSuccess re-runs
+// this once auth lands).
+function _refreshAndPopulateSkills(callOpts) {
+  const TS = window.TurnstoneSkills;
+  _paintHomeFromCache(
+    TS && TS.refreshSkills,
+    _populateHomeSkillDropdown,
+    callOpts,
+  );
+}
+
+// Populate the launcher's Skill picker from the shared cache, preserving the
+// current pick across the rebuild (the async repaint must not clobber a
+// mid-window choice).  The console label omits the " [MCP]" suffix the ui
+// pickers add — which is why the cache returns raw rows.
 function _populateHomeSkillDropdown() {
   if (!_homeCoordComposer) return;
-  authFetch("/v1/api/skills")
-    .then(function (r) {
-      return r.ok ? r.json() : { skills: [] };
-    })
-    .then(function (data) {
-      const choices = (data.skills || []).map(function (t) {
-        return {
-          value: t.name,
-          text: t.is_default ? t.name + " (default)" : t.name,
-        };
-      });
-      _homeCoordComposer.setOptionChoices("skill", choices);
-    })
-    .catch(function () {
-      /* defaults still work even without the dropdown populated */
-    });
+  const TS = window.TurnstoneSkills;
+  if (!TS) return;
+  // Reads the shared skills cache, which is FAIL-OPEN by design: a transient
+  // non-OK refresh keeps the last-known rows rather than blanking to the
+  // placeholder (the pre-cache inline fetch blanked on any non-OK via
+  // `r.ok ? json : {skills:[]}`; this cache matches the projects/personas
+  // policy instead).  A since-removed skill is rejected server-side on
+  // launch — a narrow stale-selection window traded for not blanking on a blip.
+  const previous = _homeCoordComposer.getOptionValue("skill");
+  const choices = TS.getSkills().map(function (t) {
+    return {
+      value: t.name,
+      text: t.is_default ? t.name + " (default)" : t.name,
+    };
+  });
+  _homeCoordComposer.setOptionChoices("skill", choices);
+  _restorePick("skill", previous, choices);
 }
 
-// Format a resolved alias with its model suffix the same way as the
-// dropdown rows ("alias (model)", or just "alias" when they coincide).
-// Returns "" when alias is empty or unknown so callers can fall back
-// to a neutral placeholder.
-function _resolveModelLabel(alias, models) {
-  if (!alias) return "";
-  for (let i = 0; i < (models || []).length; i++) {
-    const m = models[i];
-    if (m.alias === alias) {
-      return m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
-    }
-  }
-  return "";
+// Refresh the shared models cache then repaint the launcher's Model + Judge
+// Model pickers.  Sync paint from the warm cache first (no empty flash for the
+// round-trip), then refresh-and-repaint.  This is ALSO the single repaint path
+// for the `models_changed` SSE event, which passes {force:true} so the refresh
+// converges to the latest server state (and its .then repaints from THAT) even
+// when a burst of model-config changes lands mid-fetch — no second
+// (subscription) path that would double-repaint.
+function _refreshAndPopulateModels(callOpts) {
+  const TM = window.TurnstoneModels;
+  _paintHomeFromCache(
+    TM && TM.refreshModels,
+    _populateHomeModelDropdowns,
+    callOpts,
+  );
 }
 
-// Populate Model + Judge Model dropdowns from /v1/api/models — same
-// list the interactive new-ws modal uses.  Empty/default option stays
-// at the top so submitting without a choice falls back to the
-// ConfigStore-configured coordinator.model_alias / judge.model.
+// Populate the launcher's Model + Judge Model pickers from the shared cache —
+// same list the interactive new-ws modal uses.  One list feeds both selects;
+// each keeps its "Default …" placeholder (option 0) and its own preserved pick
+// (the async repaint must not clobber a mid-window choice).  The console reads
+// its OWN default-alias fields (coordinator_default_alias for the model,
+// judge_default_alias for the judge) — the node server sends different ones, so
+// the shared cache exposes all of them and each app picks its own.
 function _populateHomeModelDropdowns() {
   if (!_homeCoordComposer) return;
-  authFetch("/v1/api/models")
-    .then(function (r) {
-      return r.ok ? r.json() : { models: [] };
-    })
-    .then(function (data) {
-      const choices = (data.models || []).map(function (m) {
-        const label =
-          m.alias === m.model ? m.alias : m.alias + " (" + m.model + ")";
-        return { value: m.alias, text: label };
-      });
-      _homeCoordComposer.setOptionChoices("model", choices);
-      _homeCoordComposer.setOptionChoices("judge_model", choices);
-      // Both placeholders use the same "Default — alias (model)"
-      // template — the field-row labels (MODEL / JUDGE MODEL) already
-      // carry the role context, so an asymmetric "Default judge model"
-      // reads awkwardly alongside the plain "Default model" line above
-      // it.  Em-dash separator (rather than nested parens) keeps the
-      // alias's "(model)" suffix legible and matches the
-      // ``(default — alias (model))`` pattern used in the admin Roles
-      // tab.
-      const coordDefault = _resolveModelLabel(
-        data.coordinator_default_alias || "",
-        data.models || [],
-      );
-      const judgeDefault = _resolveModelLabel(
-        data.judge_default_alias || "",
-        data.models || [],
-      );
-      _homeCoordComposer.setOptionPlaceholder(
-        "model",
-        coordDefault ? "Default — " + coordDefault : "Default model",
-      );
-      _homeCoordComposer.setOptionPlaceholder(
-        "judge_model",
-        judgeDefault ? "Default — " + judgeDefault : "Default model",
-      );
-    })
-    .catch(function () {
-      /* defaults still work even without the dropdown populated */
-    });
+  const TM = window.TurnstoneModels;
+  if (!TM) return;
+  const choices = TM.modelChoices();
+  const defaults = TM.modelDefaults();
+  // The launcher composer is a PERSISTENT panel (it never reopens like the new-ws
+  // modal), so preserving the prior pick across a repaint is INTENDED — not the
+  // modal's fresh-on-open reset.  A background models_changed must not clobber a
+  // mid-window model/judge choice.
+  const prevModel = _homeCoordComposer.getOptionValue("model");
+  const prevJudge = _homeCoordComposer.getOptionValue("judge_model");
+  _homeCoordComposer.setOptionChoices("model", choices);
+  _homeCoordComposer.setOptionChoices("judge_model", choices);
+  // Both placeholders use the same "Default — alias (model)" template — the
+  // field-row labels (MODEL / JUDGE MODEL) already carry the role context, so an
+  // asymmetric "Default judge model" reads awkwardly alongside the plain
+  // "Default model" line above it.  Em-dash separator (rather than nested
+  // parens) keeps the alias's "(model)" suffix legible and matches the
+  // ``(default — alias (model))`` pattern used in the admin Roles tab.
+  const coordDefault = TM.modelLabel(defaults.coordinator_default_alias || "");
+  const judgeDefault = TM.modelLabel(defaults.judge_default_alias || "");
+  _homeCoordComposer.setOptionPlaceholder(
+    "model",
+    coordDefault ? "Default — " + coordDefault : "Default model",
+  );
+  _homeCoordComposer.setOptionPlaceholder(
+    "judge_model",
+    judgeDefault ? "Default — " + judgeDefault : "Default model",
+  );
+  // Preserve a mid-window pick on each select independently.
+  _restorePick("model", prevModel, choices);
+  _restorePick("judge_model", prevJudge, choices);
 }
 
 function _refreshHomeComposerVisibility() {
@@ -2283,6 +2369,139 @@ window.TS_APP.resolveInteractiveNode = function (wsId, hintNodeId) {
     return { error: "Failed to open this session." };
   });
 };
+// === MCP consent badge (console L-shell) ====================================
+// Mirror of the node dashboard's pending-consent subsystem (ui/static/app.js
+// §12), driving the rail's Admin > MCP Servers row badge through the shell
+// bridge.  The pending set is USER-scoped server truth — the Phase 9
+// mcp_oauth_pending table, which the console serves at
+// /v1/api/mcp/oauth/pending — hydrated at boot and fed live by hosted panes
+// through the window.TS_APP.onConsentDetected seam (the shared pane host
+// bridges an interactive pane's detections here, and the coordinator pane
+// forwards its error card's onConsent; both light up now that the seam
+// exists on the console).  admin.js re-syncs after the operator has SEEN
+// the MCP panel render (same semantics as the node's Connections flow).
+const _pendingConsentServers = new Set();
+
+function _refreshConsentBadge() {
+  const shell = window.TS_SHELL;
+  if (!shell || typeof shell.setRowBadge !== "function") return;
+  const n = _pendingConsentServers.size;
+  const label =
+    n === 0
+      ? ""
+      : n + " MCP server" + (n === 1 ? "" : "s") + " awaiting consent";
+  shell.setRowBadge("mcp", n, label);
+}
+
+function _onConsentDetected(server) {
+  if (typeof server === "string" && server) {
+    _pendingConsentServers.add(server);
+    _refreshConsentBadge();
+  }
+}
+
+function loadPendingConsents() {
+  authFetch("/v1/api/mcp/oauth/pending")
+    .then(function (r) {
+      if (!r.ok) return null;
+      return r.json();
+    })
+    .then(function (data) {
+      if (!data || !Array.isArray(data.servers)) return;
+      for (let i = 0; i < data.servers.length; i++) {
+        const row = data.servers[i];
+        if (row && typeof row.server_name === "string") {
+          _pendingConsentServers.add(row.server_name);
+        }
+      }
+      _refreshConsentBadge();
+    })
+    .catch(function () {
+      // Endpoint failures must not block console boot.
+    });
+}
+
+// Live MCP-consent notifications from a hosted pane — the seam the shared
+// pane host bridges to (and the coordinator pane's card forwards to).
+window.TS_APP.onConsentDetected = _onConsentDetected;
+// Badge re-sync to DB truth after the operator has seen the admin MCP
+// panel render: clear-then-rehydrate, the node Connections-flow semantics
+// (a FAILED panel load keeps the pending signal instead).  The repaint
+// between clear and rehydrate keeps the badge↔set invariant even when the
+// rehydrate fetch fails — matching the node's _clearConsentBadge.
+window.TS_APP.syncConsentBadge = function () {
+  _pendingConsentServers.clear();
+  _refreshConsentBadge();
+  loadPendingConsents();
+};
+
+// Visibility-show resync (#874): the consent popup opens noopener — no
+// cross-window channel exists — so the only reliable signal that consent
+// completed is the user returning to this tab.  Merge-on-success:
+// entries the server no longer lists are dropped ONLY if they predate
+// this fetch (the preFetch snapshot) — a detection arriving through
+// _onConsentDetected while the fetch is in flight survives, since its
+// DB row may postdate the server's read.  A failed fetch changes
+// nothing, so a possibly-valid warning is never blanked (unlike
+// syncConsentBadge above, whose blind clear is justified by the
+// operator having just SEEN the MCP panel).
+let _resyncInFlight = false;
+let _resyncQueued = false;
+function _resyncPendingConsents() {
+  // Single-flight: overlapping fetches can resolve out of order, and
+  // every guard short of exclusion re-admits some interleaving (a stale
+  // read clobbering a newer one, a failed fetch suppressing a valid
+  // one, an older read's additions surviving a newer read's deletes).
+  // One flight at a time makes the whole class structurally impossible;
+  // an edge firing mid-flight queues exactly one rerun so the freshest
+  // truth still lands.
+  if (_resyncInFlight) {
+    _resyncQueued = true;
+    return;
+  }
+  // Bounded flight: a stalled fetch would otherwise hold the gate shut
+  // forever (the .finally below never runs, freezing self-heal); on
+  // timeout the chain rejects → .catch → .finally clears the gate and
+  // drains any queued rerun.  Feature-detected like the codebase's
+  // AbortController guards — old runtimes just run unbounded, as before
+  // — and computed BEFORE the gate is set so no throw can wedge it.
+  const signal =
+    typeof AbortSignal !== "undefined" && AbortSignal.timeout
+      ? AbortSignal.timeout(10000)
+      : undefined;
+  _resyncInFlight = true;
+  const preFetch = new Set(_pendingConsentServers);
+  authFetch("/v1/api/mcp/oauth/pending", { signal: signal })
+    .then(function (r) {
+      return r.ok ? r.json() : null;
+    })
+    .then(function (data) {
+      if (!data || !Array.isArray(data.servers)) return;
+      const fetched = new Set();
+      for (let i = 0; i < data.servers.length; i++) {
+        const row = data.servers[i];
+        if (row && typeof row.server_name === "string") {
+          fetched.add(row.server_name);
+        }
+      }
+      preFetch.forEach(function (s) {
+        if (!fetched.has(s)) _pendingConsentServers.delete(s);
+      });
+      fetched.forEach(function (s) {
+        _pendingConsentServers.add(s);
+      });
+      _refreshConsentBadge();
+    })
+    .catch(function () {})
+    .finally(function () {
+      _resyncInFlight = false;
+      if (_resyncQueued) {
+        _resyncQueued = false;
+        _resyncPendingConsents();
+      }
+    });
+}
+
 window.TS_APP.boot = function () {
   history.replaceState({ view: "home" }, "");
   _initSavedCoordTable(); // substrate modules have evaluated by boot time
@@ -2292,6 +2511,15 @@ window.TS_APP.boot = function () {
   // pipeline (#9); the console pseudo-node carries coordinator
   // ws_created / ws_closed / cluster_state events.
   loadOverview();
+  // Hydrate the MCP pending-consent badge (#874): a coordinator or
+  // scheduled run that hit mcp_consent_required while nobody watched left
+  // a DB row — the badge is how the operator finds out.  Cheap no-op on
+  // installs with no user-scoped MCP servers; failures are silent.
+  loadPendingConsents();
+  // Self-heal the badge after the consent popup (see _resyncPendingConsents).
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") _resyncPendingConsents();
+  });
   _ensureHomeComposerInit();
   // Refresh the coord button visibility once auth.js has populated
   // sessionStorage from the initial whoami.  window.permissionsReady

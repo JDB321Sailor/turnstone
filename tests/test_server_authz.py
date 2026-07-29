@@ -18,6 +18,9 @@ from unittest.mock import MagicMock
 import pytest
 from starlette.testclient import TestClient
 
+from tests._helpers import wait_until
+from turnstone.core.workstream import INTERJECTION_CAP_CHARS
+
 _TEST_JWT_SECRET = "test-jwt-secret-minimum-32-chars!"
 
 
@@ -102,6 +105,9 @@ class _FakeUI:
         self.auto_approve = False
         self.auto_approve_tools: set[str] = set()
         self._enqueued: list[dict[str, Any]] = []
+        self.states: list[str] = []
+        self.infos: list[str] = []
+        self.errors: list[str] = []
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()
         self._pending_approval: dict[str, Any] | None = None
@@ -196,11 +202,14 @@ class _FakeUI:
     def on_stream_end(self) -> None:
         pass
 
-    def on_state_change(self, _state: str) -> None:
-        pass
+    def on_state_change(self, state: str) -> None:
+        self.states.append(state)
 
-    def on_error(self, _msg: str) -> None:
-        pass
+    def on_info(self, msg: str) -> None:
+        self.infos.append(msg)
+
+    def on_error(self, msg: str) -> None:
+        self.errors.append(msg)
 
     def resolve_approval(self, *_a: Any, **_kw: Any) -> None:
         self._approval_event.set()
@@ -217,10 +226,61 @@ class _FakeSession:
         self.messages: list[dict[str, Any]] = []
         self._last_usage: dict[str, int] | None = None
         self._pending_retry: str | None = None
+        # Real sessions always carry one; the /send route's cancel-drain
+        # poll reads it whenever a worker is live at send time.
+        self._cancel_event = threading.Event()
         self.sends: list[tuple[str, Any, Any]] = []
+        self.commands: list[str] = []
+        self.compacts = 0
+        self.compact_raises: BaseException | None = None
+        self.send_raises: BaseException | None = None
+        self.exit_commands: set[str] = set()
+        self.queued_flushes = 0
+        self.queued_text = ""
+        # Gates let a test hold the worker slot open mid-command so a
+        # concurrent /send provably lands in the PARK path.
+        self.compact_gate: threading.Event | None = None
+        self.command_gate: threading.Event | None = None
+        self.command_raises: BaseException | None = None
+        # Gate for send() — lets a test hold a TURN in flight so a
+        # deferred entry provably lands in (or is refused by) the
+        # interjection fallback at drain time.
+        self.send_gate: threading.Event | None = None
+        # Every queue_message call — the defer invariant is that command
+        # windows NEVER reach the interjection queue.
+        self.queue_calls: list[str] = []
+        # When set, queue_message records the attempt and then raises it
+        # (e.g. CrossUserInterjectionError for the drain's re-park arm).
+        self.queue_raises: BaseException | None = None
+        # DELETE /send fall-through: ids the route asked this session to
+        # dequeue (the fake never holds interjections, so it returns
+        # False and the route falls through to the deferred-send list).
+        self.dequeues: list[str] = []
 
     def send(self, text: str, *, attachments: Any = None, send_id: Any = None) -> None:
         self.sends.append((text, attachments, send_id))
+        if self.send_gate is not None:
+            self.send_gate.wait(timeout=10)
+        if self.send_raises is not None:
+            raise self.send_raises
+
+    def queue_message(
+        self,
+        text: str,
+        attachment_ids: Any = None,
+        queue_msg_id: str | None = None,
+        interjector_user_id: str = "",
+    ) -> tuple[str, str, str]:
+        self.queue_calls.append(text)
+        if self.queue_raises is not None:
+            raise self.queue_raises
+        cap = INTERJECTION_CAP_CHARS
+        cleaned = text[:cap] + "..." if len(text) > cap else text
+        return cleaned, "notice", queue_msg_id or "m1"
+
+    def dequeue_message(self, msg_id: str) -> bool:
+        self.dequeues.append(msg_id)
+        return False
 
     def set_watch_runner(self, *_a: Any, **_kw: Any) -> None:
         pass
@@ -234,8 +294,26 @@ class _FakeSession:
     def close(self) -> None:
         pass
 
-    def handle_command(self, _cmd: str) -> bool:
-        return False
+    def handle_command(self, cmd: str) -> bool:
+        self.commands.append(cmd)
+        if self.command_gate is not None:
+            self.command_gate.wait(timeout=10)
+        if self.command_raises is not None:
+            raise self.command_raises
+        return cmd in self.exit_commands
+
+    def compact_now(self) -> bool:
+        self.compacts += 1
+        if self.compact_gate is not None:
+            self.compact_gate.wait(timeout=10)
+        if self.compact_raises is not None:
+            raise self.compact_raises
+        return True
+
+    def flush_queued_messages(self) -> bool:
+        self.queued_flushes += 1
+        had, self.queued_text = bool(self.queued_text), ""
+        return had
 
     def request_title_refresh(self, _title: str) -> None:
         pass
@@ -1177,3 +1255,1259 @@ class TestInteractiveEventsLifted:
             headers=_auth("user-1"),
         )
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/api/command — /compact worker dispatch (progress-events fix)
+# ---------------------------------------------------------------------------
+
+
+def test_command_backstop_sits_under_console_proxy_timeout() -> None:
+    """The /command ``running`` answer only ever traverses a proxied pane
+    while the node-side completion backstop is STRICTLY under the console
+    proxy's client timeout — two constants in two processes whose
+    inequality used to live in a comment.  This is the enforcement: edit
+    either constant past the other and this fails before a proxied
+    deployment silently loses the degraded answer again."""
+    from turnstone.console.server import _PROXY_CLIENT_TIMEOUT_S
+    from turnstone.server import _COMMAND_RESPONSE_BACKSTOP_S
+
+    assert _COMMAND_RESPONSE_BACKSTOP_S < _PROXY_CLIENT_TIMEOUT_S
+
+
+class TestCompactCommandDispatch:
+    """Manual /compact runs on the workstream's worker slot: the event loop
+    stays free to stream the compaction progress events, and a concurrent
+    send takes the queue path instead of racing the history swap."""
+
+    def _create_ws(self, client) -> str:
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "compact-me"},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        return resp.json()["ws_id"]
+
+    def test_compact_dispatches_to_worker(self, app_client):
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok"}
+
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        # The compaction runs on the spawned worker — join it (the runner
+        # clears _worker_running before the thread exits, so the join
+        # subsumes the flag).
+        ws.worker_thread.join(timeout=5)
+        assert not ws.worker_thread.is_alive()
+        assert ws.session.compacts == 1
+        assert ws._worker_running is False
+        # The slot was classified as a command window (what the /send
+        # route's defer keys on; stale after exit is harmless — every
+        # reader conjoins _worker_running).
+        assert ws.worker_kind == "command"
+        # Exit seam: stranded-text backstop flush only — no drain, no
+        # answering send (sends during the window defer in the /send
+        # route and dispatch as their own workers afterwards).
+        assert ws.session.queued_flushes == 1
+        assert ws.session.sends == []
+        # The worker wrapped the run in busy/idle state transitions.
+        assert ws.ui.states == ["thinking", "idle"]
+
+    # Drain outcomes are polled with tests._helpers.wait_until (flake-
+    # hardened final re-check; raises instead of returning False) at
+    # timeout=8.0 — the drain thread runs at a 0.25s cadence, so dispatch
+    # is asynchronous with respect to the released command worker and the
+    # helper's 5s default is too tight for CI descheduling stalls.
+
+    def _drain_idle(self, ws) -> bool:
+        """True once the pending-send drain retired itself (list empty,
+        single-flight slot cleared) — the leaked-task guard for these
+        tests."""
+        with ws._lock:
+            return not ws._pending_sends and ws._pending_drain is None
+
+    def test_send_during_compact_window_defers_then_dispatches_fully(self, app_client):
+        """A /send during a manual /compact is answered "queued"
+        IMMEDIATELY (no parked POST — a 30s-bounded caller like the
+        coordinator client or console proxy must never lose a message to
+        a multi-minute window) and then runs as an ordinary full-fidelity
+        send — never the interjection queue, whose INTERJECTION_CAP_CHARS
+        cap silently truncated pasted logs/code and whose cross-user guard
+        locked second participants out for the whole compaction."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.json() == {"status": "ok"}
+        big = "x" * 5000  # over the interjection cap — must survive intact
+        # The response is immediate even though the window is wedged open:
+        # this request runs on the same synchronous test client, so a
+        # parked POST would deadlock the test rather than pass it.
+        r = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": big},
+            headers=_auth("user-1"),
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["status"] == "queued"
+        # The SDK-facing discriminator between "interjection-queued into a
+        # live turn" and "parked on the deferred list" (SendResponse).
+        assert body["deferred"] is True
+        assert body["msg_id"]
+        assert body["priority"] == "notice"
+        # Registered, not dispatched: the window is still open.
+        assert ws.session.sends == []
+        assert ws.session.queue_calls == []  # the queue is unreachable
+        with ws._lock:
+            assert len(ws._pending_sends) == 1
+        gate.set()  # compaction finishes; the drain dispatches
+        wait_until(lambda: ws.session.sends, timeout=8.0)
+        # Full fidelity: the exact 5000-char text, via a normal send (an
+        # oversized entry must take the fresh-spawn arm — the interjection
+        # fallback would truncate it).
+        assert [s[0] for s in ws.session.sends] == [big]
+        assert ws.session.queue_calls == []
+        # The dispatched send carries the deferred msg_id as its send_id,
+        # so the client's queued bubble reconciles against the turn.
+        assert ws.session.sends[0][2] == body["msg_id"]
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_cancelled_compact_flushes_queue_without_answering(self, app_client):
+        """A user-stopped compaction must not auto-run a turn they may no
+        longer want — queued text lands in the transcript via the flush
+        drain instead (the cancel-seam precedent)."""
+        from turnstone.core.session import GenerationCancelled
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        ws.session.compact_raises = GenerationCancelled()
+        ws.session.queued_text = "queued mid-compact"
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        ws.worker_thread.join(timeout=5)
+        assert ws.session.compacts == 1
+        assert ws.session.queued_flushes == 1
+        assert ws.session.sends == []
+        assert ws.ui.states == ["thinking", "idle"]
+
+    def test_compact_refused_while_worker_running(self, app_client):
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        with ws._lock:
+            ws._worker_running = True  # a turn is in flight
+        try:
+            resp = client.post(
+                "/v1/api/command",
+                json={"command": "/compact", "ws_id": ws_id},
+                headers=_auth("user-1"),
+            )
+        finally:
+            with ws._lock:
+                ws._worker_running = False
+        assert resp.status_code == 409  # loud refusal for status-code-only callers
+        body = resp.json()
+        assert body["status"] == "busy"
+        assert "busy" in body["error"].lower()
+        # Never ran inline, never queued a phantom compaction.
+        assert ws.session.compacts == 0
+        assert ws.session.commands == []
+
+    def test_non_compact_commands_complete_before_response(self, app_client):
+        """Quick commands dispatch through the same worker slot (mutual
+        exclusion vs sends / a running compaction / each other) but the
+        endpoint awaits completion, preserving the synchronous contract:
+        handle_command has finished by the time the response returns."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/skill", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok"}
+        ws = mgr.get(ws_id)
+        # handle_command completed before the response (the done-Event
+        # gates it); join before asserting the slot state (the runner
+        # clears _worker_running before the thread exits, so the join
+        # subsumes the flag; without it this assert races the worker's
+        # last steps).
+        assert ws.session.commands == ["/skill"]
+        ws.worker_thread.join(timeout=5)
+        assert not ws.worker_thread.is_alive()
+        assert ws._worker_running is False
+        # No exit seam work at all for quick commands: no drain, no flush,
+        # no follow-up send, and no state chatter (they never left idle).
+        assert ws.session.queued_flushes == 0
+        assert ws.session.sends == []
+        assert ws.ui.states == []
+
+    def test_deferred_send_delivers_attachments_after_release(self, app_client, monkeypatch):
+        """Attachments are peek-resolved BEFORE the defer (the bytes ride
+        the pending entry), so a send deferred through a long compaction
+        still delivers them on dispatch — the queue-path refusal
+        (attachments_busy) must never apply to a command window."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+
+        def fake_resolve(requested_ids, _ws_id, _user_id):
+            assert list(requested_ids) == ["a1"]
+            return (["fake-attachment-bytes"], ["a1"], [])
+
+        monkeypatch.setattr("turnstone.core.attachments.resolve_staged_attachments", fake_resolve)
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        r = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "with attachment", "attachment_ids": ["a1"]},
+            headers=_auth("user-1"),
+        )
+        body = r.json()
+        assert body["status"] == "queued"
+        # The attachments are TAKEN by the deferred entry (the client
+        # consumes its chips off this list — a retract discards them).
+        assert body["attached_ids"] == ["a1"]
+        assert ws.session.sends == []  # still deferred
+        gate.set()
+        wait_until(lambda: ws.session.sends, timeout=8.0)
+        text, attachments, sid = ws.session.sends[0]
+        assert text == "with attachment"
+        assert attachments == ["fake-attachment-bytes"]
+        assert sid == body["msg_id"]
+        assert ws.session.queue_calls == []
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_send_during_quick_command_window_defers(self, app_client):
+        """The defer applies to EVERY command window, not just /compact —
+        a send racing a quick command is answered "queued" and dispatches
+        after the window with full fidelity instead of entering the
+        interjection queue."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.command_gate = gate
+        cmd_result: dict = {}
+
+        def _cmd() -> None:
+            r = client.post(
+                "/v1/api/command",
+                json={"command": "/skill", "ws_id": ws_id},
+                headers=_auth("user-1"),
+            )
+            cmd_result["body"] = r.json()
+
+        runner = threading.Thread(target=_cmd, daemon=True)
+        runner.start()
+        # Wait until the command worker actually holds the slot.
+        wait_until(lambda: ws._worker_running, timeout=8.0)
+        assert ws.worker_kind == "command"
+        r = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "mid-command send"},
+            headers=_auth("user-1"),
+        )
+        send_body = r.json()
+        assert send_body["status"] == "queued"
+        assert ws.session.queue_calls == []
+        assert ws.session.sends == []
+        gate.set()
+        runner.join(timeout=10)
+        assert cmd_result["body"] == {"status": "ok"}
+        wait_until(lambda: ws.session.sends, timeout=8.0)
+        assert [s[0] for s in ws.session.sends] == ["mid-command send"]
+        assert ws.session.queue_calls == []
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_clear_ui_rides_the_worker_not_the_endpoint(self, app_client):
+        """The clear_ui follow-up runs on the worker after handle_command —
+        parked after the endpoint's 60s done-wait it was silently skipped
+        for any command that outlived the backstop, leaving every pane
+        rendering a transcript the server no longer holds."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/clear", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        ws = mgr.get(ws_id)
+        ws.worker_thread.join(timeout=5)
+        assert {"type": "clear_ui"} in ws.ui._enqueued
+
+    def _run_abandoned_command(self, client, mgr, ws_id, command="/clear", raises=None):
+        """Dispatch a gated command, force-abandon its worker mid-run, then
+        release the gate so the abandoned thread finishes late.  Returns
+        (endpoint response body, the abandoned worker thread)."""
+        ws = mgr.get(ws_id)
+        gate = threading.Event()
+        ws.session.command_gate = gate
+        ws.session.command_raises = raises
+        result: dict = {}
+
+        def _cmd() -> None:
+            r = client.post(
+                "/v1/api/command",
+                json={"command": command, "ws_id": ws_id},
+                headers=_auth("user-1"),
+            )
+            result["body"] = r.json()
+
+        runner = threading.Thread(target=_cmd, daemon=True)
+        runner.start()
+        wait_until(lambda: ws._worker_running, timeout=8.0)
+        worker = ws.worker_thread
+        # The cancel handler's force path shape: abandon the worker.
+        with ws._lock:
+            ws.worker_thread = None
+            ws._worker_running = False
+        gate.set()  # the wedged command unwedges LATE
+        worker.join(timeout=5)
+        runner.join(timeout=10)
+        assert not worker.is_alive() and not runner.is_alive()
+        return result["body"], worker
+
+    def test_abandoned_command_worker_fires_no_followups(self, app_client):
+        """A force-cancelled wedged command that unwedges minutes later
+        must not fire clear_ui (every pane would wipe its transcript
+        mid-successor-turn) — the owner guard every sibling worker closure
+        applies.  done still fires, so the endpoint never hangs."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        body, _ = self._run_abandoned_command(client, mgr, ws_id, command="/clear")
+        assert not any(e.get("type") == "clear_ui" for e in ws.ui._enqueued)
+        # handle_command genuinely completed, so the (unhung) endpoint's
+        # answer reflects that.
+        assert body["status"] == "ok"
+
+    def test_abandoned_command_worker_swallows_late_error(self, app_client):
+        """The except arm carries the same guard: a stray late 'Command
+        error:' from an abandoned worker must not land mid-successor-turn."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        self._run_abandoned_command(
+            client, mgr, ws_id, command="/skill", raises=RuntimeError("late boom")
+        )
+        assert ws.ui.errors == []
+
+    def test_abandoned_init_worker_still_fires_notify(self, app_client, monkeypatch):
+        """The completion notify is WORKSTREAM-scoped, not slot-scoped:
+        _fire_notify_targets has exactly one call site (the init worker),
+        successor turns never notify, so an owner gate here has no
+        duplicate to prevent — it only converts force-cancel into
+        permanent notification loss for scheduled/unattended workstreams.
+        This pins the un-gated behavior against the tempting symmetry
+        'fix' (the finally's siblings ARE owner-gated, correctly — they
+        mutate live slot/UI state)."""
+        client, mgr = app_client
+        fired: list = []
+        monkeypatch.setattr(
+            "turnstone.server._fire_notify_targets",
+            lambda ws, content: fired.append(ws.id),
+        )
+        gate = threading.Event()
+        started = threading.Event()
+        orig_send = _FakeSession.send
+
+        def wedged_send(self, text, **kwargs):
+            started.set()
+            assert gate.wait(timeout=10)
+            orig_send(self, text, **kwargs)
+
+        monkeypatch.setattr(_FakeSession, "send", wedged_send)
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "sched", "initial_message": "do the thing"},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        ws_id = resp.json()["ws_id"]
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        assert started.wait(timeout=10)
+        worker = ws.worker_thread
+        with ws._lock:  # the force-cancel abandon shape
+            ws.worker_thread = None
+            ws._worker_running = False
+        gate.set()  # the abandoned init completes LATE
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+        assert fired == [ws_id]  # exactly once, despite the abandonment
+
+    def test_compact_on_error_workstream_restores_error_badge(self, app_client):
+        """/compact on an ERROR workstream must exit back to 'error', not
+        stamp 'idle' over the operator's investigatable badge — the
+        compaction neither retried nor resolved the failed turn (mirrors
+        the orphan reaper's ERROR carve-out).  The existing happy-path
+        test pins ['thinking', 'idle'] for an IDLE workstream."""
+        from turnstone.core.workstream import WorkstreamState
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        ws.state = WorkstreamState.ERROR  # a prior fatal turn's badge
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.json() == {"status": "ok"}
+        ws.worker_thread.join(timeout=5)
+        assert not ws.worker_thread.is_alive()
+        # THINKING during the window is honest (work is happening); the
+        # exit restores the badge instead of clearing it.
+        assert ws.ui.states == ["thinking", "error"]
+
+    def test_retracted_deferred_send_never_dispatches(self, app_client):
+        """DELETE /send with a deferred msg_id retracts the entry before
+        dispatch — the drain must skip it entirely.  The route falls
+        through the session's interjection dequeue (which misses) to the
+        workstream's pending list."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        r = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "changed my mind"},
+            headers=_auth("user-1"),
+        )
+        msg_id = r.json()["msg_id"]
+        d = client.request(
+            "DELETE",
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"msg_id": msg_id},
+            headers=_auth("user-1"),
+        )
+        assert d.json() == {"status": "removed"}
+        assert ws.session.dequeues == [msg_id]  # fall-through was exercised
+        gate.set()
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+        assert ws.session.sends == []
+        assert ws.session.queue_calls == []
+        # Unknown ids still answer not_found after checking both holders.
+        d2 = client.request(
+            "DELETE",
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"msg_id": "nope"},
+            headers=_auth("user-1"),
+        )
+        assert d2.json() == {"status": "not_found"}
+
+    def test_deferred_sends_dispatch_in_arrival_order(self, app_client):
+        """Two sends deferred behind one window dispatch in arrival order,
+        each as its own full-fidelity turn (the fake's sends complete
+        instantly, so the second never needs the interjection fallback)."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        first = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "first"},
+            headers=_auth("user-1"),
+        ).json()
+        second = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "second"},
+            headers=_auth("user-1"),
+        ).json()
+        assert first["status"] == second["status"] == "queued"
+        assert first["msg_id"] != second["msg_id"]
+        gate.set()
+        wait_until(lambda: len(ws.session.sends) == 2, timeout=8.0)
+        assert [s[0] for s in ws.session.sends] == ["first", "second"]
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_force_cancel_of_wedged_command_releases_drain(self, app_client):
+        """Force-cancelling a wedged command clears the slot flags — the
+        drain polls the same (_worker_running, worker_kind) pair, so a
+        deferred message dispatches WITHOUT waiting for the abandoned
+        thread to unwedge (the operator's escape hatch keeps working
+        under defer exactly as it did under park)."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        zombie = ws.worker_thread
+        r = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "deferred behind wedge"},
+            headers=_auth("user-1"),
+        )
+        assert r.json()["status"] == "queued"
+        resp = client.post(
+            f"/v1/api/workstreams/{ws_id}/cancel",
+            json={"force": True},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        # Dispatch happens while the zombie is STILL wedged on the gate.
+        wait_until(lambda: ws.session.sends, timeout=8.0)
+        assert [s[0] for s in ws.session.sends] == ["deferred behind wedge"]
+        gate.set()  # let the abandoned thread finish and be joined
+        zombie.join(timeout=5)
+        assert not zombie.is_alive()
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_ws_close_mid_window_drops_pending_and_drain_exits(self, app_client):
+        """A workstream closed with deferred sends outstanding drops them
+        (documented at-most-once contract) and the drain task retires
+        itself — no leaked task, no dispatch into a closed workstream."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        r = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "never delivered"},
+            headers=_auth("user-1"),
+        )
+        assert r.json()["status"] == "queued"
+        with ws._lock:
+            ws._closed = True  # the SessionManager.close tombstone shape
+        gate.set()
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+        assert ws.session.sends == []
+        assert ws.session.queue_calls == []
+
+    def test_deferred_send_dispatches_into_post_swap_session(self, app_client):
+        """The drain re-captures ws.session per attempt: a /resume-style
+        identity swap during the window routes the deferred message into
+        the POST-swap session — the same guarantee the park's
+        per-iteration re-capture provided."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        old_session = ws.session
+        gate = threading.Event()
+        old_session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        r = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "post-swap please"},
+            headers=_auth("user-1"),
+        )
+        assert r.json()["status"] == "queued"
+        new_session = _FakeSession(ws_id=ws_id, user_id="user-1")
+        ws.session = new_session  # the in-place identity swap
+        gate.set()
+        wait_until(lambda: new_session.sends, timeout=8.0)
+        assert [s[0] for s in new_session.sends] == ["post-swap please"]
+        assert old_session.sends == []
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_rejected_deferred_entry_waits_for_slot_then_fresh_spawns(self, app_client):
+        """The drain's rejection arm: an entry the interjection fallback
+        refuses (cross-user here; attachments/oversized take the same
+        path) is NOT dropped — it waits for the slot to free and then
+        dispatches as its own fresh turn.  The queued ack must never
+        become a silent drop while the workstream lives."""
+        from turnstone.core.session import CrossUserInterjectionError
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        send_gate = threading.Event()
+        ws.session.compact_gate = gate
+        ws.session.send_gate = send_gate
+        ws.session.queue_raises = CrossUserInterjectionError("another participant's turn")
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        for msg in ("first", "second"):
+            r = client.post(
+                f"/v1/api/workstreams/{ws_id}/send",
+                json={"message": msg},
+                headers=_auth("user-1"),
+            )
+            assert r.json()["status"] == "queued"
+        gate.set()
+        # Entry 1 spawns fresh and WEDGES in send() on send_gate — a live
+        # turn now holds the slot, so entry 2 takes the interjection
+        # fallback and is refused (the fake raises cross-user).
+        wait_until(lambda: ws.session.queue_calls == ["second"], timeout=8.0)
+        assert [s[0] for s in ws.session.sends] == ["first"]
+        send_gate.set()  # the turn ends; the slot frees
+        wait_until(lambda: len(ws.session.sends) == 2, timeout=8.0)
+        # Entry 2 dispatched as its own fresh turn — exactly one refused
+        # queue attempt, then the fresh-spawn arm.
+        assert [s[0] for s in ws.session.sends] == ["first", "second"]
+        assert ws.session.queue_calls == ["second"]
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_drain_crash_requeues_entry_and_retries(self, app_client):
+        """A crash inside a claimed entry's dispatch attempt (the real-world
+        shape: Thread.start raising under thread exhaustion) must not eat
+        the acknowledged message — the per-iteration handler re-inserts it
+        at head and retries after a backoff, keeping the docstring's
+        no-silent-drop contract."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        r = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "survive the crash"},
+            headers=_auth("user-1"),
+        )
+        assert r.json()["status"] == "queued"
+        with ws._lock:
+            entry = ws._pending_sends[0]
+        real_attempt = entry.attempt
+        calls = {"n": 0}
+
+        def crash_once(session):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated Thread.start failure")
+            return real_attempt(session)
+
+        entry.attempt = crash_once
+        gate.set()
+        wait_until(lambda: ws.session.sends, timeout=8.0)
+        assert [s[0] for s in ws.session.sends] == ["survive the crash"]
+        assert calls["n"] == 2  # crashed once, re-queued, dispatched on retry
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_persistently_crashing_entry_is_never_dropped_and_retract_frees_drain(self, app_client):
+        """A persistently crashing attempt keeps the entry alive (retry
+        loop, never a silent drop) — and the user's DELETE still works
+        mid-crash-loop: the re-inserted entry is marked retracted, the
+        loop-top purge drops it, and the drain retires cleanly."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        r = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "doomed"},
+            headers=_auth("user-1"),
+        )
+        msg_id = r.json()["msg_id"]
+        with ws._lock:
+            entry = ws._pending_sends[0]
+        calls = {"n": 0}
+
+        def always_crash(_session):
+            calls["n"] += 1
+            raise RuntimeError("persistent dispatch failure")
+
+        entry.attempt = always_crash
+        gate.set()
+        # Two attempts across the ~1s backoff prove the loop survived the
+        # first crash with the entry intact (a dropped entry can't be
+        # re-attempted) and nothing was dispatched behind the user's back.
+        wait_until(lambda: calls["n"] >= 2, timeout=8.0)
+        assert ws.session.sends == []
+        # ``calls["n"]`` increments as the FIRST statement of the attempt, so
+        # the counter crosses 2 while the drain still holds the entry CLAIMED
+        # (popped, dispatch in flight).  Retract only scans ``_pending_sends``
+        # and correctly answers not_found for a claimed entry, so firing the
+        # DELETE off the counter alone races the crash path's re-insert and
+        # loses whenever the re-insert is slower than the request -- which it
+        # is under pytest, where the log handlers make the intervening
+        # ``log.exception`` roughly as expensive as wait_until's poll interval.
+        # Wait for the state this test is actually about: the entry BACK on
+        # the list, mid-crash-loop, retractable.
+        wait_until(
+            lambda: any(e.msg_id == msg_id for e in list(ws._pending_sends)),
+            timeout=8.0,
+        )
+        d = client.request(
+            "DELETE",
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"msg_id": msg_id},
+            headers=_auth("user-1"),
+        )
+        assert d.json() == {"status": "removed"}
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+        assert ws.session.sends == []
+
+    def test_fresh_send_defers_behind_claimed_entry(self, app_client):
+        """The order barrier's drain-alive term: a send arriving while the
+        drain has CLAIMED an entry (off the list, dispatch in flight) must
+        defer behind it, not overtake — the pre-fix route dispatched
+        immediately (the list looked empty) and inverted answer order
+        against the acknowledged send."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        r1 = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "first"},
+            headers=_auth("user-1"),
+        )
+        assert r1.json()["deferred"] is True
+        with ws._lock:
+            entry = ws._pending_sends[0]
+        real_attempt = entry.attempt
+        claimed = threading.Event()
+        release = threading.Event()
+
+        def gated_attempt(session):
+            claimed.set()
+            assert release.wait(timeout=10)
+            return real_attempt(session)
+
+        entry.attempt = gated_attempt
+        gate.set()  # window closes; the drain claims "first" and blocks
+        wait_until(claimed.is_set, timeout=8.0)
+        with ws._lock:
+            assert ws._pending_sends == []  # claimed — the list alone says "free"
+        big = "y" * 5000  # full-fidelity: can't fold into any live turn
+        r2 = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": big},
+            headers=_auth("user-1"),
+        )
+        # Deferred via the barrier (drain alive), never dispatched directly.
+        assert r2.json()["status"] == "queued"
+        assert r2.json()["deferred"] is True
+        assert ws.session.sends == []
+        release.set()
+        wait_until(lambda: len(ws.session.sends) == 2, timeout=8.0)
+        assert [s[0] for s in ws.session.sends] == ["first", big]
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_drain_exit_re_arms_wake_gate_after_pure_retraction(self, app_client, monkeypatch):
+        """A pending list that empties by RETRACTION never runs a deferred
+        turn, so no worker-exit backstop would re-run the wake gate that
+        yielded to the barrier — the drain's clean exit must re-arm it
+        itself (trigger="drain-exit"), or a nudge parked during the window
+        strands until some unrelated future dispatch."""
+        from turnstone.core import idle_nudge_watcher
+
+        wake_calls: list[str] = []
+        monkeypatch.setattr(
+            idle_nudge_watcher,
+            "wake_workstream_if_pending",
+            lambda ws, *, trigger="unspecified": (wake_calls.append(trigger), False)[1],
+        )
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        r = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "will be retracted"},
+            headers=_auth("user-1"),
+        )
+        d = client.request(
+            "DELETE",
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"msg_id": r.json()["msg_id"]},
+            headers=_auth("user-1"),
+        )
+        assert d.json() == {"status": "removed"}
+        gate.set()
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+        wait_until(lambda: "drain-exit" in wake_calls, timeout=8.0)
+        assert ws.session.sends == []
+
+    def test_deferred_dispatch_emits_message_dispatched(self, app_client):
+        """Fresh-spawn arm of the settle protocol: dispatching a deferred
+        entry emits pane-tier ``message_dispatched {msg_id}`` (no
+        ``folded`` key) so the queued chip promotes exactly when the
+        retraction window truly closes."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        r = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "settle me"},
+            headers=_auth("user-1"),
+        )
+        msg_id = r.json()["msg_id"]
+        queued_events = [e for e in ws.ui._enqueued if e.get("type") == "message_queued"]
+        assert [e["msg_id"] for e in queued_events] == [msg_id]
+        gate.set()
+        wait_until(
+            lambda: any(e.get("type") == "message_dispatched" for e in ws.ui._enqueued),
+            timeout=8.0,
+        )
+        dispatched = [e for e in ws.ui._enqueued if e.get("type") == "message_dispatched"]
+        assert dispatched == [{"type": "message_dispatched", "msg_id": msg_id}]
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_folded_deferred_dispatch_emits_folded_flag(self, app_client):
+        """Interjection fold-in arm: a deferred entry that dispatches INTO a
+        live turn's queue emits ``folded: true`` — the client must clear
+        only its deferred flag (DELETE still genuinely removes the message
+        from the interjection queue until the seam drains), not promote."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        send_gate = threading.Event()
+        ws.session.compact_gate = gate
+        ws.session.send_gate = send_gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        first = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "first"},
+            headers=_auth("user-1"),
+        ).json()
+        second = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "second"},
+            headers=_auth("user-1"),
+        ).json()
+        gate.set()
+        # "first" spawns fresh and wedges in send() — a live turn holds the
+        # slot, so "second" (small, no attachments) folds into its
+        # interjection queue.
+        wait_until(lambda: ws.session.queue_calls == ["second"], timeout=8.0)
+        send_gate.set()
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+        dispatched = [e for e in ws.ui._enqueued if e.get("type") == "message_dispatched"]
+        assert dispatched == [
+            {"type": "message_dispatched", "msg_id": first["msg_id"]},
+            {"type": "message_dispatched", "msg_id": second["msg_id"], "folded": True},
+        ]
+        assert [s[0] for s in ws.session.sends] == ["first"]
+
+    def test_deferred_send_list_saturation_returns_queue_full(self, app_client):
+        """The deferred list is bounded (workstream.PENDING_SENDS_MAX — the
+        shared constant ChatSession._QUEUE_MAX aliases): the 11th pending
+        send answers queue_full instead of silently pinning message +
+        attachment bytes per entry for a whole command window and then
+        costing one unattended turn each."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        for i in range(10):
+            r = client.post(
+                f"/v1/api/workstreams/{ws_id}/send",
+                json={"message": f"m{i}"},
+                headers=_auth("user-1"),
+            )
+            assert r.json()["status"] == "queued", i
+        r11 = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "one too many"},
+            headers=_auth("user-1"),
+        )
+        body = r11.json()
+        assert body["status"] == "queue_full"
+        assert "msg_id" not in body  # never acknowledged
+        with ws._lock:
+            assert len(ws._pending_sends) == 10
+        gate.set()
+        wait_until(lambda: len(ws.session.sends) == 10, timeout=8.0)
+        assert [s[0] for s in ws.session.sends] == [f"m{i}" for i in range(10)]
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_drain_spawn_failure_rolls_back_and_answers_queue_full(self, app_client, monkeypatch):
+        """Thread.start failing at the drain-spawn site must not leave a
+        phantom acknowledged-nowhere entry (the 500-after-registration
+        class): entry and slot roll back under the same lock, the client
+        gets the retryable queue_full, and a retry once resources return
+        dispatches exactly once — no duplicate turns."""
+        from turnstone.core import session_routes
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+
+        class _ExhaustedThread(threading.Thread):
+            def start(self) -> None:
+                raise RuntimeError("can't start new thread")
+
+        real_factory = session_routes._make_drain_thread
+        monkeypatch.setattr(
+            session_routes,
+            "_make_drain_thread",
+            lambda _ws: _ExhaustedThread(target=lambda: None, daemon=True),
+        )
+        r = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "refused under exhaustion"},
+            headers=_auth("user-1"),
+        )
+        assert r.json()["status"] == "queue_full"
+        with ws._lock:
+            assert ws._pending_sends == []  # rolled back — no phantom
+            assert ws._pending_drain is None
+        # Resources recover: a plain retry defers and dispatches ONCE.
+        monkeypatch.setattr(session_routes, "_make_drain_thread", real_factory)
+        r2 = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "the retry"},
+            headers=_auth("user-1"),
+        )
+        assert r2.json()["status"] == "queued"
+        assert r2.json()["deferred"] is True
+        gate.set()
+        wait_until(lambda: ws.session.sends, timeout=8.0)
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+        assert [s[0] for s in ws.session.sends] == ["the retry"]
+
+    def test_command_spawn_failure_answers_503_not_ok(self, app_client, monkeypatch):
+        """A command worker that never spawned must not answer 200 ok — the
+        endpoint's generic catch-all used to swallow the dispatcher's
+        Thread.start re-raise, telling SDK callers their /clear ran while
+        the context stayed un-cleared."""
+        from turnstone.core import session_worker
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+
+        def _exhausted(*_a, **_kw):
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch.setattr(session_worker, "send", _exhausted)
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/clear", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 503
+        assert resp.json()["status"] == "error"
+        assert ws.session.commands == []  # the command never ran
+
+    def test_drain_exit_wake_raise_is_contained(self, app_client, monkeypatch, caplog):
+        """A raising drain-exit wake (session_worker.send re-raises
+        Thread.start failures) must stay inside the wake's own guard —
+        it runs AFTER the drain retired its slot, so reaching the
+        last-resort handler would clear a slot this thread no longer
+        owns (a successor drain's live registration)."""
+        import logging
+
+        from turnstone.core import idle_nudge_watcher
+
+        def _raising_gate(ws, *, trigger="unspecified"):
+            if trigger == "drain-exit":
+                raise RuntimeError("can't start new thread")
+            return False
+
+        monkeypatch.setattr(idle_nudge_watcher, "wake_workstream_if_pending", _raising_gate)
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "dispatch me"},
+            headers=_auth("user-1"),
+        )
+        with caplog.at_level(logging.WARNING, logger="turnstone.core.session_routes"):
+            gate.set()
+            wait_until(lambda: ws.session.sends, timeout=8.0)
+            wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+            wait_until(
+                lambda: any("drain_exit_wake_failed" in r.message for r in caplog.records),
+                timeout=8.0,
+            )
+        # The raise was contained by the wake's own guard — never the
+        # last-resort handler (whose log would be a false failure for a
+        # drain that exited cleanly).
+        assert not any("pending_drain_failed" in r.message for r in caplog.records)
+        # The seam stays fully serviceable: another defer cycle works.
+        gate2 = threading.Event()
+        ws.session.compact_gate = gate2
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "and me"},
+            headers=_auth("user-1"),
+        )
+        gate2.set()
+        wait_until(lambda: len(ws.session.sends) == 2, timeout=8.0)
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+
+    def test_closed_drain_exit_runs_no_wake(self, app_client, monkeypatch):
+        """The drain-exit wake backstop belongs to the CLEAN exit only: a
+        closed workstream is torn down, and firing the gate there would
+        be work on a corpse.  (The clean-exit case is pinned by
+        test_drain_exit_re_arms_wake_gate_after_pure_retraction.)"""
+        from turnstone.core import idle_nudge_watcher
+
+        triggers: list[str] = []
+        monkeypatch.setattr(
+            idle_nudge_watcher,
+            "wake_workstream_if_pending",
+            lambda ws, *, trigger="unspecified": (triggers.append(trigger), False)[1],
+        )
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "dies with the ws"},
+            headers=_auth("user-1"),
+        )
+        with ws._lock:
+            ws._closed = True  # tombstone, as SessionManager.close sets it
+        gate.set()
+        wait_until(lambda: self._drain_idle(ws), timeout=8.0)
+        assert "drain-exit" not in triggers
+        assert ws.session.sends == []
+
+    def test_drain_last_resort_clear_is_identity_guarded(self, app_client, monkeypatch, caplog):
+        """Drive the drain's OUTER except (loop machinery failing — here
+        the closed-arm log call) and prove the last-resort slot-clear
+        executes its identity guard: the slot is this drain's own, so it
+        clears; a successor's registration would be left alone (the
+        guard compares thread identity, the sibling exit-seam pattern)."""
+        import logging
+
+        from turnstone.core import session_routes
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        gate = threading.Event()
+        ws.session.compact_gate = gate
+        client.post(
+            "/v1/api/command",
+            json={"command": "/compact", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "stranded by the crash"},
+            headers=_auth("user-1"),
+        )
+
+        def _broken_warning(*_a, **_kw):
+            raise RuntimeError("log backend down")
+
+        monkeypatch.setattr(session_routes.log, "warning", _broken_warning)
+        with ws._lock:
+            ws._closed = True  # closed arm with a pending entry → log.warning
+        with caplog.at_level(logging.ERROR, logger="turnstone.core.session_routes"):
+            gate.set()
+            wait_until(
+                lambda: any("pending_drain_failed" in r.message for r in caplog.records),
+                timeout=8.0,
+            )
+        # The identity-guarded clear ran for the drain's OWN slot.
+        wait_until(lambda: ws._pending_drain is None, timeout=8.0)
+        assert ws.session.sends == []
+
+    def test_exit_command_emits_ended_info_and_never_answers(self, app_client):
+        """should_exit commands shut the session down — the worker emits
+        the ended notice and never launches an answering turn (sends
+        during the window defer in the /send route and belong to whatever
+        follows the shutdown, not to this worker)."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        ws.session.exit_commands = {"/exit"}
+        resp = client.post(
+            "/v1/api/command",
+            json={"command": "/exit", "ws_id": ws_id},
+            headers=_auth("user-1"),
+        )
+        assert resp.status_code == 200
+        ws.worker_thread.join(timeout=5)
+        assert ws.session.sends == []
+        assert any("Session ended" in m for m in ws.ui.infos)
+
+    def test_non_compact_command_refused_while_worker_running(self, app_client):
+        """The old inline path was serialized by the event loop itself; the
+        worker-slot dispatch restores that mutual exclusion with an explicit
+        busy answer — /clear can no longer interleave with a live turn or a
+        running compaction."""
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        with ws._lock:
+            ws._worker_running = True  # a turn / compaction is in flight
+        try:
+            resp = client.post(
+                "/v1/api/command",
+                json={"command": "/clear", "ws_id": ws_id},
+                headers=_auth("user-1"),
+            )
+        finally:
+            with ws._lock:
+                ws._worker_running = False
+        assert resp.status_code == 409
+        assert resp.json()["status"] == "busy"
+        assert ws.session.commands == []
+
+
+class TestRequireProjectMountWiring:
+    """server.require_project is wired on the REAL interactive create mount
+    (create_gate_require_project=True on interactive_endpoint_config). Synthetic-
+    cfg unit tests can't catch a mis-wire on the actual mount, so drive the
+    mounted endpoint end-to-end."""
+
+    def test_projectless_interactive_create_gated_when_on(self, app_client, make_config_store):
+        client, _mgr = app_client
+        client.app.state.config_store = make_config_store(**{"server.require_project": True})
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "no-project"},
+            headers=_auth("user-1", permissions=frozenset({"workstreams.create"})),
+        )
+        assert resp.status_code == 400, resp.json()
+        assert resp.json().get("code") == "require_project"
+
+    def test_projectless_interactive_create_allowed_when_off(self, app_client, make_config_store):
+        client, _mgr = app_client
+        client.app.state.config_store = make_config_store()  # flag off (default)
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "no-project"},
+            headers=_auth("user-1", permissions=frozenset({"workstreams.create"})),
+        )
+        body = resp.json()
+        assert not (resp.status_code == 400 and body.get("code") == "require_project"), body

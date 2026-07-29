@@ -47,7 +47,7 @@ from turnstone.core.log import get_logger
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from turnstone.core.workstream import Workstream
+    from turnstone.core.workstream import WorkerKind, Workstream
 
 log = get_logger(__name__)
 
@@ -93,6 +93,7 @@ def send(
     enqueue: Callable[[], None],
     run: Callable[[], None],
     thread_name: str | None = None,
+    worker_kind: WorkerKind = "turn",
 ) -> bool:
     """Dispatch work onto a workstream's worker thread.
 
@@ -106,6 +107,36 @@ def send(
     ``ChatSession`` they want to drive, so the worker can't be racing a
     concurrent ``ws.session`` swap.
 
+    ``worker_kind`` classifies what the slot holds — ``"turn"`` (send /
+    retry / wake / init, the default) or ``"command"`` (slash-command
+    workers, including the minutes-long manual /compact).  Written to
+    ``ws.worker_kind`` in the same lock acquisition as the
+    ``(worker_thread, _worker_running)`` pair.  This is the ONLY site
+    that sets ``_worker_running=True``, so the classification cannot be
+    bypassed by a new dispatch caller.  The /send route DEFERS while a
+    command holds the slot instead of taking the interjection-queue
+    path (whose length cap / cross-user guard are turn semantics): its
+    enqueue closure reports the window and the route registers the send
+    on ``ws._pending_sends`` for the drain task to dispatch when the
+    window closes.  An ``enqueue`` callback that can fire during a
+    command window (the coordinator adapter's, the init race's) must
+    refuse rather than queue — see the command-window refusals at those
+    closures.
+
+    The refusal is DELIBERATELY not centralized here despite the
+    hand-written guards: each surface needs a different refusal channel
+    (the /send route's closure signals "command window" via its
+    ``queue_outcome`` flag — the defer trigger; the coordinator adapter
+    and the init race raise ``queue.Full`` into their existing
+    backpressure statuses), and a central refusal inside this function
+    can only return ``False`` — indistinguishable from queue-full/closed
+    exactly where the route must distinguish "defer this" from "drop
+    this".  Making it distinguishable means a tri-state contract change
+    across every dispatch caller — more surface than the guards it
+    replaces.  (A check inside this function's locked section would be
+    race-free; the cost is the contract change, not atomicity.)  If you
+    add a NEW enqueue closure that can queue turn work, copy the guard.
+
     Returns:
         ``True`` on successful enqueue (existing worker accepted) or
         thread spawn (no live worker).
@@ -114,6 +145,12 @@ def send(
         caller surfaces 429) or any other exception (logged). Falling
         through to spawn a second worker on a full queue would corrupt
         ChatSession state.
+
+    Raises:
+        Whatever ``Thread.start()`` raised when the spawn itself fails
+        (thread exhaustion, ``MemoryError``) — the slot claim is rolled
+        back first, so the workstream stays dispatchable once resources
+        recover instead of wedging behind a flag no thread will clear.
     """
     name = thread_name or f"session-worker-{ws.id[:8]}"
 
@@ -196,10 +233,33 @@ def send(
         # lock-window cost is dominated by the spawn branch's identity
         # write either way.
         ws._worker_running = True
+        ws.worker_kind = worker_kind
         t = threading.Thread(target=_runner, name=name, daemon=True)
         ws.worker_thread = t
     # ``t.start()`` may run user code (worker body) before returning;
     # keep it outside the lock to avoid pinning ``ws._lock`` for the
     # full thread-creation cost.
-    t.start()
+    try:
+        t.start()
+    except Exception:
+        # Thread creation failed (RuntimeError under thread exhaustion,
+        # MemoryError): the slot was claimed under the lock above, but the
+        # flag's normal clearer is ``_runner``'s finally — on a thread
+        # that will never run.  Without this release, ``_worker_running``
+        # stays True forever on a workstream that LOOKS idle (the worker
+        # never fired a state change), every future dispatch takes the
+        # reuse path into a queue with no consumer, and only an operator
+        # force-cancel unwedges it.  Identity-guarded like ``_runner``'s
+        # clear: a concurrent force-cancel may already have cleared or
+        # replaced the slot, and this must not clobber a live successor.
+        # Re-raise rather than return False: callers' crash paths (the
+        # deferred-send drain's per-iteration handler with its backoff)
+        # are shaped for exceptions, and a False here would masquerade as
+        # queue-full backpressure.
+        with ws._lock:
+            if ws.worker_thread is t:
+                ws.worker_thread = None
+                ws._worker_running = False
+        log.exception("session_worker.spawn_failed ws=%s — slot released", ws.id[:8])
+        raise
     return True

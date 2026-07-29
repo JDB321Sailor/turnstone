@@ -155,24 +155,17 @@ def _parse_int(
 # Proxy helpers
 # ---------------------------------------------------------------------------
 
-# Inline JS injected into proxied server-UI pages.  Two responsibilities,
-# kept in one IIFE so the original window.fetch closure variable is
-# available to the picker (which has to bypass the prefix shim):
+# Inline JS injected into proxied server-UI pages.  Two responsibilities:
 #
-#   1. Prefix shim \u2014 rewrites root-relative fetch() and EventSource()
+#   1. Prefix shim — rewrites root-relative fetch() and EventSource()
 #      URLs to /node/{id}/... so the proxied page's API calls land
 #      at the console (which forwards them to the right server node).
 #
-#   2. Node picker \u2014 on DOMContentLoaded, prepends a node-id pill into
-#      the server UI's #ui-header (.appbar).  Click \u2192 dropdown with
-#      \u2190 Console + the other healthy nodes.  Replaces the earlier
-#      32px back-to-console banner that used to live above the appbar.
-#      Lazy-fetches /api/cluster/nodes the first time the menu opens
-#      (cheap when the user never clicks; fresh when they do).
+#   2. Back to console — repoints the proxied page's rail brand at "/",
+#      so the console stays reachable from inside a node view.
 _JS_PROXY_SHIM = """\
 (function(){
   var _pfx = "PREFIX_PLACEHOLDER";
-  var _nodeId = "NODE_ID_PLACEHOLDER";
   var _oF = window.fetch;
   window.fetch = function(u, o){
     if (typeof u === "string" && u.startsWith("/")) u = _pfx + u;
@@ -188,405 +181,48 @@ _JS_PROXY_SHIM = """\
   window.EventSource.OPEN = _oE.OPEN;
   window.EventSource.CLOSED = _oE.CLOSED;
 
-  function el(tag, cls, text){
-    var n = document.createElement(tag);
-    if (cls) n.className = cls;
-    if (text != null) n.textContent = text;
-    return n;
-  }
-
-  function buildPicker(){
-    var header = document.getElementById("ui-header");
-    if (!header) return;
-
-    // Trigger pill \u2014 prepended into #ui-header (the server UI's appbar).
-    var pill = document.createElement("button");
-    pill.type = "button";
-    pill.className = "console-node-pill";
-    pill.setAttribute("aria-haspopup", "menu");
-    pill.setAttribute("aria-expanded", "false");
-    pill.setAttribute("aria-label", "Switch node, currently " + _nodeId);
-    // title gives sighted users the full id when it ellipsizes
-    // \u2014 see the max-width + text-overflow rules in _CONSOLE_PROXY_STYLE.
-    pill.setAttribute("title", _nodeId);
-    pill.appendChild(el("span", "console-node-pill-dot"));
-    pill.appendChild(el("span", "console-node-pill-id", _nodeId));
-    pill.appendChild(el("span", "console-node-pill-caret", "\u25be"));
-    header.insertBefore(pill, header.firstChild);
-
-    // Menu state lives at the picker level, not on the menu DOM, so a
-    // close-then-reopen reuses the cached node list (no stale spinner).
-    var menu = null;
-    var loaded = false;
-    var loading = false;
-    var lastNodes = [];
-    var closeHandler = null;
-
-    function closeMenu(){
-      if (menu){ menu.remove(); menu = null; }
-      if (closeHandler){
-        document.removeEventListener("mousedown", closeHandler);
-        document.removeEventListener("keydown", closeHandler);
-        closeHandler = null;
-      }
-      pill.setAttribute("aria-expanded", "false");
-    }
-
-    function openMenu(){
-      if (menu) return;
-      // Reuse the workstream-tab dropdown shell for visual + behavioural
-      // consistency with the chevron menu next to it in the same toolbar.
-      menu = document.createElement("div");
-      menu.className = "ws-tab-dropdown console-node-menu";
-      menu.setAttribute("role", "menu");
-      menu.setAttribute("aria-label", "Switch node");
-      menu.addEventListener("contextmenu", function(e){ e.preventDefault(); });
-      document.body.appendChild(menu);
-      pill.setAttribute("aria-expanded", "true");
-
-      if (loaded){
-        renderMenu(lastNodes);
-      } else if (loading){
-        menu.appendChild(skeleton());
-        positionMenu();
-      } else {
-        menu.appendChild(skeleton());
-        positionMenu();
-        loadNodes();
-      }
-
-      // Keyboard handler kept in lockstep with the workstream-tab dropdown
-      // in turnstone/ui/static/app.js (search for _tabDropdownCloseHandler).
-      // If you change the keys here, change them there.  The only intentional
-      // divergence is the :not([aria-disabled='true']) filter — the picker
-      // skips disabled rows (current + unreachable) during arrow-key cycling.
-      closeHandler = function(e){
-        if (e.type === "keydown"){
-          if (e.key === "Escape"){
-            e.preventDefault();
-            closeMenu();
-            pill.focus();
-          } else if (e.key === "Tab"){
-            // Per ARIA APG menu pattern: Tab closes the menu AND moves
-            // focus to the next focusable element.  Don't preventDefault —
-            // let the browser do its native Tab traversal.
-            closeMenu();
-          } else if (e.key === "ArrowDown" || e.key === "ArrowUp"
-                  || e.key === "Home" || e.key === "End"){
-            e.preventDefault();
-            if (!menu) return;
-            var btns = Array.from(
-              menu.querySelectorAll(".ws-tab-dropdown-item:not([aria-disabled='true'])")
-            );
-            if (!btns.length) return;
-            var idx = btns.indexOf(document.activeElement);
-            if (e.key === "ArrowDown") btns[(idx + 1) % btns.length].focus();
-            // idx <= 0 covers both "first item" (wrap to last) and "no
-            // current focus" (idx === -1, which would otherwise yield N-2
-            // via the modulo).  Same shape worth backporting to app.js.
-            else if (e.key === "ArrowUp") btns[idx <= 0 ? btns.length - 1 : idx - 1].focus();
-            else if (e.key === "Home") btns[0].focus();
-            else if (e.key === "End") btns[btns.length - 1].focus();
-          }
-        } else if (e.type === "mousedown"
-                && menu && !menu.contains(e.target)
-                && e.target !== pill && !pill.contains(e.target)){
-          closeMenu();
-        }
-      };
-
-      // Defer listener wiring + initial focus so the click that opened
-      // the menu doesn't immediately trigger the mousedown-close path.
-      var activeMenu = menu;
-      var activeHandler = closeHandler;
-      setTimeout(function(){
-        if (menu !== activeMenu || !activeHandler) return;
-        document.addEventListener("mousedown", activeHandler);
-        document.addEventListener("keydown", activeHandler);
-        var first = activeMenu.querySelector(
-          ".ws-tab-dropdown-item:not([aria-disabled='true'])"
-        );
-        if (first) first.focus();
-      }, 0);
-    }
-
-    function positionMenu(){
-      if (!menu) return;
-      var pr = pill.getBoundingClientRect();
-      var mr = menu.getBoundingClientRect();
-      var mx = pr.left;
-      var my = pr.bottom + 4;
-      if (my + mr.height > window.innerHeight) my = pr.top - mr.height - 4;
-      if (mx + mr.width > window.innerWidth) mx = window.innerWidth - mr.width - 4;
-      if (mx < 4) mx = 4;
-      menu.style.left = mx + "px";
-      menu.style.top = my + "px";
-    }
-
-    function skeleton(){
-      var box = el("div", "console-node-skeleton");
-      box.setAttribute("role", "status");
-      box.setAttribute("aria-label", "Loading nodes");
-      // Three rows: roughly the typical small-cluster size.  CSS fades
-      // opacity per :nth-child (1.0 / 0.7 / 0.5) — adding a fourth would
-      // need a fourth opacity stop to avoid visual repetition.
-      for (var i = 0; i < 3; i++) box.appendChild(el("div", "console-node-skeleton-row"));
-      return box;
-    }
-
-    function loadNodes(){
-      loading = true;
-      // Saved original fetch \u2014 the prefix shim above would otherwise
-      // rewrite this to /node/{id}/v1/api/cluster/nodes, which the node
-      // doesn't serve (it's a console-only endpoint mounted at /v1).
-      // limit=1000 requests the collector's hard maximum in one round-trip;
-      // beyond 1000 nodes the picker UI is no longer the right shape (it'd
-      // need a search box) so we don't try to paginate.
-      _oF.call(window, "/v1/api/cluster/nodes?limit=1000", { credentials: "same-origin" })
-        .then(function(r){ if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-        .then(function(data){
-          loaded = true; loading = false;
-          lastNodes = Array.isArray(data && data.nodes) ? data.nodes : [];
-          if (menu) renderMenu(lastNodes);
-        })
-        .catch(function(){
-          loading = false;
-          if (menu) renderError();
-        });
-    }
-
-    function renderError(){
-      var status = el("div", "console-node-menu-status", "Failed to load nodes");
-      var retry = document.createElement("button");
-      retry.type = "button";
-      retry.className = "ws-tab-dropdown-item console-node-menu-item";
-      retry.setAttribute("role", "menuitem");
-      retry.setAttribute("tabindex", "-1");
-      retry.appendChild(el("span", "ws-tab-dropdown-label", "Retry"));
-      retry.addEventListener("click", function(e){
-        e.stopPropagation();
-        loaded = false;
-        if (menu){ menu.replaceChildren(skeleton()); positionMenu(); }
-        loadNodes();
-      });
-      menu.replaceChildren(status, retry);
-      positionMenu();
-      setTimeout(function(){ retry.focus(); }, 0);
-    }
-
-    function buildBackItem(){
-      var back = document.createElement("a");
-      back.href = "/";
-      back.className = "ws-tab-dropdown-item console-node-menu-item console-node-menu-back";
-      back.setAttribute("role", "menuitem");
-      back.setAttribute("tabindex", "-1");
-      back.setAttribute("aria-label", "Back to console");
-      back.appendChild(el("span", "console-node-menu-arrow", "\u2190"));
-      back.appendChild(el("span", "ws-tab-dropdown-label", "Console"));
-      return back;
-    }
-
-    function buildNodeItem(n){
-      var nid = n.node_id || "";
-      if (!nid) return null;
-      var isCurrent = nid === _nodeId;
-      var reachable = n.reachable !== false;
-      var hStatus = (n.health && n.health.status) || "";
-      var status = !reachable ? "unreachable"
-                  : (hStatus && hStatus !== "ok" ? "degraded" : "healthy");
-      var dotMod = status === "healthy" ? "" : status;
-      var wsTotal = n.ws_total != null ? n.ws_total : 0;
-      // Current + unreachable rows are non-interactive: rendered as <div>
-      // with aria-disabled so the keyboard-nav filter skips them and
-      // mouse clicks land on dead text.  A clickable <a> for an
-      // unreachable node would route the user to a 502 page.
-      var nonInteractive = isCurrent || !reachable;
-
-      var item;
-      if (nonInteractive){
-        item = document.createElement("div");
-      } else {
-        item = document.createElement("a");
-        item.href = "/node/" + encodeURIComponent(nid) + "/";
-      }
-      item.className = "ws-tab-dropdown-item console-node-menu-item"
-                      + (isCurrent ? " is-current" : "")
-                      + (!reachable && !isCurrent ? " is-unreachable" : "");
-      item.setAttribute("role", "menuitem");
-      item.setAttribute("tabindex", "-1");
-      if (isCurrent) item.setAttribute("aria-current", "true");
-      if (nonInteractive) item.setAttribute("aria-disabled", "true");
-      item.setAttribute(
-        "aria-label",
-        nid + ", " + wsTotal + " workstream" + (wsTotal === 1 ? "" : "s")
-            + ", " + status + (isCurrent ? ", current node" : "")
-      );
-
-      var dot = el("span",
-        "console-node-menu-item-dot"
-        + (dotMod ? " console-node-menu-item-dot--" + dotMod : ""));
-      dot.setAttribute("aria-hidden", "true");
-      item.appendChild(dot);
-
-      item.appendChild(el("span", "ws-tab-dropdown-label console-node-menu-item-id", nid));
-
-      // Meta carries ws-count + status text \u2014 the text suffix doubles as
-      // a colorblind-safe encoding of the dot color.  aria-hidden because
-      // the menuitem aria-label already says it.
-      var metaText = wsTotal + " ws" + (status !== "healthy" ? " \u00b7 " + status : "");
-      var meta = el("span", "ws-tab-dropdown-key", metaText);
-      meta.setAttribute("aria-hidden", "true");
-      item.appendChild(meta);
-
-      if (isCurrent){
-        var check = el("span", "console-node-menu-item-check", "\u2713");
-        check.setAttribute("aria-hidden", "true");
-        item.appendChild(check);
-      }
-      return item;
-    }
-
-    function renderMenu(nodes){
-      var children = [buildBackItem()];
-
-      var nodeItems = [];
-      nodes.forEach(function(n){
-        var it = buildNodeItem(n);
-        if (it) nodeItems.push(it);
-      });
-
-      if (nodeItems.length){
-        var sep = el("div", "ws-tab-dropdown-sep");
-        sep.setAttribute("role", "separator");
-        children.push(sep);
-        children = children.concat(nodeItems);
-      }
-
-      menu.replaceChildren(...children);
-      positionMenu();
-
-      // First-open path: openMenu()'s deferred focus hook ran before the
-      // async fetch resolved, so it found only the skeleton and left
-      // focus on the pill.  If focus is still on the pill (i.e. the user
-      // didn't navigate away while the skeleton was up), grab it now.
-      if (document.activeElement === pill){
-        var first = menu.querySelector(
-          ".ws-tab-dropdown-item:not([aria-disabled='true'])"
-        );
-        if (first) first.focus();
-      }
-    }
-
-    pill.addEventListener("click", function(e){
+  // Repoint the rail brand at the console.  Only proxied pages get this shim,
+  // so a standalone server keeps shell.js's showHome().  The node's own
+  // dashboard stays reachable as the non-closable first tab.
+  function wireBrandHome(){
+    var brand = document.querySelector(".rail-brand .brand-home");
+    if (!brand) return;
+    brand.setAttribute("aria-label", "Back to console");
+    brand.setAttribute("title", "Back to console");
+    var sub = brand.querySelector(".brand-sub");
+    if (sub) sub.textContent = "← console";
+    // Capture at the document so this runs during the capture walk, before
+    // any listener on the button itself; stopPropagation() then keeps
+    // shell.js's showHome() bubble listener from ever being reached.
+    document.addEventListener("click", function(e){
+      if (!brand.contains(e.target)) return;
+      e.preventDefault();
       e.stopPropagation();
-      if (menu) closeMenu(); else openMenu();
-    });
+      window.location.href = "/";
+    }, true);
   }
 
+  // shell.js builds the rail synchronously in mountShell (before its first
+  // await), and deferred modules run before DOMContentLoaded — so
+  // .brand-home exists by the time this fires.
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", buildPicker);
+    document.addEventListener("DOMContentLoaded", wireBrandHome);
   } else {
-    buildPicker();
+    wireBrandHome();
   }
 })();
 """
 
-# Inline <style> injected into proxied server-UI pages.  The dropdown
-# panel itself reuses .ws-tab-dropdown* (defined in ui/static/style.css,
-# which the proxied page already loads) for animation, shadow, theme
-# override, and item layout.  This sheet adds:
-#   - the trigger pill (no analogue exists in the server UI),
-#   - the inline health-dot in menu items (mirrors --green / --accent /
-#     --red from the cluster-overview node table \u2014 see
-#     console/static/style.css:535-549),
-#   - the "you are here" tint + cursor:default for the current node row,
-#   - a 3-row pulse skeleton for the loading state.
-_CONSOLE_PROXY_STYLE = (
-    "<style>"
-    # --- Trigger pill \u2014 sits at the start of #ui-header (.appbar).
-    # Height 24px passes WCAG 2.5.8 (24px min target) and harmonises
-    # with .btn (28px) and .appbar-back (~20px) without looking stunted.
-    # max-width caps the pill against pathologically long node ids
-    # (validated up to 256 chars upstream); the id span ellipsizes
-    # inside.  min-width:0 lets it shrink under appbar pressure.
-    ".console-node-pill{display:inline-flex;align-items:center;gap:6px;"
-    "height:24px;padding:0 10px;max-width:240px;min-width:0;"
-    "font-family:var(--font-mono);font-size:12px;color:var(--fg-dim);"
-    "background:transparent;border:1px solid var(--border-strong);"
-    "border-radius:var(--radius-sm);cursor:pointer;line-height:1;"
-    "transition:background .12s,color .12s}"
-    ".console-node-pill:hover{background:var(--bg-highlight);color:var(--fg)}"
-    '.console-node-pill[aria-expanded="true"]{background:var(--bg-highlight);'
-    "color:var(--fg);border-color:var(--accent-dim)}"
-    ".console-node-pill:focus-visible{outline:2px solid var(--accent);"
-    "outline-offset:2px}"
-    ".console-node-pill-dot{width:6px;height:6px;border-radius:50%;"
-    "background:var(--green);box-shadow:0 0 4px var(--green-glow);"
-    "flex-shrink:0}"
-    ".console-node-pill-id{font-weight:500;overflow:hidden;"
-    "text-overflow:ellipsis;white-space:nowrap;min-width:0}"
-    ".console-node-pill-caret{font-size:10px;color:var(--fg-dim);opacity:.7;"
-    "display:inline-block;transition:transform .12s}"
-    '.console-node-pill[aria-expanded="true"] .console-node-pill-caret'
-    "{transform:rotate(180deg)}"
-    # --- Menu shell uses .ws-tab-dropdown directly; no CSS needed here.
-    # Constrain the picker's width so node ids + meta have room.
-    ".console-node-menu{min-width:240px;max-width:360px}"
-    # --- Menu items reuse .ws-tab-dropdown-item \u2014 we only override
-    # font (mono, for hostname-like ids) and add the dot column.
-    ".console-node-menu-item{font-family:var(--font-mono);font-size:12px;"
-    "padding:6px 12px;gap:8px;color:var(--fg-dim);text-decoration:none}"
-    # Current row: keep the accent-tint visible.  The shared
-    # .ws-tab-dropdown-item[aria-disabled="true"] rule applies opacity:.55
-    # which would otherwise wash out the "you are here" tint \u2014 restore
-    # full opacity here.  Same restore for the unreachable row's red dot
-    # so its color signal stays legible against the dim row background.
-    ".console-node-menu-item.is-current{background:var(--accent-dim);"
-    "color:var(--fg);cursor:default;opacity:1}"
-    ".console-node-menu-item.is-current:hover{background:var(--accent-dim);"
-    "color:var(--fg)}"
-    # Unreachable row: dim the text but leave the dot at full saturation
-    # so the red signal reads against the dim row.  cursor:not-allowed
-    # comes from the shared aria-disabled rule.
-    ".console-node-menu-item.is-unreachable{color:var(--fg-dim)}"
-    ".console-node-menu-item.is-unreachable .console-node-menu-item-dot{opacity:1}"
-    ".console-node-menu-back{color:var(--accent)}"
-    ".console-node-menu-back:hover{color:var(--accent)}"
-    ".console-node-menu-arrow{font-family:var(--font-mono);font-size:13px}"
-    # Health dots in menu items \u2014 match cluster-overview canonical colors:
-    #   reachable + ok      \u2192 --green  (style.css:539)
-    #   reachable + !ok     \u2192 --accent (style.css:548  \u2014 was --yellow)
-    #   unreachable         \u2192 --red    (style.css:544)
-    ".console-node-menu-item-dot{width:6px;height:6px;border-radius:50%;"
-    "flex-shrink:0;background:var(--green);box-shadow:0 0 4px var(--green-glow)}"
-    ".console-node-menu-item-dot--unreachable{background:var(--red);"
-    "box-shadow:0 0 4px var(--red-glow)}"
-    ".console-node-menu-item-dot--degraded{background:var(--accent);"
-    "box-shadow:0 0 4px var(--accent-glow-strong)}"
-    ".console-node-menu-item-id{flex:1}"
-    ".console-node-menu-item-check{color:var(--accent);font-size:11px}"
-    # --- Loading state: 3-row pulsing skeleton.  Reuses --border-strong
-    # for the row tint and a dedicated keyframe so we can guard it under
-    # prefers-reduced-motion in step.
-    ".console-node-skeleton{padding:6px 0}"
-    ".console-node-skeleton-row{height:14px;margin:6px 12px;"
-    "background:var(--border-strong);border-radius:var(--radius-sm);"
-    "animation:console-node-skel-pulse 1.4s ease-in-out infinite}"
-    ".console-node-skeleton-row:nth-child(2){opacity:.7;animation-delay:.15s}"
-    ".console-node-skeleton-row:nth-child(3){opacity:.5;animation-delay:.3s}"
-    "@keyframes console-node-skel-pulse{"
-    "0%,100%{opacity:.4}50%{opacity:.8}}"
-    "@media (prefers-reduced-motion:reduce){"
-    ".console-node-skeleton-row{animation:none}}"
-    # --- Status text fallback (only used by the error path now).
-    ".console-node-menu-status{padding:8px 12px;font-family:var(--font-mono);"
-    "font-size:11px;color:var(--fg-dim);text-align:center}"
-    "</style>"
-)
-
-
 _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
 _VALID_WS_ID_RE = re.compile(r"^[a-f0-9]{1,64}$")
+
+# Client timeout for the REST proxy pool (BOTH constructions: startup and
+# the mTLS re-create).  Node endpoints that answer degraded-but-in-time
+# responses size their backstops strictly UNDER this bound — e.g. the
+# quick-command ``running`` answer (turnstone/server.py
+# _COMMAND_RESPONSE_BACKSTOP_S); a test pins the inequality.  The SSE
+# proxy client's granular Timeout is a separate contract.
+_PROXY_CLIENT_TIMEOUT_S = 30
 
 _PROXY_JWT_EXPIRY_SECONDS = 300  # 5 min — ample for any request round-trip
 
@@ -642,6 +278,13 @@ def _bounded_body_preview(text: str | bytes, cap: int = 200) -> str:
     if isinstance(text, bytes):
         text = text.decode("utf-8", "replace")
     return _CONTROL_CHAR_RE.sub(" ", text)[:cap]
+
+
+def _dispatch_failed(node_id: str) -> JSONResponse:
+    """The sanitized 502 the cluster-create proxy returns for every masked node
+    outcome (network failure, unparseable 2xx body, and any non-require_project
+    node status). One wording, one status — each caller keeps its own distinct log."""
+    return JSONResponse({"error": f"Dispatch to node {node_id} failed"}, status_code=502)
 
 
 def _proxy_auth_headers(request: Request) -> dict[str, str]:
@@ -2197,18 +1840,81 @@ async def create_workstream(request: Request) -> JSONResponse:
             )
         else:
             resp = await client.post(node_url, json=ws_body, headers=headers)
-        resp.raise_for_status()
     except httpx.HTTPError as exc:
         log.warning("Workstream dispatch to %s failed: %s", node_id, exc)
-        return JSONResponse({"error": f"Dispatch to node {node_id} failed"}, status_code=502)
+        return _dispatch_failed(node_id)
 
-    return JSONResponse(
-        {
-            "status": "ok",
-            "correlation_id": resp.json().get("ws_id", ""),
-            "target_node": node_id,
-        }
+    # The node is the authoritative require_project gate. Surface ONLY its
+    # coded require_project 400 to the operator; mask every OTHER node outcome
+    # as an opaque 502. Rationale (do not "simplify" by re-emitting the node
+    # status/body generically):
+    #   * a node 401 re-emitted here trips authFetch's reactive refresh +
+    #     force-logout, dumping a VALID operator to the login overlay and
+    #     double-sending the (non-idempotent) create;
+    #   * a node 429 re-emitted here trips authFetch's auto-retry, minting a
+    #     DUPLICATE workstream;
+    #   * any non-require_project node body may carry internal detail
+    #     ("cannot fork <id>: <persona ValueError>", skill/persona/path text)
+    #     that would land in the operator's browser DOM.
+    # The discriminator is an EXACT code match: coded-but-different bodies
+    # (too_many/too_large/upload) and every un-coded 400 mask to 502. The
+    # actionable attach-denied 403 and factory-misconfig 503 are also masked
+    # to 502 — a deliberate leak boundary; do NOT surface 403/503 here without
+    # re-checking the leak. Branch on the explicit success range (not
+    # raise_for_status) so a future httpx that lets a 3xx through still cannot
+    # reach the 2xx json parse. Guard BOTH body reads (a 204 / non-JSON 2xx
+    # would otherwise raise a JSONDecodeError → console 500 → operator retry →
+    # orphan/duplicate ws).
+    try:
+        _raw = resp.json()
+        node_body = _raw if isinstance(_raw, dict) else None
+    except Exception:
+        # Broad by design at this console->node proxy boundary: ANY parse failure
+        # (a 204 with no body, an intermediary's HTML, a truncated body) must fall
+        # through to the 502 mask below, never propagate. Deliberately wider than
+        # the codebase's narrow (ValueError, JSONDecodeError) json-guard.
+        node_body = None
+
+    if 200 <= resp.status_code < 300:
+        if node_body is None:
+            log.warning(
+                "Workstream dispatch to %s: unparseable %s success body: %s",
+                node_id,
+                resp.status_code,
+                _bounded_body_preview(resp.content),
+            )
+            return _dispatch_failed(node_id)
+        return JSONResponse(
+            {
+                "status": "ok",
+                "correlation_id": node_body.get("ws_id", ""),
+                "target_node": node_id,
+            }
+        )
+
+    from turnstone.core.auth import REQUIRE_PROJECT_CODE, REQUIRE_PROJECT_ERROR
+
+    if (
+        resp.status_code == 400
+        and node_body is not None
+        and node_body.get("code") == REQUIRE_PROJECT_CODE
+    ):
+        # Surface OUR canonical wording, not the node's echoed `error` string: a
+        # version-skewed or misbehaving node must not control the operator-facing
+        # text, and this keeps the message identical across every refusal cause.
+        log.info("Workstream dispatch to %s refused: require_project", node_id)
+        return JSONResponse(
+            {"error": REQUIRE_PROJECT_ERROR, "code": REQUIRE_PROJECT_CODE},
+            status_code=400,
+        )
+
+    log.warning(
+        "Workstream dispatch to %s failed: node status %s: %s",
+        node_id,
+        resp.status_code,
+        _bounded_body_preview(resp.content),
     )
+    return _dispatch_failed(node_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2965,16 +2671,12 @@ async def proxy_index(request: Request) -> Response:
         page = page.replace('src="/static/', f'src="{prefix}/static/')
         page = page.replace('href="/shared/', f'href="{prefix}/shared/')
         page = page.replace('src="/shared/', f'src="{prefix}/shared/')
-        # Inject the proxy shim (prefix rewriting + node-picker) after <body>.
-        # The picker self-attaches to #ui-header on DOMContentLoaded; the
-        # banner that used to live above the appbar is gone.  node_id is
-        # validated against _VALID_NODE_ID upstream, so json.dumps is the
-        # only escaping the JS literal needs.
-        shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix)).replace(
-            '"NODE_ID_PLACEHOLDER"', json.dumps(node_id)
-        )
-        shim = "<script>" + shim_js + "</script>"
-        page = page.replace("<body>", "<body>" + _CONSOLE_PROXY_STYLE + shim, 1)
+        # Inject the proxy shim (prefix rewriting + back-to-console) after
+        # <body>.  prefix is built from a node_id already validated against
+        # _VALID_NODE_ID, so json.dumps is the only escaping the JS literal
+        # needs.
+        shim_js = _JS_PROXY_SHIM.replace('"PREFIX_PLACEHOLDER"', json.dumps(prefix))
+        page = page.replace("<body>", "<body><script>" + shim_js + "</script>", 1)
         html_resp = HTMLResponse(page)
         html_resp.headers["Cache-Control"] = "no-cache"
         return html_resp
@@ -3887,7 +3589,7 @@ def _audit_coordinator_create(
     )
 
 
-def _coord_spawn_metrics(_request: Request, ui: Any) -> None:
+def _coord_spawn_metrics(ui: Any) -> None:
     """Per-spawn counter writes for coord — mirrors interactive's pattern.
 
     Wired onto :attr:`SessionEndpointConfig.spawn_metrics`. Increments
@@ -5043,6 +4745,9 @@ def _bootstrap_coord_subsystem(
         config_store=config_store,
         node_id="console",
         coord_client_factory=_coord_client_factory,
+        # Getter, not the instance: the console MCP ensure-helper can
+        # (re)construct the manager after this bootstrap (#725).
+        mcp_client_getter=lambda: getattr(app.state, "mcp_client", None),
     )
     coord_adapter = CoordinatorAdapter(
         collector=app.state.collector,
@@ -5322,7 +5027,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     _proxy_verify: Any = _proxy_ssl if _proxy_ssl else True
 
     app.state.proxy_client = httpx.AsyncClient(
-        timeout=30,
+        timeout=_PROXY_CLIENT_TIMEOUT_S,
         limits=httpx.Limits(
             max_connections=fan_out + 50,
             max_keepalive_connections=min(fan_out // 4, 100),
@@ -5464,7 +5169,7 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 await app.state.proxy_client.aclose()
                 await app.state.proxy_sse_client.aclose()
                 app.state.proxy_client = httpx.AsyncClient(
-                    timeout=30,
+                    timeout=_PROXY_CLIENT_TIMEOUT_S,
                     limits=httpx.Limits(
                         max_connections=app.state.fan_out_limit + 50,
                         max_keepalive_connections=min(app.state.fan_out_limit // 4, 100),
@@ -5500,6 +5205,28 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         # startup.  Mirrors the runtime CRUD-triggered path's
         # ``asyncio.to_thread`` invocation.
         await asyncio.to_thread(_load_and_bootstrap_coord_subsystem, app, storage, config_store)
+
+    # Console-hosted MCP client manager for coordinator workstreams
+    # (#725) — node-boot parity: same constructor, same catalog
+    # resolution (DB → mcp.config_path → config.toml), same bounded
+    # inline connect wait, None when nothing is configured.  Later
+    # convergence rides the reload fan-out (_ensure_console_mcp_client).
+    app.state.mcp_client = None
+    if storage and config_store:
+        from turnstone.core.mcp_client import create_mcp_client
+
+        try:
+            app.state.mcp_client = await asyncio.to_thread(
+                create_mcp_client,
+                config_store.get("mcp.config_path") or None,
+                storage=storage,
+            )
+        except Exception:
+            log.warning(
+                "console MCP manager boot failed — coordinators get no MCP "
+                "until the next admin MCP write or reload",
+                exc_info=True,
+            )
 
     yield
     # Shutdown
@@ -5555,6 +5282,20 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
         log.debug("console.coord_ui_refs_reset_failed", exc_info=True)
     await app.state.proxy_sse_client.aclose()
     await app.state.proxy_client.aclose()
+    # Console-hosted MCP manager: coordinator sessions stay LOADED at
+    # console shutdown (there is no session-close loop here, unlike the
+    # node), so their MCP listeners are intentionally still registered
+    # when the manager dies — acceptable because the process is exiting
+    # and the manager's listener fan-out swallows per-callback
+    # exceptions.  shutdown() blocks (mcp-loop join + transport
+    # teardown), so offload like coord_state_writer above.  Ordered
+    # before close_mcp_oauth_state per LIFO teardown.
+    _console_mcp_shutdown = getattr(app.state, "mcp_client", None)
+    if _console_mcp_shutdown is not None:
+        try:
+            await asyncio.to_thread(_console_mcp_shutdown.shutdown)
+        except Exception:
+            log.debug("console.mcp_client_shutdown_failed", exc_info=True)
     # Close in reverse order of initialization (mcp_oauth → mcp_crypto →
     # oidc) per LIFO teardown discipline.
     from turnstone.core.mcp_oauth import close_mcp_oauth_state
@@ -10155,7 +9896,15 @@ def _mcp_server_to_detail(
 async def _collect_mcp_status(
     request: Request,
 ) -> dict[str, dict[str, dict[str, Any]]]:
-    """Query all nodes for MCP status. Returns {node_id: {server_name: status}}."""
+    """Query all nodes — and the console's own manager — for MCP status.
+
+    Returns {node_id: {server_name: status}}.  The console's manager
+    reports under the collector's console pseudo-node id (#725): the
+    admin MCP view must show the surface coordinators actually dispatch
+    through.  Its rows carry the same read-scope projection node rows
+    get (``has_error``, no command/url/verbose error); on failure the
+    console key is omitted, matching ``_fetch``'s None contract.
+    """
     collector: ClusterCollector = request.app.state.collector
     nodes = collector.get_all_nodes()
     client: httpx.AsyncClient = request.app.state.proxy_client
@@ -10180,7 +9929,31 @@ async def _collect_mcp_status(
                 log.debug("Failed to fetch MCP status from node %s", node_id, exc_info=True)
         return node_id, None
 
-    results = await asyncio.gather(*[_fetch(n) for n in nodes])
+    async def _console() -> tuple[str, dict[str, dict[str, Any]] | None]:
+        # Class constant, not the collector instance: several callers
+        # exercise this collector with minimal stubs, and the pseudo-node
+        # key must not depend on runtime state they never provided.
+        console_id = ClusterCollector.CONSOLE_PSEUDO_NODE_ID
+        mgr = getattr(request.app.state, "mcp_client", None)
+        if mgr is None:
+            return console_id, None
+        from turnstone.core.mcp_utils import strip_server_status_for_read
+
+        # Mirrors internal_mcp_status's admin path: cross-user aggregate
+        # view scoped to the requesting admin.
+        uid = _auth_user_id(request)
+
+        def _status() -> dict[str, dict[str, Any]]:
+            all_status = mgr.get_all_server_status(uid, aggregate=True)
+            return {n: strip_server_status_for_read(s) for n, s in all_status.items()}
+
+        try:
+            return console_id, await asyncio.to_thread(_status)
+        except Exception:
+            log.debug("console MCP status read failed", exc_info=True)
+            return console_id, None
+
+    results = await asyncio.gather(*[_fetch(n) for n in nodes], _console())
     return {nid: servers for nid, servers in results if servers is not None}
 
 
@@ -10873,6 +10646,60 @@ async def admin_delete_mcp_server(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"}, background=_schedule_mcp_reload(request))
 
 
+# Guards concurrent construction of the console's own MCP client manager
+# (lifespan boot racing an admin-write fan-out, or two rapid fan-outs
+# while ``app.state.mcp_client`` is still None).  Two winners would each
+# start an mcp-loop daemon thread and a static connection set; the second
+# assignment clobbers the first ref and the loser leaks both forever.
+# The node's ``internal_mcp_reload`` lazy-construct carries exactly this
+# latent race (turnstone/server.py internal_mcp_reload) — the console
+# does not replicate it.  Same shape as ``_COORD_BOOTSTRAP_LOCK``.
+_CONSOLE_MCP_ENSURE_LOCK = threading.Lock()
+
+
+def _ensure_console_mcp_client(app: Any) -> dict[str, Any]:
+    """Reconcile — and lazily construct — the console's own MCP client manager.
+
+    The console hosts an ``MCPClientManager`` so coordinator-kind
+    workstreams get an MCP tool surface (#725).  Node parity throughout:
+    construction goes through ``create_mcp_client`` — the same catalog
+    resolution as a node host (DB rows, then ``mcp.config_path``, then
+    this host's config.toml; ``None`` when nothing is configured) — and
+    the reconcile arm runs whenever a manager exists, so running
+    coordinators track admin edits exactly like node sessions do.
+
+    This is the ONE lazy-construct/reconcile path for every post-boot
+    trigger — the admin-write reload fan-out and the operator
+    ``POST /reload`` — mirroring the node's ``internal_mcp_reload``.
+    Unlike the node's arm, the body holds a lock: two concurrent
+    triggers on a managerless console must not double-construct (the
+    node's unlocked equivalent is issue #873).
+
+    Plain SYNC function: construction connects to static servers and
+    ``reconcile_sync`` performs bounded sync waits, so every caller
+    (all async) MUST invoke via ``asyncio.to_thread``.
+
+    Returns a reconcile-shaped dict (``added``/``removed``/``updated``,
+    or ``skipped``) so the operator reload view reports the console
+    alongside the nodes.
+    """
+    with _CONSOLE_MCP_ENSURE_LOCK:
+        storage = getattr(app.state, "auth_storage", None)
+        if storage is None:
+            return {"skipped": "storage not initialized"}
+        mgr = getattr(app.state, "mcp_client", None)
+        if mgr is None:
+            from turnstone.core.mcp_client import create_mcp_client
+
+            cs = getattr(app.state, "config_store", None)
+            cfg_path = cs.get("mcp.config_path") if cs is not None else None
+            mgr = create_mcp_client(cfg_path or None, storage=storage)
+            if mgr is None:
+                return {"skipped": "no MCP servers configured"}
+            app.state.mcp_client = mgr
+        return mgr.reconcile_sync(storage)
+
+
 async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
     """Tell all nodes to re-read the mcp_servers DB table and reconcile.
 
@@ -10908,7 +10735,33 @@ async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
                 log.debug("Failed to notify node %s for MCP reload", node_id, exc_info=True)
                 return node_id, {"error": str(exc)}
 
-    results = await asyncio.gather(*[_notify(n) for n in nodes])
+    async def _console() -> tuple[str, Any]:
+        # The console hosts its own MCP manager for coordinator sessions
+        # (#725) — ensure/reconcile it in the SAME gather as the node
+        # fan-out so EVERY producer (post-write background hooks and the
+        # operator POST /reload alike) covers it, and so the console's
+        # (up to ~30s) construct/connect work OVERLAPS the node HTTP
+        # window instead of stacking after it on the operator-inline
+        # reload path.  Keyed under the collector's console pseudo-node
+        # id: get_nodes hides that id from fan-out enumeration, so the
+        # key can neither collide with a real node nor self-HTTP.
+        # Deliberately OUTSIDE ``sem`` — that semaphore paces node POSTs,
+        # and a ~30s worker-thread hold would starve a slot.  Exceptions
+        # are caught HERE (the gather runs return_exceptions=False): a
+        # console failure must not abandon collected node results.  Class
+        # constant for the key, like the sibling arms: stub collectors
+        # may not carry the instance attr.
+        console_id = ClusterCollector.CONSOLE_PSEUDO_NODE_ID
+        try:
+            return (
+                console_id,
+                await asyncio.to_thread(_ensure_console_mcp_client, request.app),
+            )
+        except Exception as exc:
+            log.warning("console MCP self-reconcile failed", exc_info=True)
+            return console_id, {"error": str(exc)}
+
+    results = await asyncio.gather(*[_notify(n) for n in nodes], _console())
     return {nid: data for nid, data in results if data is not None}
 
 
@@ -10940,23 +10793,97 @@ def _schedule_mcp_reload(request: Request) -> BackgroundTask:
                 exc_info=True,
             )
             return
+        # The console's ensure entry rides the same results dict but is
+        # NOT a node: its failures are already logged with console
+        # wording at their production sites, and counting it here would
+        # both warn with node-remediation prose for a console-local
+        # failure and inflate the denominator (a node-less install with
+        # a console error would log "1 of 1 node(s)").  Class constant,
+        # not request.app.state.collector: the accounting must not
+        # depend on runtime state the (possibly patched) fan-out never
+        # touched.
+        console_id = ClusterCollector.CONSOLE_PSEUDO_NODE_ID
+        node_results = {nid: data for nid, data in results.items() if nid != console_id}
         unreached = sorted(
-            nid for nid, data in results.items() if isinstance(data, dict) and "error" in data
+            nid for nid, data in node_results.items() if isinstance(data, dict) and "error" in data
         )
         if unreached:
             log.warning(
                 "auto mcp-reload did not reach %d of %d node(s) after admin write "
                 "(stale MCP catalog until next reload): %s",
                 len(unreached),
-                len(results),
+                len(node_results),
                 ", ".join(unreached),
             )
 
     return BackgroundTask(_run)
 
 
+def _console_mcp_action_outcome(mgr: Any, action: str, name: str) -> dict[str, Any]:
+    """Run one per-server MCP action against the console's own manager.
+
+    COPY of the node endpoints' outcome classification
+    (``internal_mcp_refresh_one`` / ``internal_mcp_reconnect_one`` in
+    turnstone/server.py) minus the HTTP mapping — deliberately a copy,
+    not an extraction, so the node endpoint bodies stay untouched; the
+    equivalence is pinned by TestConsoleActionOutcomeParity in
+    tests/test_mcp_admin_api.py, which drives both sides with identical
+    managers and fails if either drifts.  See the node endpoints for the
+    full rationale comments (authoritative-outcome re-check;
+    error-beats-skip).
+
+    Sync + blocking (``refresh_sync``/``reconnect_sync`` park on manager
+    locks up to their caller timeouts) — call via ``asyncio.to_thread``.
+    """
+    from turnstone.core.mcp_utils import public_server_status
+
+    if action == "refresh":
+        try:
+            mgr.refresh_sync(server_name=name)
+        except Exception as exc:
+            log.warning("console MCP refresh failed for %s: %s", name, exc)
+            return {"status": "error", "error": "refresh failed"}
+        status = public_server_status(mgr, name)
+        if status.get("error"):
+            log.warning("console MCP refresh reported error for %s: %s", name, status["error"])
+            return {"status": "error", "error": "refresh failed", "server": status}
+        if mgr.last_refresh_outcome(name) == "skipped":
+            return {"status": "skipped", "server": status}
+        return {"status": "ok", "server": status}
+
+    try:
+        result = mgr.reconnect_sync(name)
+    except Exception as exc:
+        log.warning("console MCP reconnect failed for %s: %s", name, exc)
+        return {"status": "error", "error": "reconnect failed"}
+    if result.get("error"):
+        log.warning(
+            "console MCP reconnect reported error for %s: %s",
+            name,
+            result.get("error", ""),
+        )
+        return {
+            "status": "error",
+            "error": "reconnect failed",
+            "server": public_server_status(mgr, name),
+        }
+    return {"status": "ok", "server": public_server_status(mgr, name)}
+
+
 async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> dict[str, Any]:
-    """Tell all nodes to perform a per-server MCP action.
+    """Tell all nodes — and the console's own manager — to perform a per-server MCP action.
+
+    Console arm (#725): the console's manager serves coordinator
+    dispatch, so the operator's per-server recovery actions must reach
+    it like any node's — otherwise reconnecting a wedged server heals
+    every node while the surface coordinators actually dispatch through
+    stays wedged until a console restart.  The arm runs the pinned copy
+    of the node outcome classification (see
+    ``_console_mcp_action_outcome``), keyed under the collector's
+    console pseudo-node id, gated on manager PRESENCE (nothing here
+    reads settings — a live manager must stay operable).  Names the
+    console's catalog never carried (e.g. servers from a node's own
+    config file) report skipped, not error.
 
     *action* is the suffix of the internal endpoint — currently
     ``"refresh"`` or ``"reconnect"``.  Each node is hit at
@@ -10995,7 +10922,32 @@ async def _notify_nodes_mcp_action(request: Request, action: str, name: str) -> 
                 )
                 return node_id, {"error": str(exc)}
 
-    results = await asyncio.gather(*[_notify(n) for n in nodes])
+    def _console_action() -> dict[str, Any]:
+        # Sync body for the worker thread.
+        mgr = getattr(request.app.state, "mcp_client", None)
+        if mgr is None:
+            return {"skipped": "console MCP manager not running"}
+        # Membership via the public status API (covers static AND
+        # pool-backed names): a name only nodes know must skip, not
+        # error through reconnect_sync's "unknown server" arm.
+        if name not in mgr.get_all_server_status(None, aggregate=True):
+            return {"skipped": "not in console catalog"}
+        return _console_mcp_action_outcome(mgr, action, name)
+
+    async def _console() -> tuple[str, Any]:
+        # Gather sibling OUTSIDE ``sem`` (that semaphore paces node
+        # POSTs; a long worker-thread hold would starve a slot),
+        # self-caught so a console failure never abandons collected node
+        # results — mirroring the reload fan-out's console arm.  Class
+        # constant for the key: stub collectors may not carry the attr.
+        console_id = ClusterCollector.CONSOLE_PSEUDO_NODE_ID
+        try:
+            return console_id, await asyncio.to_thread(_console_action)
+        except Exception as exc:
+            log.warning("console MCP %s of %s failed", action, name, exc_info=True)
+            return console_id, {"error": str(exc)}
+
+    results = await asyncio.gather(*[_notify(n) for n in nodes], _console())
     return {nid: data for nid, data in results if data is not None}
 
 
@@ -11276,7 +11228,14 @@ async def admin_import_mcp_config(request: Request) -> JSONResponse:
             ip,
         )
 
-    return JSONResponse({"imported": imported, "skipped": skipped, "errors": errors})
+    # Conditional like the audit record above: import is the one write
+    # whose 200 can mean zero row changes (every name already present) —
+    # fan out only when rows actually changed, matching the CRUD
+    # siblings' newly-written-row semantics.
+    return JSONResponse(
+        {"imported": imported, "skipped": skipped, "errors": errors},
+        background=_schedule_mcp_reload(request) if imported else None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -14238,6 +14197,13 @@ def create_app(
         events_replay=_coord_events_replay,
         create_supports_attachments=True,
         create_supports_user_id_override=False,
+        # Coordinator creates honour ``server.require_project`` exactly like
+        # interactive creates — the operator's own token gets no exemption.
+        # Distinct seam: the sessions a coordinator SPAWNS stay exempt via
+        # the ``token_source == "coordinator"`` branch inside
+        # ``require_project_denies_create``; that covers child spawns on
+        # nodes, not creating the coordinator itself.
+        create_gate_require_project=True,
         create_validate_request=_coord_create_validate_request,
         create_build_kwargs=_coord_create_build_kwargs,
         create_post_install=_coord_create_post_install,

@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import threading
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -39,6 +40,17 @@ class _FakeWorkstream:
         self._worker_running = False
         self._closed = False
         self.worker_thread: Any = None
+        # Deferred /send entries — the wake gate yields while the order
+        # barrier holds; empty/None is the default every other test
+        # assumes.
+        self._pending_sends: list[Any] = []
+        self._pending_drain: Any = None
+
+    def send_barrier_active(self) -> bool:
+        # Mirrors Workstream.send_barrier_active — the gate calls the
+        # METHOD, so the stub must carry the same two-term pair.
+        drain = self._pending_drain
+        return bool(self._pending_sends) or (drain is not None and drain.is_alive())
 
 
 class _FakeManager:
@@ -193,6 +205,35 @@ class TestWakeWorkstreamIfPending:
         with patch("turnstone.core.session_worker.send") as mock_send:
             assert wake_workstream_if_pending(ws) is False
             assert mock_send.call_count == 0
+
+    def test_yields_to_pending_deferred_sends(self, fake_mgr_and_ws):
+        """Deferred /send entries hold the order barrier: a wake worker
+        claiming the slot would push messages already acknowledged
+        "queued" behind its whole turn, so the gate yields.  Re-armed
+        structurally — every deferred turn's exit re-runs the gate, and
+        the drain's clean exit (trigger="drain-exit") covers a list that
+        emptied by pure retraction and never ran a turn."""
+        _mgr, ws = fake_mgr_and_ws
+        ws.session._nudge_queue.enqueue("watch_triggered", "output", "any")
+        ws._pending_sends.append(object())
+        with patch("turnstone.core.session_worker.send", return_value=True) as mock_send:
+            assert wake_workstream_if_pending(ws, trigger="worker-exit") is False
+            assert mock_send.call_count == 0
+        # CLAIMED-entry window: list empty but the drain is alive (an
+        # acked entry was popped, its dispatch in flight).  The one-term
+        # list check let a wake jump the acknowledged send here — the
+        # barrier's drain-alive term must hold the yield.
+        ws._pending_sends.clear()
+        ws._pending_drain = SimpleNamespace(is_alive=lambda: True)
+        with patch("turnstone.core.session_worker.send", return_value=True) as mock_send:
+            assert wake_workstream_if_pending(ws, trigger="worker-exit") is False
+            assert mock_send.call_count == 0
+        # Barrier fully cleared (the drain retired) — the same call
+        # dispatches.
+        ws._pending_drain = None
+        with patch("turnstone.core.session_worker.send", return_value=True) as mock_send:
+            assert wake_workstream_if_pending(ws, trigger="drain-exit") is True
+            assert mock_send.call_count == 1
 
     def test_skips_closed_ws(self, fake_mgr_and_ws):
         """A workstream mid-``close()`` must not get a wake spawned on

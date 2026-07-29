@@ -7,57 +7,44 @@
  * per-snapshot backend join and every creation surface agrees on the
  * same list.
  *
- * House style mirrors composer.js / hatch.js: an ES module for the
- * module consumers (rail.js, shell-side) that ALSO installs a
- * `window.TurnstoneProjects` bridge for the classic (non-module)
+ * House style mirrors personas.js / models.js / skills.js: the coalescing,
+ * fail-open refresh, change-detection fan-out, and bridge machinery come
+ * from the shared `makeListCache` core (list_cache.js); this module adds the
+ * projects-specific readers (the require_project advisory, id→name
+ * resolution, {value,text} choices) and the `createProject` POST helper.
+ * An ES module for module consumers (rail.js, project_creator.js) that ALSO
+ * installs a `window.TurnstoneProjects` bridge for the classic (non-module)
  * app.js bundles.  All fetches ride the shared cookie-auth `authFetch`.
  */
 
 import { authFetch } from "./auth.js";
+import { makeListCache } from "./list_cache.js";
 
-let _cache = []; // last-fetched project rows (active, caller-visible)
-let _byId = {}; // project_id -> row, for O(1) rail name resolution
-let _loaded = false; // has the first refresh attempt completed (ok or failed)?
-let _lastError = null; // last failure: HTTP status, 0 for network/parse, null when ok
-let _inflight = null; // shared pending refresh so concurrent callers coalesce
-let _fingerprint = null; // last fired map signature, for change-detection
-const _subs = []; // () => void, fired after each CHANGED refresh
-
-function _fp(rows) {
-  // Cheap signature of the fields subscribers render (id + name + visibility +
-  // state) so a refresh returning identical data skips the fan-out (and the
-  // rail's O(workstreams) rebuild).  JSON.stringify is collision-proof (it
-  // escapes anything inside a project name) and needs no separator chars; an
-  // earlier version joined on raw control bytes, which made git see this whole
-  // file as binary.
-  return JSON.stringify(
-    rows.map(function (p) {
-      return [p.project_id, p.name, p.visibility, p.state];
-    }),
-  );
-}
-
-function _setCache(rows) {
-  _cache = Array.isArray(rows) ? rows : [];
-  _byId = {};
-  for (const p of _cache) if (p && p.project_id) _byId[p.project_id] = p;
-  const firstLoad = !_loaded;
-  _loaded = true;
-  const fp = _fp(_cache);
-  // Fire only when the map actually changed (or on first load) — a redundant
-  // refresh (picker re-open, a mutation that no-ops the visible set) shouldn't
-  // force every subscriber to rebuild.
-  if (firstLoad || fp !== _fingerprint) {
-    _fingerprint = fp;
-    _subs.forEach(function (cb) {
-      try {
-        cb(_cache);
-      } catch (_) {
-        /* a subscriber throwing must not abort the rest of the fan-out */
-      }
-    });
-  }
-}
+// The require_project advisory rides the same /v1/api/projects response as an
+// extra top-level field.  It fails OPEN to false: a stale-true value would make
+// the composer hide options on a transient error, so `extraDefaults` resets it
+// on every refresh failure and it seeds false before the first refresh.  The
+// fingerprint is the project rows only, so a require_project-only toggle (with an
+// unchanged project list) does NOT force a rail rebuild; the composers re-read it
+// synchronously on their next open.
+const _core = makeListCache({
+  url: "/v1/api/projects",
+  dataKey: "projects",
+  name: "projects",
+  keyField: "project_id",
+  fpRow: function (p) {
+    return [p.project_id, p.name, p.visibility, p.state];
+  },
+  captureExtra: function (data) {
+    return { requireProject: !!data.require_project };
+  },
+  extraDefaults: { requireProject: false },
+  // require_project GATES the picker (strict mode hides the projectless option),
+  // so it must fail OPEN: a failed refresh resets it to false rather than letting
+  // a stale-true value hide options.  (Default, but explicit for the contrast
+  // with models.js, whose cosmetic extra opts out of the reset.)
+  resetExtraOnError: true,
+});
 
 /**
  * Fetch /v1/api/projects into the cache.  Resolves to the row list and
@@ -66,56 +53,20 @@ function _setCache(rows) {
  * a half-open picker.  A failure is recorded (see {@link projectsError})
  * and warned, rather than silently masqueraded as an empty project list.
  */
-export function refreshProjects() {
-  // Coalesce concurrent callers (on console load both mountRail and the launcher
-  // init fire this) onto one in-flight request — they share the same promise and
-  // _setCache runs once.
-  if (_inflight) return _inflight;
-  _inflight = authFetch("/v1/api/projects")
-    .then(function (r) {
-      if (r.ok) return r.json();
-      // A non-OK status (403 when the caller lacks the project.read grant, a
-      // 5xx, ...) is NOT "you have zero projects": keep the prior cache rather
-      // than blanking it, and record the status so the failure is visible
-      // instead of looking like an empty list.
-      _lastError = r.status;
-      console.warn("projects: GET /v1/api/projects -> " + r.status);
-      return null;
-    })
-    .then(function (data) {
-      if (data) {
-        _lastError = null;
-        _setCache(data.projects || []);
-      }
-      return _cache;
-    })
-    .catch(function (e) {
-      // Network drop or a non-JSON body — same policy as a non-OK status:
-      // preserve the last-known cache, never reject (callers chain a bare
-      // .then), and surface the failure.
-      _lastError = 0;
-      console.warn("projects: refresh failed", e);
-      return _cache;
-    })
-    .finally(function () {
-      // One attempt has completed (ok or not) — lets a reader tell "still
-      // loading" from "loaded, genuinely empty" / "load failed".
-      _loaded = true;
-      _inflight = null;
-    });
-  return _inflight;
+export function refreshProjects(callOpts) {
+  return _core.refresh(callOpts);
 }
 
 /** Cached project rows (empty array until the first refresh resolves). */
 export function getProjects() {
-  return _cache;
+  return _core.get();
 }
 
 /** Whether the first refresh has resolved — lets a reader distinguish
  *  "no projects" from "not loaded yet" (the rail falls back to the bare
  *  id only when loaded-but-unknown, i.e. a stale/again-removed project). */
 export function projectsLoaded() {
-  return _loaded;
+  return _core.loaded();
 }
 
 /** Status of the last refresh failure — the HTTP status (e.g. 403 when the
@@ -123,13 +74,25 @@ export function projectsLoaded() {
  *  when the last refresh succeeded.  Lets a reader tell "loaded, no projects"
  *  apart from "couldn't load projects" without re-fetching. */
 export function projectsError() {
-  return _lastError;
+  return _core.error();
+}
+
+/** Whether this deployment requires new chats to be filed under a project
+ *  (server.require_project). ADVISORY only — the create endpoint on the
+ *  enforcing node is authoritative. Reads the current cached value
+ *  SYNCHRONOUSLY: before the first {@link refreshProjects} resolves it is the
+ *  fail-open default false, so a synchronous read is safe — a composer can seed
+ *  UI from the warm cache immediately and re-read after a refresh to catch a
+ *  change. Fails OPEN to false on any refresh failure too, so the composer never
+ *  hides options on a stale-true value. */
+export function requireProject() {
+  return _core.extra().requireProject;
 }
 
 /** Display name for a project_id, or "" when unknown (not yet loaded, no
  *  access, or since-removed). */
 export function projectName(id) {
-  const p = id && _byId[id];
+  const p = _core.getByKey(id);
   return p ? p.name || "" : "";
 }
 
@@ -137,7 +100,7 @@ export function projectName(id) {
  *  seed their own "No project" placeholder (preserved by the composer's
  *  setOptionChoices) and any "+ New project…" sentinel. */
 export function projectChoices() {
-  return _cache.map(function (p) {
+  return _core.get().map(function (p) {
     return { value: p.project_id, text: p.name };
   });
 }
@@ -145,7 +108,7 @@ export function projectChoices() {
 /** Subscribe to post-refresh changes (rail re-render, picker repopulate).
  *  Idempotent — the same callback is registered at most once. */
 export function onProjectsChange(cb) {
-  if (typeof cb === "function" && _subs.indexOf(cb) < 0) _subs.push(cb);
+  _core.onChange(cb);
 }
 
 /** Create a project owned by the caller.  Resolves `{ok, status, data}`
@@ -169,6 +132,7 @@ window.TurnstoneProjects = {
   getProjects: getProjects,
   projectsLoaded: projectsLoaded,
   projectsError: projectsError,
+  requireProject: requireProject,
   projectName: projectName,
   projectChoices: projectChoices,
   onProjectsChange: onProjectsChange,

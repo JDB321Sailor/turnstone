@@ -19,6 +19,7 @@ import pytest
 
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
 _INTERACTIVE_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/interactive.js"
+_MCP_ERROR_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/mcp_error.js"
 _SHELL_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/shell.js"
 _REDACT_CREDENTIALS_JS = (
     Path(__file__).resolve().parent.parent / "turnstone/shared_static/redact_credentials.js"
@@ -198,10 +199,11 @@ def test_refetch_history_seeds_resume_cursor_only_on_initial_connect() -> None:
 
     Two load-bearing guards are pinned here:
 
-    1. The seed is gated on ``seedCursor`` so ONLY the initial-connect
-       caller (``_loadHistoryThenConnect``, which reconnects) seeds it;
-       the clear_ui / replay_truncated re-render callers (no reconnect)
-       must NOT rewind ``_lastEventId`` off the live stream position.
+    1. The seed is gated on ``seedCursor`` so ONLY callers that
+       reconnect (``_loadHistoryThenConnect`` — first paint, ws switch,
+       and both truncated-resync branches) seed it; the clear_ui
+       re-render caller runs on a LIVE stream with no reconnect and
+       must NOT rewind ``_lastEventId`` off the live position.
     2. ``connectSSE`` gates the ``?last_event_id=`` param on
        ``!= null`` (not truthiness) so a valid cursor of 0 — a brand-new
        ws's first-turn boundary — isn't silently dropped to the fresh
@@ -224,22 +226,34 @@ def test_refetch_history_seeds_resume_cursor_only_on_initial_connect() -> None:
         "rewind the live stream and a 0 cursor still fast-forwards."
     )
     assert "seedCursor = false" in fn, (
-        "seedCursor must default false so the clear_ui / replay_truncated "
-        "re-render callers (which pass only 2 args) never seed the cursor."
+        "seedCursor must default false so the clear_ui re-render caller "
+        "(which passes only 2 args and stays on the live stream) never "
+        "seeds the cursor."
     )
     # (1b) the initial-connect path opts in with seedCursor=true.
     assert "_refetchHistory(wsId, token, true)" in body, (
         "_loadHistoryThenConnect must call _refetchHistory(..., true) so "
         "the reconnecting initial-connect path is the only seeder."
     )
-    # (2) connectSSE gates the last_event_id param on != null, not truthiness.
+    # (2) connectSSE gates the last_event_id param on != null, not
+    # truthiness, and a recorded truncation gap overrides the live cursor
+    # (the connect-chokepoint half of the gap-repair guarantee).
     assert re.search(
-        r"if\s*\(\s*this\._lastEventId\s*!=\s*null\s*\)\s*\{\s*"
+        r"const connectCursor =\s*this\._truncatedFromCursor != null\s*"
+        r"\?\s*this\._truncatedFromCursor\s*:\s*this\._lastEventId;",
+        body,
+    ), (
+        "connectSSE must present the truncation-time cursor while a gap "
+        "is on record — the advanced live cursor would draw replay_ok "
+        "and silently forget the gap."
+    )
+    assert re.search(
+        r"if\s*\(\s*connectCursor\s*!=\s*null\s*\)\s*\{\s*"
         r"evtUrl\s*\+=\s*\"\?last_event_id=\"",
         body,
     ), (
         "connectSSE must gate the ?last_event_id= param on "
-        "this._lastEventId != null (not truthiness) — else a cursor of 0 "
+        "connectCursor != null (not truthiness) — else a cursor of 0 "
         "(brand-new ws first turn) is dropped to the fresh snapshot path."
     )
 
@@ -433,20 +447,27 @@ _UNSAFE_CODE_SINK_RE = re.compile(
 
 def test_phase8_mcp_error_helpers_defined() -> None:
     """``tryParseMcpError`` (envelope detector) + ``buildMcpErrorEmbed``
-    (interactive consent / forbidden / operator card) moved into the shared
-    interactive module with the Pane.  The consent-badge state
-    (``_pendingConsentServers`` / ``_onConsentDetected``) stays in the
-    standalone shell — it drives the rail's Manage-row badge — and the pane
-    reaches it through the ``host.onConsentDetected`` seam.  The shared host
-    bridges that seam to the standalone via ``window.TS_APP.onConsentDetected``
-    (undefined on the console, so it stays a no-op there).  Pin both halves and
+    (consent / forbidden / operator card) live in the shared ``mcp_error.js``
+    module — lifted out of interactive.js by #725 so BOTH conversation
+    surfaces render the same card: the interactive pane AND the coordinator
+    pane (whose sessions carry the same MCP surface, persona-gated).
+    The consent-badge state (``_pendingConsentServers`` /
+    ``_onConsentDetected``) stays in the standalone shell — it drives the
+    rail's Manage-row badge — and the pane reaches it through the
+    ``host.onConsentDetected`` seam.  The shared host bridges that seam to the
+    standalone via ``window.TS_APP.onConsentDetected`` (undefined on the
+    console, so it stays a no-op there).  Pin the module, both consumers, and
     the bridge."""
-    inter = _INTERACTIVE_JS.read_text(encoding="utf-8")
-    assert "function tryParseMcpError" in inter
-    assert "function buildMcpErrorEmbed" in inter
+    mod = _MCP_ERROR_JS.read_text(encoding="utf-8")
+    assert "function tryParseMcpError" in mod
+    assert "function buildMcpErrorEmbed" in mod
     # The actionable branch surfaces consent via the THREADED callback, not a
     # direct shell call — that decoupling is what lets the console no-op it.
-    assert "if (onConsent) onConsent(err.server)" in inter
+    assert "if (onConsent) onConsent(err.server)" in mod
+    inter = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    assert 'from "./mcp_error.js"' in inter, (
+        "the interactive pane must consume the shared MCP error module"
+    )
     assert "onConsentDetected(s)" in inter, (
         "the pane must notify consent through host.onConsentDetected"
     )
@@ -454,6 +475,15 @@ def test_phase8_mcp_error_helpers_defined() -> None:
     # detected, so the console — which never defines the hook — no-ops).
     assert "window.TS_APP.onConsentDetected(server)" in inter, (
         "the shared interactive host must bridge onConsentDetected to the TS_APP seam"
+    )
+    # The coordinator pane is the second consumer (#725): a coordinator MCP
+    # dispatch hitting consent-required must render the card, not raw JSON.
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    assert '"/shared/mcp_error.js"' in coord, (
+        "the coordinator pane must import the shared MCP error module (#725)"
+    )
+    assert "tryParseMcpError(" in coord and "buildMcpErrorEmbed(" in coord, (
+        "the coordinator pane must dispatch structured MCP errors to the shared card"
     )
     app = _APP_JS.read_text(encoding="utf-8")
     assert "_pendingConsentServers" in app
@@ -570,6 +600,7 @@ _UNSAFE_CODE_SINK_LINT_TARGETS = [
     ("turnstone/shared_static/utils.js", _UTILS_JS),
     ("turnstone/shared_static/auth.js", _AUTH_JS),
     ("turnstone/shared_static/kb.js", _KB_JS),
+    ("turnstone/shared_static/mcp_error.js", _MCP_ERROR_JS),
     ("turnstone/console/static/coordinator/coordinator.js", _COORD_JS),
     ("turnstone/console/static/admin.js", _CONSOLE_ADMIN_JS),
     ("turnstone/console/static/governance.js", _CONSOLE_GOVERNANCE_JS),
@@ -860,7 +891,7 @@ def test_phase8_xss_safe_render_in_build_mcp_error_embed() -> None:
     scopes list. The card builder uses createElement + textContent
     throughout so a script-tag server name renders harmlessly. Pin
     the absence of the unsafe-write inside ``buildMcpErrorEmbed``."""
-    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    body = _MCP_ERROR_JS.read_text(encoding="utf-8")
     start = body.index("function buildMcpErrorEmbed(")
     # Bound to the function body — find its closing brace at column 0.
     rest = body[start:]
@@ -883,7 +914,7 @@ def test_mcp_error_button_gated_on_consent_url_not_code_alone() -> None:
     obo rows) produced a button that dead-ended in a 'no consent URL' toast.
     The button must render only when a valid per-server consent URL is present —
     obo errors show the card's honest detail text without a broken affordance."""
-    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    body = _MCP_ERROR_JS.read_text(encoding="utf-8")
     start = body.index("function buildMcpErrorEmbed(")
     rest = body[start:]
     end_match = re.search(r"\n}\n", rest)
@@ -939,7 +970,7 @@ def test_phase8_consent_url_prefix_check_in_click_handler() -> None:
     string and the ``startsWith`` form so a future refactor can't
     silently weaken the guard.
     """
-    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    body = _MCP_ERROR_JS.read_text(encoding="utf-8")
     # Bound the search to the click handler region (between the
     # ``buildMcpErrorEmbed`` function and the next top-level helper) to
     # avoid false positives from unrelated string occurrences.
@@ -993,7 +1024,11 @@ def _slice_balanced_body(body: str, anchor: int) -> str | None:
     depth = 0
     in_str: str | None = None
     start = i
-    while i < n and i - start < 8000:
+    # 12000: connectSSE reached ~7950 chars during the 2026-07 SSE
+    # recovery campaign (cursor-override + capture-rationale comments);
+    # the window exists to bound a runaway scan, not to cap legitimate
+    # method growth — keep it comfortably above the largest real body.
+    while i < n and i - start < 12000:
         ch = body[i]
         if in_str:
             if ch == "\\" and i + 1 < n:
@@ -1736,9 +1771,13 @@ def test_coord_stream_overflow_case_counts_and_rate_limits() -> None:
     body = _COORD_JS.read_text(encoding="utf-8")
     assert 'case "stream_overflow":' in body
     assert "noteStreamOverflow();" in body
-    # The three-way health counter distinguishes dropped events (overflow /
-    # malformed frame) from render wedges (dispatch / render throw).
-    assert "streamHealth = { overflows: 0, renderThrows: 0, malformedFrames: 0 }" in body
+    # The health object carries all four field-forensics counters; the
+    # truncated-resync counter distinguishes the replay-window class from
+    # the dropped-events class (overflows).
+    health = re.search(r"const streamHealth = \{(.*?)\};", body, re.S)
+    assert health is not None, "streamHealth initializer not found"
+    for field in ("overflows: 0", "renderThrows: 0", "malformedFrames: 0", "truncatedGaps: 0"):
+        assert field in health.group(1), f"streamHealth must init {field!r}"
     assert "streamHealth.overflows += 1;" in body
     assert "streamHealth.malformedFrames += 1;" in body
     # Exactly two render-throw increment sites: the noteRenderThrow helper
@@ -1754,11 +1793,13 @@ def test_coord_stream_overflow_case_counts_and_rate_limits() -> None:
     assert 'noteRenderThrow("streamingRender", e);' in body
     assert 'noteRenderThrow("in_progress_snapshot render", e);' in body
     assert 'noteRenderThrow("streamingRenderFinalize", e);' in body
+    # Overflow closes route through the ONE shared churn step (also fed by
+    # truncated resyncs — see the truncated fresh-connect test), keeping the
+    # class-specific instrumentation in noteStreamOverflow itself.
     note = re.search(r"function noteStreamOverflow\(\)\s*\{(.*?)\n  \}", body, re.S)
     assert note is not None, "noteStreamOverflow not found"
-    assert "overflowWindowTripped(" in note.group(1)
-    assert "enterDegradedCatchup()" in note.group(1)
-    # The trip handler only counts + trips; the cooldown reset lives in
+    assert "recordChurnAndMaybeTrip();" in note.group(1)
+    # The counting step only counts + trips; the cooldown reset lives in
     # enterDegradedCatchup (keyed off lastDegradedAt) — the finding [0] shape.
     assert "degradedCooldownMs" not in note.group(1), (
         "noteStreamOverflow must not touch the cooldown — that reset defeated the ladder escalation"
@@ -1894,16 +1935,25 @@ def test_coord_post_gap_sidebar_refresh_is_replay_aware() -> None:
     under close-on-hide must not rebuild the sidebar.  The refresh fires
     exactly when the replay cannot vouch for the gap: no resume cursor or an
     over-threshold gap at onopen, or the server's replay_truncated envelope
-    (ring evicted), deduped per open via gapRefreshedAtOpen."""
+    (ring evicted), deduped per open via gapRefreshedAtOpen.  While a
+    truncation gap is on record the onopen arm stands down entirely
+    (truncatedFromCursor == null gate): the gap machinery owns sidebar
+    recovery — gap-start envelope refresh + heal-time refresh — and the
+    failed-resync retry loop (which nulls lastEventId and never re-seeds it
+    on failure) must not re-fire this refresh once per reconnect."""
     body = _COORD_JS.read_text(encoding="utf-8")
     conn = re.search(r"function connectSSE\(\)\s*\{(.*?)\n  \}", body, re.S)
     assert conn is not None
     method = conn.group(1)
     gate = re.search(
-        r"wasReconnecting &&\s*\(lastEventId == null \|\| gapMs > GAP_REFRESH_THRESHOLD_MS\)",
+        r"wasReconnecting &&\s*truncatedFromCursor == null &&\s*"
+        r"\(lastEventId == null \|\| gapMs > GAP_REFRESH_THRESHOLD_MS\)",
         method,
     )
-    assert gate is not None, "onopen must gate the sidebar refresh on replay coverage"
+    assert gate is not None, (
+        "onopen must gate the sidebar refresh on replay coverage AND on no "
+        "truncation gap being on record (the gap machinery owns recovery)"
+    )
     assert "refreshSidebarAfterGap();" in method
     assert "gapRefreshedAtOpen = true;" in method
     # The ring-evicted signal triggers the same refresh (deduped per open).
@@ -1927,31 +1977,233 @@ def test_coord_post_gap_sidebar_refresh_is_replay_aware() -> None:
 
 def test_coord_defers_truncated_resync_and_consumes_at_idle() -> None:
     """replay_truncated seen mid-stream must be DEFERRED, not dropped (matches
-    interactive's _pendingTruncatedResync): refetching immediately would detach
-    the live bubble (content OR a reasoning-only one), but skipping outright
-    leaves the ring-evicted turns lost for the session.  The guard covers both
-    streaming targets and latches otherwise; the next state_change=idle consumes
-    the flag — which also repairs a turn stranded by close-on-hide (stream_end
-    evicted while hidden), resetting the streaming refs first since
-    refetchHistory does not null them."""
+    interactive's _pendingTruncatedResync): tearing down + refetching
+    immediately would detach the live bubble (content OR a reasoning-only
+    one), but skipping outright leaves the ring-evicted turns lost for the
+    session.  The guard covers both streaming targets and latches otherwise;
+    the next state_change=idle consumes the flag through the SAME dead-stream
+    flow as the immediate branch (loadHistoryThenReconnect, which owns the
+    streaming-ref reset) — recording the gap but NOT feeding the degraded
+    churn window (turn-settle timing already rate-limits this branch), and
+    NOT jittered (once per latch, staggered per pane by turn timing)."""
     body = _COORD_JS.read_text(encoding="utf-8")
     trunc = re.search(r'case "replay_truncated":(.*?)break;', body, re.S)
     assert trunc is not None, "replay_truncated case not found"
     t = trunc.group(1)
     assert "if (!currentAssistantEl && !currentReasoningEl)" in t
-    assert "refetchHistory();" in t
     assert "pendingTruncatedResync = true;" in t
     st = re.search(r'case "state_change":(.*?)\n      case ', body, re.S)
     assert st is not None, "state_change case not found"
     s = st.group(1)
-    assert "if (pendingTruncatedResync)" in s
-    assert "pendingTruncatedResync = false;" in s
-    assert "currentAssistantEl = null;" in s
-    assert "refetchHistory();" in s
-    # Consume the latch, THEN reset the dangling refs and refetch.
-    consume = s.index("pendingTruncatedResync = false;")
-    refetch = s.index("refetchHistory();")
-    assert consume < refetch
+    idle = re.search(r"if \(pendingTruncatedResync\) \{(.*?)\n          \}", s, re.S)
+    assert idle is not None, "idle-edge truncated consumption not found"
+    i = idle.group(1)
+    assert "pendingTruncatedResync = false;" in i
+    assert "recordTruncatedGap();" in i
+    assert "loadHistoryThenReconnect();" in i
+    # Consume the latch, THEN record the gap and run the fresh-connect flow.
+    consume = i.index("pendingTruncatedResync = false;")
+    load = i.index("loadHistoryThenReconnect();")
+    assert consume < load
+    # No churn feed and no jitter at the idle edge — noteTruncatedResync /
+    # scheduleTruncatedResync belong to the immediate branch only.
+    assert "noteTruncatedResync" not in i
+    assert "scheduleTruncatedResync" not in i
+    # And no in-place seedless refetch on either consumption path.
+    assert "refetchHistory();" not in i
+    assert "refetchHistory();" not in t
+
+
+def test_coord_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None:
+    """replay_truncated = the stream admitted losing events past recovery.
+    The coordinator pane must treat the connection as DEAD and mirror
+    interactive.js's converged recovery design (the #882 parity port).
+
+    Pinned: (1) the truncation-time cursor is recorded KEEP-OLDEST at the
+    envelope, BEFORE the mid-stream branch, and the connect chokepoint
+    presents it over the advanced live cursor while set — the
+    interleaving-proof half of the gap-repair guarantee (a cancellable
+    timer alone silently loses the repair when a hide/show cycle lands
+    inside the jitter window); (2) the record is cleared ONLY by a
+    successful full render (refetchHistory, below the ``!hist`` guard) —
+    never by the teardown chokepoint or suspendStream; (3) the immediate
+    branch routes through ``noteTruncatedResync()`` and SKIPS the resync
+    when the limiter just tripped (the cooldown disconnected the stream;
+    a ``.finally`` reconnect would defeat it), else SCHEDULES the fresh
+    connect behind the herd-spreading jitter; (4) churn accounting is ONE
+    shared step (``recordChurnAndMaybeTrip``) fed by BOTH overflow closes
+    and truncated resyncs, so the trip parameters cannot silently diverge;
+    (5) the jitter scheduler dedups to one pending resync and its fire
+    path nulls the handle BEFORE loading (the teardown inside the load
+    would cancel the work it is part of), while ``closeStreamTransport``
+    owns cancellation of a merely-pending timer; (6) the dead-stream flow
+    tears down FIRST, resets the streaming refs (refetchHistory does not
+    null them, and the envelope's own in_progress_snapshot may have
+    re-created a bubble inside the jitter window), seeds via
+    ``refetchHistory(true)``, and reconnects in ``.finally`` gated on the
+    pane still owning its stream lifecycle (``visHandler`` — the destroy /
+    close-session sentinel); (7) every ``truncatedGaps`` bump routes
+    through the one increment+log step; (8) the old in-place seedless
+    refetch must not come back; (9) repair-intent supersession is ONE
+    site — refetchHistory's success path clears the gap record, the
+    deferred latch, AND any pending resync timer together (a failed fetch
+    returns above the block and clears none, keeping the resync armed as
+    repair owner; a latch or timer surviving a heal fired a phantom
+    resync whose failed-fetch leg reconnected cursorless with nothing
+    armed) — and clear_ui carries no path-local cancel of its own;
+    (10) the envelope's sidebar refresh is deduped per GAP
+    (isNewTruncationGap) on top of the per-open flag — a failed-resync
+    retry loop must not re-stampede /children + /tasks once per reconnect
+    — with the retry-window staleness covered instead by ONE heal-time
+    refresh on the successful render inside loadHistoryThenReconnect."""
+    body = _COORD_JS.read_text(encoding="utf-8")
+    trunc = re.search(r'case "replay_truncated":(.*?)break;', body, re.S)
+    assert trunc is not None, "replay_truncated case not found"
+    t = trunc.group(1)
+    # (1) keep-oldest record at the envelope, before the refs branch (the
+    # null-check rides the isNewTruncationGap capture, which also feeds the
+    # per-gap sidebar dedup below).
+    assert "if (isNewTruncationGap) {" in t
+    assert "truncatedFromCursor = lastEventId;" in t
+    record = t.index("truncatedFromCursor = lastEventId;")
+    branch = t.index("if (!currentAssistantEl && !currentReasoningEl)")
+    assert record < branch, "the gap must be recorded before the mid-stream branch"
+    # (10) sidebar refresh deduped per GAP as well as per open: a retry
+    # reconnect re-draws the envelope for the SAME unrepaired gap and must
+    # NOT re-stampede /children + /tasks (only /history rides the jitter).
+    assert "const isNewTruncationGap = truncatedFromCursor == null;" in t
+    assert t.index("const isNewTruncationGap") < record, (
+        "the new-gap capture must precede the keep-oldest record"
+    )
+    assert "if (isNewTruncationGap && !gapRefreshedAtOpen) refreshSidebarAfterGap();" in t
+    # (1) connect chokepoint: the recorded cursor overrides the live one,
+    # gated ``!= null`` (0/"0" are valid ids).
+    assert re.search(
+        r"const connectCursor =\s*truncatedFromCursor != null\s*"
+        r"\?\s*truncatedFromCursor\s*:\s*lastEventId;",
+        body,
+    ), (
+        "connectSSE must present the truncation-time cursor while a gap is "
+        "on record — the advanced live cursor would draw replay_ok and "
+        "silently forget the gap."
+    )
+    assert re.search(
+        r"if\s*\(\s*connectCursor\s*!=\s*null\s*\)\s*\{\s*"
+        r"url\s*\+=\s*\"\?last_event_id=\"",
+        body,
+    ), "connectSSE must gate ?last_event_id= on connectCursor != null"
+    # (2) cleared only by a successful full render — below the !hist guard,
+    # riding the wipe — and never by the teardown paths.  (Sliced to the
+    # next function boundary; the invariant is the ORDER, not the
+    # density, and a char-count window rots as at-site comments grow.)
+    start = body.index("async function refetchHistory(seedCursor = false)")
+    fn = body[start : body.index("\n  function ", start + 1)]
+    guard = fn.index("if (!hist) return;")
+    clear = fn.index("truncatedFromCursor = null;")
+    assert guard < clear, "the record must only clear once a payload rendered"
+    teardown = re.search(r"function closeStreamTransport\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert teardown is not None, "closeStreamTransport not found"
+    assert "truncatedFromCursor" not in teardown.group(1), (
+        "teardown must not clear the gap record — it is the durable repair state"
+    )
+    sus = re.search(r"function suspendStream\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert sus is not None
+    assert "truncatedFromCursor" not in sus.group(1)
+    # (3) limiter check gates the JITTERED fresh connect in the immediate
+    # branch.
+    assert "if (!noteTruncatedResync())" in t
+    assert "scheduleTruncatedResync();" in t
+    # (8) the old in-place seedless refetch must not come back in the case.
+    assert "refetchHistory();" not in t
+    # (4) ONE shared churn step, fed by both classes; ladder reset stays in
+    # enterDegradedCatchup.
+    churn = re.search(r"function recordChurnAndMaybeTrip\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert churn is not None, "recordChurnAndMaybeTrip not found"
+    c = churn.group(1)
+    assert "overflowTimes.push(now);" in c
+    assert "overflowWindowTripped(" in c
+    assert "enterDegradedCatchup();" in c
+    assert "return true;" in c
+    assert "return false;" in c
+    assert "degradedCooldownMs" not in c
+    over = re.search(r"function noteStreamOverflow\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert over is not None
+    assert "recordChurnAndMaybeTrip();" in over.group(1), (
+        "overflow closes must feed the same shared churn step"
+    )
+    note = re.search(r"function noteTruncatedResync\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert note is not None, "noteTruncatedResync not found"
+    n = note.group(1)
+    assert "recordTruncatedGap();" in n
+    assert "return recordChurnAndMaybeTrip();" in n
+    # (5) jittered scheduler: dedup guard, jitter const, null-before-load,
+    # cancellation owned by the teardown chokepoint.
+    sched = re.search(r"function scheduleTruncatedResync\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert sched is not None, "scheduleTruncatedResync not found"
+    s = sched.group(1)
+    assert "if (truncatedResyncTimer != null) return;" in s
+    assert "Math.random() * TRUNCATED_RESYNC_JITTER_MS" in s
+    null_then_load = s.index("truncatedResyncTimer = null;")
+    load = s.index("loadHistoryThenReconnect();")
+    assert null_then_load < load, (
+        "the firing path must null the handle BEFORE loading, or the "
+        "teardown inside loadHistoryThenReconnect would cancel the work it "
+        "is part of"
+    )
+    assert "clearTimeout(truncatedResyncTimer)" in teardown.group(1)
+    # (6) the dead-stream flow: teardown first, refs reset, seeded refetch,
+    # guarded .finally reconnect, deferred latch superseded.
+    flow = re.search(r"function loadHistoryThenReconnect\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert flow is not None, "loadHistoryThenReconnect not found"
+    f = flow.group(1)
+    assert f.index("suspendStream();") < f.index("refetchHistory(true)")
+    assert "currentAssistantEl = null;" in f
+    assert "currentReasoningEl = null;" in f
+    assert "pendingTruncatedResync = false;" in f
+    # Reborn-ring convergence: the load must DROP the live cursor before the
+    # fetch — without this, a post-restart heal on an idle ws (no /history
+    # cursor) re-presents the frozen pre-restart cursor against the reseeded
+    # empty ring, draws replay_truncated forever, and parks the pane in
+    # degraded cooldown cycles.  Found by recovery_e2e --scenario
+    # coord-restart (browser-level); invisible to source-pattern tests —
+    # this pin only keeps the fix from being "simplified" away.
+    assert "lastEventId = null;" in f
+    assert f.index("lastEventId = null;") < f.index("refetchHistory(true)")
+    assert ".finally(" in f
+    assert f.index("refetchHistory(true)") < f.index(".finally(")
+    assert "if (visHandler) connectSSE();" in f
+    # (10) heal-time sidebar refresh: once, on the successful render only
+    # (record cleared), only on the cursor-SEEDED heal (the cursorless
+    # heal's fresh-connect onopen runs the same refresh via its no-cursor
+    # arm), and standing down when a SLOW heal (past the cursor-trust
+    # window, measured off the same disconnectedAt) guarantees onopen's
+    # over-threshold refresh — the two arms are exclusive by construction.
+    # Never on the failed-fetch leg of the retry loop.
+    assert "const onopenWillRefresh =" in f
+    assert "GAP_REFRESH_THRESHOLD_MS" in f
+    assert "truncatedFromCursor == null &&" in f
+    assert "lastEventId != null &&" in f
+    assert "!onopenWillRefresh" in f
+    assert "refreshSidebarAfterGap();" in f
+    # (7) single truncatedGaps bump site (running-count console invariant).
+    assert body.count("streamHealth.truncatedGaps += 1;") == 1
+    rec = re.search(r"function recordTruncatedGap\(\)\s*\{(.*?)\n  \}", body, re.S)
+    assert rec is not None, "recordTruncatedGap not found"
+    assert "console.warn(" in rec.group(1)
+    # (9) repair-intent supersession lives in refetchHistory's success path
+    # — record + deferred latch + pending timer, all below the !hist guard
+    # — and clear_ui carries no path-local cancel of the TRUNCATED repair
+    # intent.  Pin the specific timer, not all clearTimeout: #894's
+    # staleRetryTimer re-arm cancel in clear_ui is the staleness latch's
+    # own machinery, deliberately armed there (see the coord latch-contract
+    # test), not a truncated-repair cancel.
+    assert "pendingTruncatedResync = false;" in fn
+    assert "clearTimeout(truncatedResyncTimer)" in fn
+    assert guard < fn.index("pendingTruncatedResync = false;")
+    assert guard < fn.index("clearTimeout(truncatedResyncTimer)")
+    cu = re.search(r'case "clear_ui": \{(.*?)\n      \}', body, re.S)
+    assert cu is not None, "clear_ui case not found"
+    assert "clearTimeout(truncatedResyncTimer)" not in cu.group(1)
 
 
 def test_coord_detects_server_restart_by_backwards_event_id() -> None:
@@ -1965,12 +2217,122 @@ def test_coord_detects_server_restart_by_backwards_event_id() -> None:
     m = re.search(r"evtSource\.onmessage = function \(event\) \{(.*?)\n    \};", body, re.S)
     assert m is not None, "onmessage handler not found"
     handler = m.group(1)
-    assert "Number(evtSource.lastEventId) < Number(lastEventId)" in handler
+    assert "Number(event.lastEventId) < Number(lastEventId)" in handler
     assert "!gapRefreshedAtOpen" in handler
     assert "refreshSidebarAfterGap();" in handler
-    check = handler.index("Number(evtSource.lastEventId) < Number(lastEventId)")
-    overwrite = handler.index("lastEventId = evtSource.lastEventId;")
+    check = handler.index("Number(event.lastEventId) < Number(lastEventId)")
+    overwrite = handler.index("lastEventId = event.lastEventId;")
     assert check < overwrite
+
+
+def test_sse_cursor_captured_from_message_event_never_the_source_object() -> None:
+    """``lastEventId`` lives on the MessageEvent — EventSource exposes no
+    such property (WHATWG: url/withCredentials/readyState only), so an
+    object-form read like ``evtSource.lastEventId`` is undefined in every
+    real browser.  All three clients shipped exactly that dead
+    conditional: the cursor never tracked live traffic, every MANUAL
+    reconnect (close-on-hide show edge, degraded retry, recover beat)
+    connected fresh, and turns committed during the gap silently never
+    painted — the 2026-07 'turn disappeared' field mechanism.  Only a
+    real-browser harness could catch it (source-pattern tests pinned the
+    broken form as happily as the fixed one), so this tripwire at least
+    pins the corrected form and forbids the dead one by name.
+
+    Guard shape is pinned too — the explicit ``!= null && !== ""`` form.
+    On a DOMString this is behaviorally identical to truthiness (the
+    valid id "0" is a truthy STRING; only "" and null/undefined are
+    falsy here), so the pin is for cross-site symmetry with the NUMERIC
+    cursor gates (``_lastEventId != null`` / ``data.cursor != null``),
+    where truthiness genuinely drops a valid 0 — one visual idiom for
+    every cursor guard keeps a future editor from "simplifying" the
+    numeric ones to match a terser string form.
+
+    The GLOBAL stream (app.js) was pinned CURSORLESS here until #881
+    landed its boot-epoch signal: global ids are now
+    ``"{boot_epoch}-{counter}"``, so a cursor from a prior boot
+    mismatches the live epoch and draws ``replay_truncated`` + a fresh
+    node_snapshot instead of the old ``replay_ok``-empty ghost-roster
+    shape — the reason for cursorlessness is gone, and app.js now
+    captures/presents the cursor like the per-ws clients.  Its cursor
+    stays an OPAQUE STRING end to end (never ``parseInt``/``Number``
+    — the epoch prefix would NaN any numeric read), presented via
+    ``?last_event_id=`` (EventSource cannot set the header manually),
+    and cleared where the record dies: the ``replay_truncated``
+    handler, the ``node_snapshot`` recovery floor (required, not
+    belt-and-braces — that id-less frame's MessageEvent inherits the
+    connection's stale pre-restart cursor on NATIVE reconnects, so the
+    pre-dispatch capture re-stores it and only a branch-level clear
+    kills it), and ``onLogout``.  All three clears are pinned below —
+    a simplify pass dropping one reintroduces the redundant
+    dead-cursor truncated round.
+
+    Comments are stripped before the scan (module-level, string-aware
+    stripper) so documentation may name the anti-pattern verbatim — the
+    tripwire forbids the dead CODE, not its description."""
+    dead_form = re.compile(r"(?:this\.)?\w*[Ee]vtSource\.lastEventId")
+    for path, capture in (
+        (
+            _INTERACTIVE_JS,
+            r'if \(e\.lastEventId != null && e\.lastEventId !== ""\) \{\s*'
+            r"this\._lastEventId = e\.lastEventId;",
+        ),
+        (
+            _COORD_JS,
+            r'if \(event\.lastEventId != null && event\.lastEventId !== ""\) \{',
+        ),
+        (
+            _APP_JS,
+            r'if \(e\.lastEventId != null && e\.lastEventId !== ""\) \{\s*'
+            r"globalLastEventId = e\.lastEventId;",
+        ),
+    ):
+        body = path.read_text(encoding="utf-8")
+        code = _strip_js_comments(body)
+        hits = [m.group(0) for m in dead_form.finditer(code)]
+        assert not hits, (
+            f"{path.name}: cursor read off the EventSource OBJECT {hits} — "
+            "that property does not exist; capture from the MessageEvent."
+        )
+        assert re.search(capture, code), (
+            f"{path.name}: MessageEvent cursor capture (with the "
+            '``!= null && !== ""`` guard) not found'
+        )
+    app_code = _strip_js_comments(_APP_JS.read_text(encoding="utf-8"))
+    # Presentation: manual reconnects carry the stored cursor as a query
+    # param, behind the same string-guard idiom (see docstring above for
+    # why the explicit form is pinned).
+    assert re.search(
+        r'if \(globalLastEventId != null && globalLastEventId !== ""\) \{\s*'
+        r'globalUrl \+= "\?last_event_id=" \+ encodeURIComponent\(globalLastEventId\);',
+        app_code,
+    ), (
+        "app.js: manual global reconnect must present the stored cursor "
+        "via ?last_event_id= behind the house string guard"
+    )
+    # The cursor is opaque — any numeric interpretation of it is a bug
+    # (the epoch prefix turns Number()/parseInt() into NaN silently).
+    assert not re.search(r"(?:Number|parseInt)\(\s*globalLastEventId", app_code), (
+        "app.js: the global cursor is an opaque epoch-tagged string — "
+        "never interpret it numerically"
+    )
+    # Dead-record clears (see docstring): truncated envelope, snapshot
+    # recovery floor (BEFORE the roster rebuild), and logout.
+    assert re.search(
+        r"globalLastEventId = null;\s*resyncRoster\(\);",
+        app_code,
+    ), "app.js: the replay_truncated handler must clear the spent cursor"
+    assert re.search(
+        r"globalLastEventId = null;\s*applyRosterSnapshot\(",
+        app_code,
+    ), (
+        "app.js: the node_snapshot branch must clear the cursor — on "
+        "native reconnects this id-less frame re-captured the stale one"
+    )
+    logout_body = re.search(r"window\.onLogout = function \(\) \{(.*?)\n\};", app_code, re.S)
+    assert logout_body is not None, "app.js: window.onLogout not found"
+    assert "globalLastEventId = null;" in logout_body.group(1), (
+        "app.js: onLogout must reset the cursor (roster identity reset)"
+    )
 
 
 def test_interactive_history_is_rest_first_not_sse() -> None:
@@ -2311,3 +2673,727 @@ def test_console_has_matching_pane_hotkeys() -> None:
     assert '"Fork"' not in index and "New workstream" not in index, (
         "Fork + New are intentionally omitted on the console"
     )
+
+
+def test_fork_hides_project_picker() -> None:
+    """A fork must NOT show a project picker. A fork inherits its source's project
+    (enforced server-side), and a re-fileable fork picker was a cross-tenant
+    history-relocation vector — so showNewWsModal hides the picker for forks and
+    the "Keep source's project" fork option is gone."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert "projSelect.hidden = !!_forkFromWsId" in body, (
+        "the new-ws project picker must be hidden for forks"
+    )
+    assert "Keep source's project" not in body, (
+        "the fork project picker (and its 'Keep source's project' option) must be removed"
+    )
+
+
+def test_submit_gates_project_on_fork_flag() -> None:
+    """submitNewWs must send body.project_id ONLY for a fresh create
+    (!_forkFromWsId) — a fork never sends a project (its project is the source's,
+    enforced server-side). Not gated on picker visibility or a requireProject()
+    re-read."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    m = re.search(r"function submitNewWs\(\)\s*\{(.*?)\n\}", body, re.S)
+    assert m is not None, "could not locate submitNewWs"
+    fn = m.group(1)
+    assert "TurnstoneProjects.requireProject" not in fn, (
+        "submit must not re-read the requireProject() advisory"
+    )
+    assert re.search(r"project_id && !_forkFromWsId", fn), (
+        "submit must gate project_id on !_forkFromWsId (a fork never sends a project)"
+    )
+
+
+def test_strict_picker_requires_explicit_pick() -> None:
+    """Under require_project the fresh picker must NOT auto-select the first
+    project (which silently mis-files a required chat under a possibly-shared
+    project) — it offers a 'Select a project…' prompt so the user consciously
+    chooses."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    assert "Select a project" in body, (
+        "strict picker must offer an explicit 'Select a project…' prompt"
+    )
+    m = re.search(
+        r"function _reconcileRequiredProjectSelection\(sel, choices\)\s*\{(.*?)\n\}",
+        body,
+        re.S,
+    )
+    assert m is not None, "could not locate _reconcileRequiredProjectSelection"
+    fn = m.group(1)
+    assert "real[0]" not in fn, "strict picker must not auto-select the first project"
+    # §6b polish: _populateProjectSelect threads its already-computed choices into
+    # reconcile rather than forcing a second projectChoices() recompute (the onClose
+    # creator caller still passes none and reconcile recomputes for it).
+    assert "_reconcileRequiredProjectSelection(sel, choices)" in body, (
+        "the populate helper must thread its computed choices into reconcile "
+        "(avoids a redundant projectChoices() recompute)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Composer selector FOUC — sync-paint-then-refresh guards
+# ---------------------------------------------------------------------------
+#
+# The project + persona composer selectors are painted from the warm shared
+# client cache (window.TurnstoneProjects / window.TurnstonePersonas, warmed by
+# the rail at startup) SYNCHRONOUSLY on open, BEFORE the deliberate async
+# refresh-and-repaint that catches items created elsewhere.  Pre-fix they were
+# painted only inside the refresh().then callback, so every open flashed an
+# empty dropdown for a network round-trip even when the data was already in
+# memory.  These guards pin the ordering — a synchronous populate must precede
+# the refresh().then — for all three composer surfaces (new-ws modal, dashboard
+# Options, console launcher).  The model/skill selectors (phase 2b) are covered
+# by the guards further down (search "models/skills composer FOUC").
+
+
+def _slice_top_level_fn(body: str, header: str) -> str:
+    """Slice a top-level ``function`` body from ``header`` to the next
+    column-0 ``function`` declaration (or EOF).  Unlike
+    ``_slice_balanced_body`` this has no fixed-size window, so it is safe
+    for large functions like ``showNewWsModal``.  Nested (indented)
+    ``function () {…}`` expressions never match the ``\\nfunction `` bound,
+    so the slice stops at the next top-level function."""
+    start = body.index(header)
+    nxt = body.find("\nfunction ", start + 1)
+    return body[start:] if nxt < 0 else body[start:nxt]
+
+
+def test_new_ws_modal_paints_project_and_persona_from_cache_synchronously() -> None:
+    """FOUC fix: the new-ws modal's project + persona pickers paint from the warm
+    shared cache SYNCHRONOUSLY on open, BEFORE the async refresh-and-repaint — so a
+    warm-cache open (the common case; the rail warms the caches at startup) shows
+    the populated dropdowns immediately instead of flashing empty for a network
+    round-trip.  The refresh-on-open is KEPT (it catches items created elsewhere);
+    these guards pin only that a synchronous populate precedes it."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function showNewWsModal(")
+    # Project is painted via the shared _paintProjectPicker helper (fork-gated);
+    # the sync-before-async pattern is pinned in test_paint_project_picker_syncs.
+    assert "_paintProjectPicker(projSelect" in fn, (
+        "the modal must paint the project picker via the shared _paintProjectPicker helper"
+    )
+    # Persona is painted via the shared _paintPersonaSelect wrapper (fork-gated);
+    # its sync-before-async ordering is pinned in the wrapper-internals test.
+    assert "_paintPersonaSelect(personaSelect" in fn, (
+        "the modal must paint the persona picker via the shared _paintPersonaSelect helper"
+    )
+
+
+def test_dashboard_paints_project_and_persona_from_cache_synchronously() -> None:
+    """FOUC fix (dashboard composer twin of the modal): the dashboard Options
+    project + persona pickers paint synchronously from the warm cache before the
+    async refresh.  Also pins the deferred require_project polish — the dashboard
+    Project label carries a ``.label-hint`` span seeded ``required``/``optional``
+    from requireProject() synchronously, matching the new-ws modal."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _loadDashboardOptionsLists(")
+    # Project is painted via the shared _paintProjectPicker helper.
+    assert "_paintProjectPicker(projSel" in fn, (
+        "the dashboard must paint the project picker via the shared _paintProjectPicker helper"
+    )
+    # Persona is painted via the shared _paintPersonaSelect wrapper (freshOnOpen:false).
+    assert "_paintPersonaSelect(personaSel, { freshOnOpen: false })" in fn, (
+        "the dashboard must paint the persona picker via _paintPersonaSelect (preserving)"
+    )
+    # require_project label-hint parity: the dashboard Project label gained a
+    # .label-hint span, seeded synchronously from requireProject() like the modal.
+    html = _INDEX_HTML.read_text(encoding="utf-8")
+    lbl = html.index('for="dashboard-project"')
+    assert 'class="label-hint"' in html[lbl : lbl + 120], (
+        "the dashboard Project label must carry a .label-hint span (required/optional cue)"
+    )
+    # The hint is seeded synchronously inside _paintProjectPicker (asserted there).
+
+
+def test_console_launcher_paints_project_and_persona_from_cache_synchronously() -> None:
+    """FOUC fix (console launcher composer): the project + persona wrappers route
+    through the _paintHomeFromCache chokepoint — sync paint from the warm cache,
+    then refresh(callOpts)-and-repaint; the ordering discipline is asserted ONCE
+    on the helper (in the model/skill twin test).  Each wrapper must pair its OWN
+    bridge refresh with its OWN populate helper.  Also pins the persona
+    kind-default revert: _populateHomePersonaDropdown must fall back to
+    defaultPersona(kind) when the previous pick is no longer a valid choice (the
+    interactive/coordinator persona shelves are disjoint), or a kind toggle
+    silently degrades the picker to a bare placeholder."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    proj_fn = _slice_top_level_fn(body, "function _refreshAndPopulateProjects(")
+    assert re.search(
+        r"_paintHomeFromCache\(\s*TP && TP\.refreshProjects,\s*_populateHomeProjectDropdown",
+        proj_fn,
+    ), "the launcher project wrapper must pair its bridge refresh + populate via the chokepoint"
+    persona_fn = _slice_top_level_fn(body, "function _refreshAndPopulatePersonas(")
+    assert re.search(
+        r"_paintHomeFromCache\(\s*TP && TP\.refreshPersonas,\s*_populateHomePersonaDropdown",
+        persona_fn,
+    ), "the launcher persona wrapper must pair its bridge refresh + populate via the chokepoint"
+    pop = _slice_top_level_fn(body, "function _populateHomePersonaDropdown(")
+    assert '_restorePick("persona"' in pop, (
+        "the persona populate must restore a still-valid pick via _restorePick"
+    )
+    assert "defaultPersona(_launcherKind)" in pop, (
+        "the persona populate must revert to the kind default when the pick is gone"
+    )
+    proj_pop = _slice_top_level_fn(body, "function _populateHomeProjectDropdown(")
+    assert '_restorePick("project"' in proj_pop, (
+        "the project populate must validate a previous pick via _restorePick (a "
+        "since-deleted project falls back to the placeholder, not a blank select)"
+    )
+
+
+def test_console_launcher_project_placeholder_tracks_require_project() -> None:
+    """require_project parity on the console launcher: with the gate on, BOTH
+    launcher kinds are refused a projectless create server-side (interactive at
+    the node, coordinator at the console's own mount), so the picker must stop
+    presenting "No project" as a normal choice.  Mirrors the interactive strict
+    picker's soft treatment — retitle the placeholder ("Select a project…", or
+    "No projects available" when none exist) and never auto-select a real
+    project; the server's coded 400 stays the enforcement."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _populateHomeProjectDropdown(")
+    assert "TP.requireProject()" in fn, (
+        "the launcher project populate must read the requireProject() advisory"
+    )
+    assert re.search(r'setOptionPlaceholder\(\s*"project"', fn), (
+        "strict mode must retitle the seeded placeholder via setOptionPlaceholder"
+    )
+    for label in ("Select a project…", "No projects available", "No project"):
+        assert label in fn, f"placeholder branch missing the {label!r} title"
+    # The has-projects check must see REAL projects only: the placeholder is
+    # computed before the "+ New project…" sentinel is appended, or an empty
+    # deployment would read as having one project and mis-title the prompt.
+    assert fn.index("setOptionPlaceholder") < fn.index("_PROJECT_NEW"), (
+        "the placeholder must be computed before the + New project… sentinel is appended"
+    )
+
+
+def test_paint_project_picker_syncs_before_refresh() -> None:
+    """The shared _paintProjectPicker (used by BOTH the modal and dashboard, so
+    the two can't drift and silently re-introduce the FOUC) seeds the required/
+    optional hint + paints via _populateProjectSelect, and routes its
+    sync-then-refresh tail through the _paintFromCache chokepoint — where the
+    sync-before-async + always-fresh:false discipline is asserted once.  Its
+    fork/absent-bridge path returns a resolved promise so the dashboard's chained
+    Options-chip recompute still runs.  Both paints reuse _populateProjectSelect
+    (preserving the #867 strict-picker invariant)."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _paintProjectPicker(")
+    assert "_populateProjectSelect(" in fn, (
+        "_paintProjectPicker must paint via _populateProjectSelect"
+    )
+    assert "hint.textContent" in fn, "_paintProjectPicker must seed the required/optional hint"
+    assert "opts.fork" in fn, "_paintProjectPicker must skip for a fork"
+    assert "return Promise.resolve();" in fn, (
+        "_paintProjectPicker's fork/absent-bridge path must return a resolved "
+        "promise (the dashboard chains its Options-chip recompute on the return)"
+    )
+    assert "return _paintFromCache(window.TurnstoneProjects.refreshProjects, paint, opts)" in fn, (
+        "_paintProjectPicker's tail must route through the _paintFromCache "
+        "chokepoint (sync paint(freshOnOpen) then always-fresh:false repaint)"
+    )
+
+
+# --- models/skills composer FOUC (phase 2b) --------------------------------
+#
+# The model + skill pickers had NO client cache: every composer open re-fetched
+# /v1/api/models and /v1/api/skills inline, flashing an empty dropdown for the
+# round-trip.  Phase 2b adds shared caches (models.js / skills.js) on the
+# extracted list_cache.js core that the composers read synchronously, then
+# refresh-and-repaint — the same pattern the project/persona pickers use.  These
+# guards pin the sync-before-async ordering on all three surfaces, the cache
+# fail-open/coalesce contract, the two-server-schema exposure, and the
+# single-repaint-path wiring.
+
+_LIST_CACHE_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/list_cache.js"
+_MODELS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/models.js"
+_SKILLS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/skills.js"
+_PROJECTS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/projects.js"
+_PERSONAS_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/personas.js"
+
+
+def test_paint_model_and_skill_wrappers_sync_before_refresh() -> None:
+    """The _paintFromCache chokepoint (PR #869 review: the three wrapper twins
+    repeated the same wiring, so the discipline now lives ONCE) paints from the
+    warm cache SYNCHRONOUSLY, then refreshes-and-repaints.  CRITICAL: the sync
+    paint mirrors the caller's freshOnOpen but the ASYNC repaint MUST pass
+    fresh:false — leaking freshOnOpen into the async paint would clobber a
+    mid-window pick (for the project picker that reconciles to "" -> a
+    require_project 400).  Each wrapper must pair its OWN bridge refresh with
+    its OWN populate helper and thread `fresh` through untouched."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    helper = _slice_top_level_fn(body, "function _paintFromCache(")
+    sync = helper.find("repaint(!!(opts && opts.freshOnOpen))")
+    async_ = helper.find("refresh().then")
+    assert 0 <= sync < async_, (
+        "_paintFromCache must sync-paint (repaint mirroring freshOnOpen) BEFORE "
+        "the async refresh repaint"
+    )
+    assert "repaint(false)" in helper[async_:], (
+        "_paintFromCache's async repaint must pass fresh:false (never leak "
+        "freshOnOpen, or it clobbers a mid-window pick)"
+    )
+    # Promise contract: callers (the dashboard Options-chip recompute) chain on
+    # the async repaint landing; the no-refresh path must still hand back a
+    # resolved promise or the chain throws on a cold bridge.
+    assert "return Promise.resolve()" in helper, (
+        "_paintFromCache must return an already-resolved promise when there is "
+        "no refresh (dashboard callers chain the Options-chip recompute)"
+    )
+    assert "return refresh().then" in helper, (
+        "_paintFromCache must return the async-repaint promise (callers act "
+        "after the repaint lands)"
+    )
+    for wrapper, bridge_refresh, populate in (
+        (
+            "function _paintModelSelects(",
+            "window.TurnstoneModels && window.TurnstoneModels.refreshModels",
+            "_populateModelSelect(modelSel, judgeSel, { fresh: fresh })",
+        ),
+        (
+            "function _paintSkillSelect(",
+            "window.TurnstoneSkills && window.TurnstoneSkills.refreshSkills",
+            "_populateSkillSelect(sel, { fresh: fresh })",
+        ),
+        (
+            "function _paintPersonaSelect(",
+            "window.TurnstonePersonas && window.TurnstonePersonas.refreshPersonas",
+            "_populatePersonaSelect(sel, { fresh: fresh })",
+        ),
+    ):
+        fn = _slice_top_level_fn(body, wrapper)
+        assert "return _paintFromCache(" in fn, f"{wrapper} must return the _paintFromCache promise"
+        assert bridge_refresh in fn, f"{wrapper} must pass its own bridge refresh"
+        assert populate in fn, f"{wrapper} must thread fresh through to its own populate helper"
+
+
+def test_new_ws_modal_renders_all_selects_fresh_on_open() -> None:
+    """Finding [0] fix — every composer select in the reused new-ws <dialog> renders
+    its ACTUAL value fresh on open (no stale carryover from the last open): model +
+    skill via the wrappers with freshOnOpen:true, persona via {fresh:true}, project
+    via _paintProjectPicker freshOnOpen:true.  The model paint is fork-gated."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function showNewWsModal(")
+    assert "_paintModelSelects(modelSelect, judgeSelect, { freshOnOpen: true })" in fn, (
+        "the modal must paint model+judge fresh-on-open via the shared wrapper"
+    )
+    assert "_paintSkillSelect(tplSelect, { freshOnOpen: true })" in fn, (
+        "the modal must paint skill fresh-on-open"
+    )
+    assert "_paintPersonaSelect(personaSelect, { freshOnOpen: true })" in fn, (
+        "the modal must paint persona fresh-on-open via the shared wrapper"
+    )
+    proj = fn[fn.find("_paintProjectPicker(projSelect") :]
+    assert "freshOnOpen: true" in proj[:120], (
+        "the modal must paint the project picker fresh-on-open"
+    )
+    # Fork-gates: the model + persona paints must each be the FIRST statement
+    # inside their own `if (!_forkFromWsId)` block.  (A first-gate ordering
+    # check is vacuous here — the first gate in showNewWsModal IS the model
+    # gate, so it would pass even with the paint hoisted out below it.)
+    assert re.search(r"if \(!_forkFromWsId\) \{\s*_paintModelSelects\(modelSelect", fn), (
+        "the modal model paint must be skipped for a fork"
+    )
+    assert re.search(r"if \(!_forkFromWsId\) \{\s*_paintPersonaSelect\(personaSelect", fn), (
+        "the modal persona paint must be skipped for a fork"
+    )
+
+
+def test_dashboard_paints_model_and_skill_via_wrappers_preserving() -> None:
+    """Dashboard twin — all four pickers paint via the SAME wrappers but
+    freshOnOpen:false (a persistent panel preserves a pick across a repaint), the
+    old fetch-once ``options.length <= 1`` guard is gone, and EVERY paint chains
+    _refreshDashboardOptionsSummary on its async repaint: a repaint can drop a
+    server-removed pick (or revert persona to its kind default) without firing
+    'change', and the collapsed Options chip must always name what submit sends."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    fn = _slice_top_level_fn(body, "function _loadDashboardOptionsLists(")
+    for paint in (
+        "_paintModelSelects(modelSel, judgeSel, { freshOnOpen: false })",
+        "_paintSkillSelect(skillSel, { freshOnOpen: false })",
+        "_paintProjectPicker(projSel, projHint, { fork: false })",
+        "_paintPersonaSelect(personaSel, { freshOnOpen: false })",
+    ):
+        assert re.search(re.escape(paint) + r"\.then\(\s*_refreshDashboardOptionsSummary", fn), (
+            f"dashboard paint must chain the Options-chip recompute: {paint[:36]}"
+        )
+    assert "options.length <= 1" not in fn, (
+        "the dashboard model/skill fetch-once guard must be removed (refresh-on-open now)"
+    )
+
+
+def test_new_ws_modal_fork_inherits_model_and_judge() -> None:
+    """Q2 — a fork INHERITS its source's model + judge: the modal hides both selects
+    for a fork (like skill/persona/project), and submitNewWs gates body.model AND
+    body.judge_model on !_forkFromWsId.  Asserts the model line SPECIFICALLY — its
+    guard `model && !_forkFromWsId` is a substring of the judge line, so a
+    model-unguarded regression would otherwise false-pass."""
+    body = _APP_JS.read_text(encoding="utf-8")
+    modal = _slice_top_level_fn(body, "function showNewWsModal(")
+    assert "modelSelect.hidden = !!_forkFromWsId" in modal, (
+        "modal must hide the model select for a fork"
+    )
+    assert "judgeSelect.hidden = !!_forkFromWsId" in modal, (
+        "modal must hide the judge select for a fork"
+    )
+    # [4] fix: the skill paint is fork-gated too (skill is hidden for a fork).
+    # Tie the gate to the skill paint SPECIFICALLY — a first-gate check would be
+    # satisfied by the model gate even if the skill paint were left
+    # unconditional, so require the paint to be the FIRST statement inside its
+    # own gate block.  (A nearest-preceding-gate proximity window false-passes
+    # a gate block that CLOSES before the paint.)
+    skill_paint = modal.find("_paintSkillSelect(tplSelect")
+    assert skill_paint >= 0, "the modal must paint the skill picker"
+    assert re.search(r"if \(!_forkFromWsId\) \{\s*_paintSkillSelect\(tplSelect", modal), (
+        "the modal skill paint must be directly wrapped in `if (!_forkFromWsId)` "
+        "(skip the wasted fetch + hidden-select rebuild on a fork)"
+    )
+    submit = _slice_top_level_fn(body, "function submitNewWs(")
+    assert "if (model && !_forkFromWsId) body.model = model;" in submit, (
+        "submitNewWs must fork-gate body.model (distinct from the judge line)"
+    )
+    assert "if (judge_model && !_forkFromWsId) body.judge_model = judge_model;" in submit, (
+        "submitNewWs must fork-gate body.judge_model"
+    )
+
+
+def test_console_launcher_paints_model_and_skill_from_cache_synchronously() -> None:
+    """Console launcher — the four _refreshAndPopulate* wrappers route through the
+    _paintHomeFromCache chokepoint: sync paint from the warm cache BEFORE the
+    async refresh(callOpts)-and-repaint (callOpts threads {force:true} for the
+    models_changed / onLoginSuccess invalidation callers).  The ordering
+    discipline is asserted once, on the helper; the wrappers are pairing-checked
+    (model/skill here, project/persona in their twin test)."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    helper = _slice_top_level_fn(body, "function _paintHomeFromCache(")
+    sync = helper.find("populate()")
+    async_ = helper.find("refresh(callOpts).then")
+    assert 0 <= sync < async_, (
+        "_paintHomeFromCache must sync-paint (populate()) BEFORE the async "
+        "refresh(callOpts).then repaint"
+    )
+    model_fn = _slice_top_level_fn(body, "function _refreshAndPopulateModels(")
+    assert re.search(
+        r"_paintHomeFromCache\(\s*TM && TM\.refreshModels,\s*_populateHomeModelDropdowns", model_fn
+    ), "the launcher model wrapper must pair its bridge refresh + populate via the chokepoint"
+    skill_fn = _slice_top_level_fn(body, "function _refreshAndPopulateSkills(")
+    assert re.search(
+        r"_paintHomeFromCache\(\s*TS && TS\.refreshSkills,\s*_populateHomeSkillDropdown", skill_fn
+    ), "the launcher skill wrapper must pair its bridge refresh + populate via the chokepoint"
+
+
+def test_console_relogin_rewarms_all_four_caches_with_force() -> None:
+    """onLoginSuccess re-warms ALL FOUR composer caches after auth lands (the boot
+    pass runs pre-login -> 401 -> fail-open empty), EACH with {force:true} so a
+    still-in-flight failing pre-auth fetch yields a trailing authenticated refetch
+    (skills/personas have no *_changed event to recover otherwise). Fixes [0]+[2]."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    start = body.index("window.onLoginSuccess = function ()")
+    # The four re-warm calls live before the // Active-coordinators marker; an
+    # assert falling outside this slice fails loudly rather than silently passing.
+    login = body[start : body.index("// Active-coordinators", start)]
+    for name in ("Skills", "Models", "Projects", "Personas"):
+        assert f"_refreshAndPopulate{name}({{ force: true }})" in login, (
+            f"onLoginSuccess must force-re-warm {name.lower()} after login"
+        )
+
+
+def test_models_changed_forces_trailing_single_repaint_path() -> None:
+    """The console ``models_changed`` handler repaints via the refresh wrapper with
+    {force:true} — so a burst of model-config changes converges to the latest server
+    state (trailing refresh) — and the launcher does NOT ALSO subscribe onModelsChange
+    (one repaint path, no double rebuild)."""
+    body = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    mc = body.index('data.type === "models_changed"')
+    handler = body[mc : mc + 700]
+    assert "_refreshAndPopulateModels({ force: true })" in handler, (
+        "models_changed must force a trailing refresh so it converges to the latest"
+    )
+    assert "onModelsChange" not in body, (
+        "the console must not ALSO subscribe onModelsChange (single repaint path)"
+    )
+
+
+def test_models_label_centralized_on_bridge() -> None:
+    """Finding [7] — the "alias (model)" label lives ONCE in models.js: modelLabel is
+    exported AND registered on the window.TurnstoneModels bridge (the classic app.js
+    bundles reach it only via the bridge — an ES-only export throws at runtime), and
+    neither app keeps a local _resolveModelLabel copy."""
+    models_src = _MODELS_JS.read_text(encoding="utf-8")
+    assert "export function modelLabel(" in models_src, "models.js must export modelLabel"
+    assert "modelLabel: modelLabel" in models_src, (
+        "models.js must register modelLabel on the window.TurnstoneModels bridge "
+        "(classic bundles call it via the bridge)"
+    )
+    # [7] fix: modelLabel resolves via the core's O(1) keyField index, not a scan.
+    assert 'keyField: "alias"' in models_src, (
+        "models.js must index by alias (keyField) so modelLabel is an O(1) getByKey"
+    )
+    assert "getByKey(alias)" in models_src, (
+        "modelLabel must resolve via the core's getByKey index (not a per-paint scan)"
+    )
+    assert "_resolveModelLabel" not in _APP_JS.read_text(encoding="utf-8"), (
+        "the ui app must not keep a local _resolveModelLabel (use TurnstoneModels.modelLabel)"
+    )
+    assert "_resolveModelLabel" not in _CONSOLE_APP_JS.read_text(encoding="utf-8"), (
+        "the console app must not keep a local _resolveModelLabel"
+    )
+
+
+def test_models_skills_module_tagged_in_both_apps() -> None:
+    """All four data-layer modules (projects/personas/models/skills) are
+    ``<script type=module>``-tagged BEFORE /shared/shell.js in BOTH index.html.
+    shell.js is the LAST module tag and calls TS_APP.boot (the first dashboard /
+    launcher paint); module execution follows tag order, and classic app.js is
+    parse-time definitions only — so a data-layer tag reordered below shell.js
+    boots the app before that bridge installs: the sync paint no-ops AND the
+    refresh is skipped, a silent test-green FOUC regression without this guard."""
+    for idx in (_INDEX_HTML, _CONSOLE_INDEX):
+        html = idx.read_text(encoding="utf-8")
+        for mod in ("projects", "personas", "models", "skills"):
+            path = f"/shared/{mod}.js"
+            assert path in html, f"{mod}.js must be module-tagged in {idx.name}"
+            assert html.index(path) < html.index("/shared/shell.js"), (
+                f"{mod}.js must be tagged BEFORE shell.js in {idx.name} — its "
+                "bridge must install before TS_APP.boot paints the composers"
+            )
+
+
+def test_list_cache_core_is_failopen_coalesced_and_gated() -> None:
+    """The extracted list_cache.js core: non-force callers coalesce onto the in-flight
+    refresh; it fails open (keeps the prior cache + records the error, never rejects —
+    only the SUCCESS branch calls _setCache); the extra-reset is GATED on
+    resetExtraOnError across BOTH error branches (finding [1]); and a force caller
+    schedules a trailing refetch that converges to the latest (finding [2])."""
+    src = _LIST_CACHE_JS.read_text(encoding="utf-8")
+    assert "return _inflight;" in src, "non-force callers must coalesce onto the in-flight refresh"
+    assert src.count("_byKey = Object.create(null)") == 2, (
+        "both _byKey sites (declaration + _setCache rebuild) must be null-prototype "
+        "(a row keyed __proto__ must not swap the map's prototype; inherited members "
+        "must not resolve as rows)"
+    )
+    assert "_lastError = r.status" in src and "_lastError = 0" in src, (
+        "a non-OK status and a network/parse error must both be recorded (fail-open)"
+    )
+    assert src.count("_setCache(data[dataKey]") == 1, (
+        "only the success branch may repopulate the cache (non-OK/catch keep the prior cache)"
+    )
+    # finding [1]: the extra-reset must be gated on resetExtraOnError on BOTH the
+    # non-OK branch AND the network/parse .catch branch (a cosmetic extra must
+    # survive a network drop too, not just a non-OK status).
+    assert src.count("resetExtraOnError && extraDefaults") == 2, (
+        "resetExtraOnError must gate the extra-reset on BOTH error branches"
+    )
+    # finding [2]: a force caller gets a trailing refetch (converges to latest).
+    assert "callOpts.force" in src and "_pending" in src, (
+        "a force caller must schedule a trailing refetch so it converges to the latest state"
+    )
+    assert "firstLoad || fp !== _fingerprint" in src, (
+        "subscribers must fire on first load or a changed fingerprint only"
+    )
+
+
+def test_reset_extra_policy_per_cache() -> None:
+    """require_project (an advisory that GATES the picker) must fail open on error;
+    the models default-aliases (a COSMETIC annotation) must keep their last-known
+    value.  So projects opts INTO the reset, models opts OUT (finding [1])."""
+    assert "resetExtraOnError: true" in _PROJECTS_JS.read_text(encoding="utf-8"), (
+        "projects.js must reset the require_project advisory on error (fail-open)"
+    )
+    assert "resetExtraOnError: false" in _MODELS_JS.read_text(encoding="utf-8"), (
+        "models.js must keep last-known default aliases on error (cosmetic, not a gate)"
+    )
+
+
+def test_models_cache_exposes_both_server_schemas() -> None:
+    """models.js must carry ALL default-alias fields — the node server sends
+    default_alias, the console sends coordinator_default_alias, both send
+    judge_default_alias — so each app reads its own (via modelDefaults/captureExtra,
+    which drive the "Default — <alias>" placeholder).  The dead onChange
+    subscription (+ its fingerprint fold) was removed: models has no live-render
+    subscriber (the console repaints via its direct models_changed handler), so it
+    exposes no onModelsChange."""
+    src = _MODELS_JS.read_text(encoding="utf-8")
+    for field in ("default_alias", "judge_default_alias", "coordinator_default_alias"):
+        assert field in src, f"models.js must carry {field} for the two server schemas"
+    assert "window.TurnstoneModels" in src, "models.js must install the classic bridge"
+    assert "makeListCache" in src, "models.js must build on the shared list_cache core"
+    assert "onModelsChange" not in src, (
+        "models.js must not expose the dead onModelsChange subscription (no subscribers)"
+    )
+
+
+def test_skills_cache_returns_raw_rows() -> None:
+    """skills.js exposes raw rows (getSkills) — the ui pickers add a ' [MCP]' suffix
+    the console omits, so a single pre-formatted label in the cache would silently
+    change one app's labels."""
+    src = _SKILLS_JS.read_text(encoding="utf-8")
+    assert "window.TurnstoneSkills" in src, "skills.js must install the classic bridge"
+    assert "makeListCache" in src, "skills.js must build on the shared list_cache core"
+    assert "getSkills" in src, "skills.js must expose raw rows via getSkills"
+
+
+def test_projects_personas_keep_public_surface_on_factory() -> None:
+    """The projects.js / personas.js retrofit onto list_cache.js must preserve their
+    full public surface — rail.js and project_creator.js import these by name, and
+    the classic bundles read the window bridges."""
+    proj = _PROJECTS_JS.read_text(encoding="utf-8")
+    assert "makeListCache" in proj, "projects.js must build on the shared core"
+    for name in (
+        "refreshProjects",
+        "getProjects",
+        "projectsLoaded",
+        "projectsError",
+        "requireProject",
+        "projectName",
+        "projectChoices",
+        "onProjectsChange",
+        "createProject",
+    ):
+        assert f"function {name}(" in proj, f"projects.js must still export {name}"
+    assert "requireProject: false" in proj, (
+        "the require_project advisory must seed / fail-open to false"
+    )
+    persona = _PERSONAS_JS.read_text(encoding="utf-8")
+    assert "makeListCache" in persona, "personas.js must build on the shared core"
+    for name in (
+        "refreshPersonas",
+        "getPersonas",
+        "personasLoaded",
+        "personasError",
+        "personaLabel",
+        "defaultPersona",
+        "personaChoices",
+        "onPersonasChange",
+    ):
+        assert f"function {name}(" in persona, f"personas.js must still export {name}"
+
+
+_MCP_ERROR_CSS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/mcp_error.css"
+
+# The categories _mcpErrorCategory can return that carry their own CSS —
+# buildMcpErrorEmbed's interpolated `"mcp-error-" + category` class expands
+# to these plus "actionable", which is deliberately unstyled (the base card
+# look IS the actionable look: accent icon + Connect button).
+_MCP_ERROR_STYLED_CATEGORIES = ("operator", "transient", "forbidden")
+
+
+def test_mcp_error_css_owns_every_card_class() -> None:
+    """Every class mcp_error.js assigns has a rule in mcp_error.css.
+
+    The dual-static reach class (#725 review round 1: the standalone
+    coordinator page rendered the consent card bare because the card's
+    rules lived only in a host sheet it never linked).  The sheet pairs
+    with the module and every card host links it; this pin makes the
+    invariant structural — add a class to the card and this fails until
+    mcp_error.css owns it."""
+    js = _MCP_ERROR_JS.read_text(encoding="utf-8")
+    css = _MCP_ERROR_CSS.read_text(encoding="utf-8")
+    tokens: set[str] = set()
+    for assignment in re.findall(r'className\s*=\s*"([^"]+)"', js):
+        for tok in assignment.split():
+            if tok.endswith("-"):
+                # Interpolated category suffix ("mcp-error-" + category).
+                tokens.update(tok + cat for cat in _MCP_ERROR_STYLED_CATEGORIES)
+            else:
+                tokens.add(tok)
+    assert "mcp-error-card" in tokens, "class extractor found nothing — regex rotted?"
+    missing = sorted(t for t in tokens if ("." + t) not in css)
+    assert not missing, f"mcp_error.css lacks rules for: {missing}"
+
+
+def test_mcp_error_css_linked_by_every_card_host() -> None:
+    """Every page that renders the MCP error card links its sheet — the
+    other half of the reach invariant (a future host that imports
+    mcp_error.js without the stylesheet regresses to bare markup)."""
+    root = Path(__file__).resolve().parent.parent
+    hosts = (
+        root / "turnstone/console/static/coordinator/index.html",
+        root / "turnstone/console/static/index.html",
+        root / "turnstone/ui/static/index.html",
+    )
+    for host in hosts:
+        html = host.read_text(encoding="utf-8")
+        assert "/shared/mcp_error.css" in html, f"{host.name} must link /shared/mcp_error.css"
+
+
+def test_console_consent_badge_seam() -> None:
+    """#874 badge half, console side: the console defines the same
+    TS_APP.onConsentDetected seam the node dashboard does (which the shared
+    pane host bridges interactive panes' detections to), hydrates from the
+    Phase 9 persistence endpoint at boot, and badges the Admin > MCP
+    Servers rail row through the shell bridge."""
+    js = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    assert "window.TS_APP.onConsentDetected" in js
+    assert '"/v1/api/mcp/oauth/pending"' in js
+    assert 'setRowBadge("mcp"' in js
+    assert "window.TS_APP.syncConsentBadge" in js
+
+
+def test_admin_mcp_panel_resyncs_consent_badge() -> None:
+    """The admin MCP panel re-syncs the badge to DB truth AFTER a
+    successful render (node Connections-flow semantics) — and only then:
+    a failed load keeps the pending signal.  The order is asserted inside
+    loadAdminMcp's body (a whole-file check would bind to unrelated
+    earlier .catch( sites and false-pass a move into the failure path)."""
+    js = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    body = js[js.index("function loadAdminMcp(") :]
+    body = body[: body.index("\nfunction ")]
+    assert (
+        body.index("_renderMcpServers(") < body.index("syncConsentBadge") < body.index(".catch(")
+    ), "syncConsentBadge must sit in loadAdminMcp's success path, after the render"
+
+
+def test_coordinator_pane_threads_consent_detection() -> None:
+    """#874 badge half, coordinator side: the single MCP-error helper
+    passes the consent callback to the card builder (both result paths get
+    detection), forwarding to the L-shell seam and the standalone
+    status-bar chip."""
+    js = _COORD_JS.read_text(encoding="utf-8")
+    assert "buildMcpErrorEmbed(mcpErr, output, _notifyConsentDetected)" in js
+    assert "onConsentDetected" in js
+    assert "coord-sb-consent" in js
+    # The chip is standalone-only chrome; the L-shell pane relies on the
+    # rail badge.
+    assert "opts.standalone" in js
+
+
+def test_consent_badge_visibility_resync_pins() -> None:
+    """#874 self-heal: both consent surfaces re-pull server truth on the
+    visibility-show edge (the consent popup is noopener — no cross-window
+    channel exists), with merge-on-success semantics: the mirrors diff
+    against a preFetch snapshot so a detection landing mid-fetch survives
+    and a failed fetch never blanks a possibly-valid warning.  A blind
+    clear()-then-refill would clobber mid-fetch adds — the preFetch
+    marker is the pin against that regression."""
+    app = _CONSOLE_APP_JS.read_text(encoding="utf-8")
+    assert 'document.addEventListener("visibilitychange"' in app
+    assert "_resyncPendingConsents" in app
+    assert app.count("preFetch") >= 2
+    # Single-flight: overlapping fetches can resolve out of order and no
+    # ordering guard covers every interleaving (stale clobber, failure
+    # suppression, phantom re-adds) — exclusion plus one queued rerun is
+    # the pinned shape, with a bounded flight so a stalled fetch cannot
+    # wedge the gate shut.  The timeout signal is feature-detected (old
+    # runtimes, per the codebase's AbortController guards) so it can
+    # never throw the gate wedged.
+    assert "_resyncInFlight" in app
+    assert "_resyncQueued" in app
+    assert app.count("AbortSignal.timeout") >= 2  # guard + use
+    coord = _COORD_JS.read_text(encoding="utf-8")
+    assert 'document.addEventListener("visibilitychange"' in coord
+    assert coord.count("preFetch") >= 2
+    assert "hydrateInFlight" in coord
+    assert "hydrateQueued" in coord
+    assert coord.count("AbortSignal.timeout") >= 2  # guard + use
+
+
+def test_reload_toast_console_phrasing_pins() -> None:
+    """Reload-toast truth table (#725): a node-less install reads
+    'Reload sent to console' instead of '0 node(s) + console'; a failed
+    console entry appends its explicit note; and failed beats reconciled
+    if a malformed entry ever carries both shapes."""
+    js = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    assert '"Reload sent to console"' in js
+    assert '"; console reload failed"' in js
+    assert "!consoleFailed &&" in js
