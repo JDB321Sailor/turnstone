@@ -15,7 +15,7 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+REPO_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 
 SRC_COMPOSE="$REPO_DIR/turnstone/deploy/compose.yaml"
 SRC_CADDYFILE="$REPO_DIR/turnstone/deploy/Caddyfile"
@@ -447,6 +447,8 @@ check_prereqs() {
     have docker || die "docker is required. Install Docker Engine first: https://docs.docker.com/engine/install/"
     docker compose version >/dev/null 2>&1 || die "the Docker Compose v2 plugin is required (docker compose version failed)."
     [ -f "$SRC_COMPOSE" ] || die "missing $SRC_COMPOSE — run this script from a full repository clone."
+    [ -f "$SRC_CADDYFILE" ] || die "missing $SRC_CADDYFILE — run this script from a full repository clone."
+    [ -d "$SRC_SEARXNG_DIR" ] || die "missing $SRC_SEARXNG_DIR — run this script from a full repository clone."
 }
 
 # ---------------------------------------------------------------------------
