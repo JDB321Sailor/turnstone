@@ -114,15 +114,20 @@ from turnstone.core.memory_relevance import (
     score_memories,
 )
 from turnstone.core.metacognition import (
-    MEMORY_NUDGE_TYPES,
     NUDGE_COMPACTION_RESUME,
     NUDGE_COMPACTION_RESUME_NO_RECALL,
+    NUDGE_REQUIRED_TOOL,
+    TASK_NOTE_MAX,
+    TASK_TITLE_MAX,
     RepeatDetector,
     detect_completion,
     detect_correction,
     format_nudge,
+    sanitize_display,
     sanitize_payload,
     should_nudge,
+    task_too_long_message,
+    task_unrenderable_message,
 )
 from turnstone.core.model_turn import (
     ModelTurnResult,
@@ -142,6 +147,7 @@ from turnstone.core.nudge_queue import (
     QUIET_DRAIN,
     TOOL_DRAIN,
     USER_DRAIN,
+    WAKE_CHANNEL,
     WAKE_PENDING,
     Entry,
     NudgeQueue,
@@ -862,6 +868,16 @@ _LIST_NODES_RESERVED_ARGS: frozenset[str] = frozenset(
 _TASKS_READ_ACTIONS: frozenset[str] = frozenset({"list"})
 _TASKS_WRITE_ACTIONS: frozenset[str] = frozenset({"add", "update", "remove", "reorder"})
 
+# Per-field character budget for the tasks approval preview/header.  The
+# operator rules on the preview, so over-budget fields are cut with
+# ``honest_truncate``'s explicit marker, never a bare slice — a bare
+# ``[:60]`` reads as the whole argument, and with ``TASK_NOTE_MAX`` /
+# ``TASK_TITLE_MAX`` at 200 the half the operator never saw can be the
+# half naming the destructive option.  NOT ``judge.arg_budget_chars()``:
+# that is the judge-context budget (thousands of chars), which would make
+# the preview slice a no-op.
+_TASK_PREVIEW_FIELD_CHARS = 60
+
 # Matches resource paths referenced in skill content (scripts/foo.py, etc.)
 _RESOURCE_PATH_RE = re.compile(
     r"(?<![/\w-])(?:scripts|references|assets)/[\w./-]+\."
@@ -1415,6 +1431,10 @@ def _tool_turn_meta(
 # ---------------------------------------------------------------------------
 
 
+class BackendAuthUnavailableError(RuntimeError):
+    """A fail-closed dynamic model credential could not be resolved."""
+
+
 class ChatSession:
     # The mid-turn interjection queue's cap — an ALIAS of the shared
     # per-workstream backpressure bound (see workstream.PENDING_SENDS_MAX):
@@ -1714,6 +1734,9 @@ class ChatSession:
         #   - "any" entries drain at whichever seam fires first; used for
         #     wake-trigger-driven nudges that should not pin to a
         #     specific seam
+        #   - "wake" entries drain ONLY via ``deliver_wake_nudge_from_queue``
+        #     (the coordinator idle nudges); invisible to every other seam
+        #     and dropped — never demoted — on abandoned generations
         # Cooldown timestamps live separately in ``_metacog_state`` for
         # ``should_nudge`` gating.
         self._metacog_state: dict[str, float] = {}
@@ -1726,6 +1749,13 @@ class ChatSession:
         # correction nudges on top of it) and so the synthesized user
         # message gets stamped ``_source`` for audit / replay distinction.
         self._wake_source_tag: str = ""
+        # True between an abandoned generation (cancel / interrupt /
+        # fatal error) and the next real (non-wake) ``send`` — the
+        # liveness wake's own synthetic send leaves it set (see the
+        # clearing site in ``send()``).  Read by producers that must
+        # not treat the IDLE that such a path emits as an invitation
+        # to wake the workstream back up.
+        self._generation_abandoned: bool = False
         # Nudge entries pre-drained by ``deliver_wake_nudge_from_queue``
         # — handed to ``_emit_pending_user_nudges`` so the synthesized
         # send doesn't re-drain (and so we can bail out before send when
@@ -1736,6 +1766,13 @@ class ChatSession:
         # Queued user turns never carry attachments — see
         # ``AttachmentsNotQueueableError`` for the role-ordering reason —
         # so the entry tuple is just ``(cleaned, priority)``.
+        # Ids retracted while a dispatcher held the popped items — the
+        # DELETE route can land during the handoff's in-flight send, find
+        # the id already popped, and answer "already sent"; a restore
+        # that resurrected it would deliver a message the user explicitly
+        # cancelled.  Written under ``_queued_lock``; cleared at each pop
+        # (a new window) and consumed by the restore.
+        self._retracted_while_popped: set[str] = set()
         self._queued_messages: collections.OrderedDict[str, tuple[str, str]] = (
             collections.OrderedDict()
         )
@@ -1806,6 +1843,10 @@ class ChatSession:
         # _task_tools, no listeners, no resource/prompt catalogs, and the
         # refresh callbacks stay inert (they all guard on _mcp_client).
         # Task agents keep their native tools; only the MCP surface closes.
+        # Model authentication is host infrastructure, not an MCP tool-surface
+        # capability. Preserve the raw manager even when the persona gate hides
+        # MCP tools, resources, and prompts or a resume drops that surface.
+        self._mcp_mint_client = mcp_client
         self._mcp_client = mcp_client if self._persona_mcp else None
         # True when a real client was withheld by the persona gate (as
         # opposed to no MCP in the deployment at all).  Mid-session
@@ -1924,6 +1965,7 @@ class ChatSession:
                 always_on_names=builtin_in_session,
                 max_results=tool_search_max_results,
                 reranker=self._bm25_reranker(),
+                status_provider=self._mcp_status_snapshot,
             )
         # Converge with any MCP catalog change that fired during
         # construction: a listener callback landing between the
@@ -2975,12 +3017,34 @@ class ChatSession:
                 always_on_names=set(BUILTIN_TOOL_NAMES),
                 max_results=self._tool_search_max_results,
                 reranker=self._bm25_reranker(),
+                status_provider=self._mcp_status_snapshot,
             )
             # Restore previously expanded tools that still exist
             if old_expanded:
                 self._tool_search.expand_visible(old_expanded)
         else:
             self._tool_search = None
+
+    def _mcp_status_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Per-server MCP status for this session's user, consumed by
+        ``ToolSearchManager`` to flag unavailable servers in search results.
+
+        Scoped to the EFFECTIVE user — the acting participant on a shared
+        workstream — matching the ``get_tools`` call that builds the search
+        corpus. Owner-scoping here would render the owner's per-user pool
+        state (including their recorded discovery-failure text) into a
+        non-owner participant's search results.
+
+        Returns ``{}`` when no MCP client is bound or the lookup fails — the
+        advisory then simply stays silent rather than breaking tool search.
+        """
+        client = self._mcp_client
+        if client is None:
+            return {}
+        try:
+            return client.get_all_server_status(self._mcp_effective_user_id)
+        except Exception:
+            return {}
 
     def set_watch_runner(self, runner: Any, wake_fn: Callable[[], object] | None = None) -> None:
         """Inject the server-level WatchRunner and register a dispatch fn
@@ -3226,6 +3290,10 @@ class ChatSession:
         self._mcp_client = None
         self._set_session_tools([])
         self._render_agent_tool_descriptions()
+
+    def set_model_mint_client(self, client: MCPClientManager | None) -> None:
+        """Update the ungated model-auth manager after a runtime registry reload."""
+        self._mcp_mint_client = client
 
     def _handle_mcp_refresh(self, arg: str) -> None:
         """Handle ``/mcp refresh [server]``."""
@@ -3938,18 +4006,26 @@ class ChatSession:
             self._watch_runner.remove_dispatch_fn(old_ws_id, owner=old_fn)
 
     def _nudges_enabled(self, nudge_type: str) -> bool:
-        """Config gate + persona lever 4 for metacognitive nudges.
+        """Config gate + required-tool visibility for ADVICE nudges.
 
-        Memory-directed nudge types (``MEMORY_NUDGE_TYPES``) are suppressed
-        whenever the persona's envelope hides the memory tool — the lever
-        being off OR an allowlist that hides ``memory`` (a tool_search
-        expansion that re-adds it re-enables them) — because their copy
-        directs the model at that tool.  Every other nudge type passes
-        straight through to the config gate.
+        Tool-directed nudge types (``NUDGE_REQUIRED_TOOL`` — the memory
+        set plus ``idle_tasks``) are suppressed whenever the persona's
+        envelope hides the tool their copy names: the memory lever being
+        off OR an allowlist that hides the tool (a tool_search expansion
+        that re-adds it re-enables them).  A nudge instructing the model
+        at a tool it cannot see produces "I don't have access" apology
+        loops.  Types with no required tool pass straight through to the
+        config gate.
+
+        LIVENESS nudges never reach this method: ``idle_children`` (the
+        coordinator wake for active children) is deliberately not gated
+        on ``memory.nudges`` — see the classification ruling in
+        :mod:`turnstone.console.coordinator_idle_observer`.
         """
         if not self._mem_cfg.nudges:
             return False
-        return nudge_type not in MEMORY_NUDGE_TYPES or self._persona_tool_visible("memory")
+        required = NUDGE_REQUIRED_TOOL.get(nudge_type)
+        return required is None or self._persona_tool_visible(required)
 
     def _init_system_messages(self) -> None:
         """Build the system/developer prefix messages.
@@ -4518,12 +4594,17 @@ class ChatSession:
             return None
         from turnstone.core.perception import describe_cached, describe_peek
 
-        # Peek the (alias, content_hash) memo BEFORE building parts: for a PDF,
+        # Peek the (principal, alias, content_hash) memo BEFORE building parts: for a PDF,
         # _perception_parts rasterizes every page, but describe_cached returns a
         # memoized description without touching parts on a hit — so on a cross-send
         # hit the rasterize would be pure waste.
         content_hash = str(att.get("attachment_id"))
-        text = describe_peek(alias=alias, content_hash=content_hash)
+        principal_id = (self._mcp_effective_user_id or "").strip()
+        text = describe_peek(
+            principal_id=principal_id,
+            alias=alias,
+            content_hash=content_hash,
+        )
         if text is None:
             parts = self._perception_parts(att, kind)
             if not parts:
@@ -4532,6 +4613,7 @@ class ChatSession:
                 provider=provider,
                 client=client,
                 model=model,
+                principal_id=principal_id,
                 alias=alias,
                 content_hash=content_hash,
                 parts=parts,
@@ -4544,6 +4626,9 @@ class ChatSession:
                 registry=self._registry,
                 config_store=self._config_store,
                 capabilities=caps,
+                # The memo is partitioned by the same effective principal used
+                # by the resolver, so delegated output cannot cross users.
+                backend_auth_resolver=self._model_backend_auth_token,
             )
         if not text:
             return None
@@ -5140,6 +5225,7 @@ class ChatSession:
             registry=self._registry,
             capabilities=caps,
             config_store=self._config_store,
+            backend_auth_resolver=self._model_backend_auth_token,
         )
         result = model_turn(
             lane,
@@ -5375,10 +5461,14 @@ class ChatSession:
         tracker = self._get_health_tracker()
 
         try:
-            result = self._try_stream(self.client, self.model, msgs)
+            result = self._try_stream(self.client, self.model, msgs, model_alias=self._model_alias)
             if tracker:
                 tracker.record_success()
             return result
+        except BackendAuthUnavailableError:
+            # Explicit fail-closed policy: never reinterpret an authentication
+            # refusal as backend health and never route it to a static fallback.
+            raise
         except Exception as primary_err:
             if tracker:
                 tracker.record_failure()
@@ -5438,6 +5528,8 @@ class ChatSession:
             if fb_tracker:
                 fb_tracker.record_success()
             return result
+        except BackendAuthUnavailableError:
+            raise
         except Exception as fb_err:
             if fb_tracker:
                 fb_tracker.record_failure()
@@ -5486,6 +5578,14 @@ class ChatSession:
             role_counts,
         )
         msgs = self._maybe_attach_vllm_chat_reasoning(msgs, prov, model_alias)
+        # Dynamic backend auth: bind the minted token as the SDK client's
+        # api_key (with_options reuses the connection pool) so it becomes the
+        # provider's own credential header — extra_headers can't override the
+        # Anthropic SDK's x-api-key. None → the backend's static key stands.
+        # Resolved once, outside the retry loop.
+        backend_auth_token = self._model_backend_auth_token(model_alias or "")
+        if backend_auth_token:
+            client = client.with_options(api_key=backend_auth_token)
         last_err: Exception | None = None
         for attempt in range(self._MAX_RETRIES + 1):
             self._check_cancelled()
@@ -5970,6 +6070,109 @@ class ChatSession:
         """
         return self._acting_user_id or self._mcp_user_id
 
+    def _model_backend_auth_token(self, alias: str) -> str | None:
+        """Resolve the delegated-user or app-identity credential for *alias*.
+
+        The caller binds the returned token as the SDK client's ``api_key`` via
+        ``with_options``, which preserves the connection pool and lets each SDK
+        emit its native credential header. Header injection is deliberately not
+        used: Anthropic does not allow ``extra_headers`` to replace ``x-api-key``.
+
+        Every session-owned lane, including judge, output guard, and perception,
+        resolves through this same effective principal. ``entra_app`` remains an
+        explicit model-definition choice; it is never inferred from a missing
+        user or failed OBO mint.
+
+        A dynamic alias with no static key always fails closed rather than
+        issuing the SDK-construction placeholder. When a real static key exists,
+        mint failures retain that explicit fallback unless the operator enables
+        ``model.auth_fail_closed``. An ``entra_obo`` call with no user always
+        fails closed regardless of fallback policy.
+        """
+        registry = self._registry
+        if registry is None or not alias:
+            return None
+        try:
+            cfg = registry.get_config(alias)
+        except (KeyError, ValueError):
+            return None
+        mode = getattr(cfg, "auth_mode", "static")
+        if mode not in ("entra_obo", "entra_app") or not cfg.obo_audience:
+            return None
+        has_static_key = bool(getattr(cfg, "api_key", ""))
+        configured_fail_closed = bool(
+            self._config_store is not None and self._config_store.get("model.auth_fail_closed")
+        )
+        must_fail_closed = configured_fail_closed or not has_static_key
+        user_id = ""
+        if mode == "entra_obo":
+            user_id = (self._mcp_effective_user_id or "").strip()
+            if not user_id:
+                log.warning(
+                    "model_obo.no_user_context",
+                    alias=alias,
+                    audience=cfg.obo_audience,
+                    has_static_key=has_static_key,
+                )
+                raise BackendAuthUnavailableError(
+                    f"Delegated backend authentication has no user for model alias {alias!r}"
+                )
+        mcp = self._mcp_mint_client
+        if mcp is None:
+            log.warning(
+                "model_backend_auth.mint_client_unavailable",
+                alias=alias,
+                auth_mode=mode,
+                audience=cfg.obo_audience,
+                has_static_key=has_static_key,
+            )
+            if must_fail_closed:
+                raise BackendAuthUnavailableError(
+                    f"Dynamic backend authentication unavailable for model alias {alias!r}"
+                )
+            return None
+        if mode == "entra_app":
+            # App/managed identity via client-credentials — Turnstone's own SSO
+            # app reg. This is used only when the model definition explicitly
+            # selects entra_app; missing OBO context never switches grant modes.
+            # The gateway resolves it to one shared virtual account (no per-user
+            # attribution).
+            token = mcp.mint_app_token_sync(audience=cfg.obo_audience)
+            if not token:
+                log.warning(
+                    "model_app.fallback_to_static",
+                    alias=alias,
+                    audience=cfg.obo_audience,
+                    has_static_key=has_static_key,
+                )
+                if must_fail_closed:
+                    raise BackendAuthUnavailableError(
+                        f"App backend authentication unavailable for model alias {alias!r}"
+                    )
+                return None
+            return token
+        # entra_obo — per-user On-Behalf-Of.
+        token = mcp.mint_model_obo_token_sync(user_id=user_id, audience=cfg.obo_audience)
+        if not token:
+            # A user IS driving but the mint yielded nothing (no captured
+            # credential, decrypt failure, or the AS rejected the grant). Never
+            # silent: when the operator explicitly configured a static key and
+            # left fail-closed off, that key stands; a keyless alias raises below
+            # and can never issue its SDK-construction placeholder.
+            log.warning(
+                "model_obo.fallback_to_static",
+                alias=alias,
+                user_id=user_id,
+                audience=cfg.obo_audience,
+                has_static_key=has_static_key,
+            )
+            if must_fail_closed:
+                raise BackendAuthUnavailableError(
+                    f"Delegated backend authentication unavailable for model alias {alias!r}"
+                )
+            return None
+        return token
+
     def _history_scope_user_id(self) -> str | None:
         """Identity that scopes conversation-history reads (recall tool,
         ``/history``).
@@ -6100,6 +6303,20 @@ class ChatSession:
             self._budget_exhausted = False
             self._budget_warned = False
         self._notify_count = 0
+        # Cleared per REAL send: set by ``_drain_pending_advisories`` on
+        # every abandoned-generation path so the IDLE those paths emit
+        # can be told apart from an IDLE a turn reached under its own
+        # power.  A wake send must NOT clear it — the liveness wake
+        # fires on an abandoned generation by design, and letting its
+        # own synthetic ``send("", from_wake=True)`` erase the latch
+        # would hand the advice path the wake turn's terminal IDLE with
+        # the suppression gone: Stop would buy exactly the task-reminder
+        # resume it exists to prevent, one bracket late.  Same wake/real
+        # discrimination the observer's cap-reset path applies via
+        # ``_wake_source_tag``, expressed through ``from_wake`` because
+        # this chokepoint receives it directly.
+        if not from_wake:
+            self._generation_abandoned = False
         # Per-send cooperative-compaction latch: each send starts a fresh
         # advise→compact cycle, so reset here.  This single chokepoint covers
         # the cancel / error / superseded / resume / clear / new exits that
@@ -6834,8 +7051,36 @@ class ChatSession:
         a wake earned by a NEW event) without ever being the wake reason.
         Stale entries are handled at drain time by their ``valid_until``
         predicates.
+
+        ``"wake"``-channel entries (the coordinator idle nudges) are
+        DROPPED, not demoted.  The quiet demote's whole value is that the
+        entry still delivers at a user or tool seam — and delivering
+        there is exactly what this class may never do: an idle nudge
+        speaks about an IDLE state, and quiet delivery would land it on
+        a later real turn describing a moment that no longer exists.
+        Dropping an already-charged entry is the accepted fail-closed
+        cost — the same pricing as the observer's drain-predicate ruling,
+        where a charged fire dies rather than deliver on a claim that
+        can't be re-validated.  "Liveness survives operator Stop" means
+        the NEXT idle event fires fresh (the observer's Stop gate
+        suppresses only the advice class, and its caps/plans re-derive
+        over fresh reads) — NOT that a queued entry outlives the Stop
+        and re-wakes the workstream later.
+
+        Demoting is necessary but NOT sufficient, because the
+        ``_emit_state("idle")`` that follows fans out synchronously to
+        state subscribers — and a producer reacting to that IDLE can
+        enqueue a NEW wake-eligible entry after this demote has run,
+        re-arming the very wake the demote exists to disarm (the
+        ``IdleNudgeWatcher`` is itself a subscriber on the same fan-out,
+        so it sees the new entry before any later cleanup could reach
+        it).  The latch set here is how such producers tell this IDLE
+        apart from one a turn reached under its own power; it is cleared
+        at the top of the next real (non-wake) ``send`` — the rationale
+        lives at the clearing site.
         """
-        self._nudge_queue.clear_channels({"tool", "user"})
+        self._generation_abandoned = True
+        self._nudge_queue.clear_channels({"tool", "user", WAKE_CHANNEL})
         self._nudge_queue.demote_channel("any", QUIET_CHANNEL)
 
     def _synthesize_cancelled_results(self, reason: str) -> None:
@@ -7800,7 +8045,8 @@ class ChatSession:
     def _carry_budget_chars(self, carries: int = 1) -> int:
         """Per-carry char budget for content carried VERBATIM across a
         compaction — the continuation hint's quote of the user's last
-        message, and the wind-down spill.
+        message, the wind-down spill, and (coordinators only) the
+        ``## Handles`` block.
 
         A quarter of the window per carry, clamped so ALL concurrent carries
         fit what the window spares after the summary output reserve AND the
@@ -8091,6 +8337,198 @@ class ChatSession:
                         raise _CompactionIrreducibleError from e2
                     budget = max(self._MIN_SUMMARY_BUDGET_CHARS, budget // 2)
 
+    # -- Coordinator handles across a compaction --------------------------------
+    #
+    # A handle is an id PAIRED with what it refers to: a task id with its title
+    # and status, a child workstream id with what that child is called and what
+    # state it is in.  Both halves are load-bearing — an id with no meaning can't
+    # be used, a meaning with no id can't be acted on — and the pairing lived only
+    # in the transcript, which compaction replaces.  A summary optimising for
+    # density drops bare hex ids as noise, and a coordinator that loses the
+    # pairing can neither update its own tasks nor collect a finished child's
+    # results.  It is exactly the coordinator most likely to be idle holding
+    # unfinished work.
+    #
+    # The harness holds both halves, so the harness writes them.  The compactor
+    # prompts are IDENTICAL for both session kinds and say nothing about handles:
+    # asking the summarizer to transcribe ids would spend attention budget to get
+    # a strictly worse answer (a model-copied id is fallible, and a section the
+    # model invents can contradict the one storage would have rendered).  Same
+    # lowering rule the idle-tasks nudge follows — what the controller knows, the
+    # controller states, rather than paying a round-trip to have the plant fetch
+    # it back.
+    #
+    # Complementary to that nudge, not redundant with it.  The nudge is
+    # ids-and-statuses only, deliberately carrying no titles because "the
+    # association an id needs is already in its transcript" — the premise
+    # compaction breaks.  This block is where the association survives; the nudge
+    # remains the authoritative LIVE SET at wake time, read fresh.  Both read the
+    # same storage, so neither is a cache of the other.
+    #
+    # Interactive sessions have neither a task envelope nor children: both reads
+    # are skipped and nothing is appended, so their compaction output is byte for
+    # byte what it was.
+    _HANDLES_HEADING = "\n\n## Handles\n"
+    _HANDLES_PROVENANCE = (
+        "Read from storage at compaction time, not carried over from the summary "
+        "above — these ids are exact.\n"
+    )
+    _HANDLES_TASKS_MORE = "  … and {n} more — call `tasks(action='list')` for the full list.\n"
+    _HANDLES_CHILDREN_MORE = "  … and {n} more — call `list_workstreams` for the full list.\n"
+
+    def _coordinator_handle_rows(self) -> tuple[list[str], list[str]]:
+        """Render this coordinator's handles as ``(task_lines, child_lines)``.
+
+        ``([], [])`` whenever there can be no handles — an interactive session
+        (no task envelope, no children), a coordinator with no coord client
+        (eval / rehydration shells), or both reads coming back empty.
+
+        Both reads are same-process storage reads on the worker thread that is
+        already running the compaction (``tasks_get`` decodes the workstream's
+        config row; ``list_children`` is a single ``list_workstreams`` query), so
+        this costs no round-trip and no lock the tool path doesn't already take.
+
+        NEVER raises.  A failed read costs this block's precision, never the
+        compaction: the summary is correct without it, and trading a whole
+        history swap for a side read would be the worse failure by far.  Same
+        isolation the idle observer's children probe keeps.
+
+        Sanitiser ruling, one oracle for the whole block — ``sanitize_display``:
+
+        * Model-authored text (titles, notes, child names) is sanitised.  The
+          control class is what this render actually needs: these are single-line
+          list rows, and a newline inside a title would forge a sibling row the
+          model then reads as a real task.  That class is identical in both
+          sanitisers, so nothing about the structural guarantee turns on the
+          choice.  The guarantee is exactly that — STRUCTURAL, one row per real
+          handle.  A title can still mention an id-shaped string inline, which is
+          left alone because it fails safe: an id no envelope holds resolves to
+          "not found", never to another row.
+        * Angle brackets are KEPT, which is the whole difference from
+          ``sanitize_name``.  Deleting them silently rewrites ordinary planning
+          text ("cut p99 to <200ms" → "cut p99 to 200ms"), inverting a constraint
+          the coordinator is working to — and it would buy nothing here: these
+          titles are the coordinator's own, and already reach this same model
+          verbatim through its own ``tasks(action='list')`` results on this same
+          assistant channel.  The nudge bodies delete brackets because they are
+          interpolated into a SYSTEM turn; this block is not.
+        * Ids take the sanitiser as an ALTERATION CHECK rather than a filter: a
+          row whose id would be altered is DROPPED, never mangled, because a
+          mangled id renders a handle that cannot resolve — worse than an absent
+          one.  Task ids are server-minted (``tsk_`` + token_hex) but read back
+          out of a JSON blob a hand-edited DB can leave ragged; ws_ids are
+          primary keys and can't be ragged, but they take the same check so the
+          block has one rule rather than two.
+        """
+        if self._kind != WorkstreamKind.COORDINATOR or self._coord_client is None:
+            return [], []
+
+        def _clean(value: Any) -> str:
+            return sanitize_display(str(value or "").strip())
+
+        def _id(value: Any) -> str:
+            """The alteration check: '' for an id that isn't usable as-is."""
+            raw = str(value or "").strip()
+            return raw if raw and sanitize_display(raw) == raw else ""
+
+        task_lines: list[str] = []
+        child_lines: list[str] = []
+        try:
+            envelope = self._coord_client.tasks_get(self._ws_id)
+            for task in envelope.get("tasks", []):
+                if not isinstance(task, dict):
+                    continue
+                task_id = _id(task.get("id"))
+                if not task_id:
+                    continue
+                line = f"- `{task_id}` [{_clean(task.get('status')) or 'unknown'}] "
+                line += _clean(task.get("title"))
+                child_ws_id = _id(task.get("child_ws_id"))
+                if child_ws_id:
+                    line += f" → child `{child_ws_id}`"
+                note = _clean(task.get("note"))
+                if note:
+                    line += f" (note: {note})"
+                task_lines.append(line + "\n")
+        except Exception:
+            log.warning("compaction.handles_read_failed", source="tasks", exc_info=True)
+        try:
+            children = self._coord_client.list_children(self._ws_id).get("children", [])
+            for child in children:
+                if not isinstance(child, dict):
+                    continue
+                ws_id = _id(child.get("ws_id"))
+                if not ws_id:
+                    continue
+                state = _clean(child.get("state")) or "unknown"
+                child_lines.append(f"- `{ws_id}` [{state}] {_clean(child.get('name'))}\n")
+        except Exception:
+            log.warning("compaction.handles_read_failed", source="children", exc_info=True)
+        return task_lines, child_lines
+
+    @staticmethod
+    def _fit_handle_rows(heading: str, rows: list[str], budget: int, more: str) -> str:
+        """One handles section, fitted to ``budget`` chars — never mid-row.
+
+        Rows are whole handles, so truncation drops them at their boundary and
+        names how many went: cutting head+tail through a list the way
+        :meth:`_truncate_block` does would leave a half-copied id, which is worse
+        than an absent one (it renders a call that can't resolve).  ``more``
+        formats the count with an authoritative-source pointer, so the block is
+        never the last word on what exists.
+
+        The returned text is always ``<= budget`` (``""`` when even the heading
+        plus pointer won't fit): each kept row was admitted only after the
+        pointer covering everything still behind it was accounted for.
+        """
+        if not rows or budget <= 0:
+            return ""
+        kept: list[str] = []
+        used = len(heading)
+        for i, row in enumerate(rows):
+            behind = len(rows) - (i + 1)
+            pointer = more.format(n=behind) if behind else ""
+            if used + len(row) + len(pointer) > budget:
+                break
+            kept.append(row)
+            used += len(row)
+        dropped = len(rows) - len(kept)
+        if not kept:
+            pointer = more.format(n=dropped)
+            return heading + pointer if len(heading) + len(pointer) <= budget else ""
+        return heading + "".join(kept) + (more.format(n=dropped) if dropped else "")
+
+    def _render_handles_block(
+        self, task_lines: list[str], child_lines: list[str], budget: int
+    ) -> str:
+        """Assemble the ``## Handles`` block within ``budget`` chars.
+
+        Tasks are served first — the coordinator's own plan, and the only place
+        the id→title pairing survives at all — but children are reserved up to
+        half the room so a long task list can't starve them off the page; what
+        they don't need goes back to the tasks.  Headings carry the TOTAL count,
+        so a truncated section still tells the model how much it isn't seeing.
+        """
+        prefix = self._HANDLES_HEADING + self._HANDLES_PROVENANCE
+        spare = budget - len(prefix)
+        if spare <= 0:
+            return ""
+        child_heading = f"\nChild workstreams ({len(child_lines)}):\n"
+        child_full = len(child_heading) + sum(len(line) for line in child_lines)
+        reserved = min(child_full, spare // 2) if child_lines else 0
+        tasks = self._fit_handle_rows(
+            f"\nTasks ({len(task_lines)}):\n",
+            task_lines,
+            spare - reserved,
+            self._HANDLES_TASKS_MORE,
+        )
+        children = self._fit_handle_rows(
+            child_heading, child_lines, spare - len(tasks), self._HANDLES_CHILDREN_MORE
+        )
+        if not tasks and not children:
+            return ""
+        return prefix + tasks + children
+
     def _compact_messages(
         self,
         auto: bool = False,
@@ -8320,6 +8758,12 @@ class ChatSession:
         record, and the plan must cross a compaction copied, not paraphrased —
         the summarizer also reads the spill, but its paraphrase must not be
         the only survivor.
+
+        A coordinator additionally gets a ``## Handles`` block appended by the
+        same shell concatenation — its task and child-workstream ids paired with
+        what they refer to, read from storage here rather than transcribed by the
+        summarizer (:meth:`_coordinator_handle_rows`).  Interactive sessions have
+        no handles and get nothing.
         """
         # Presentation label derived from the one semantic flag — deriving
         # locally makes an auto=True/trigger="manual" drift impossible.
@@ -8413,11 +8857,25 @@ class ChatSession:
             spill = to_summarize[-1]
             if spill.role is Role.ASSISTANT:
                 spill_text = (spill.text or "").strip()
-        carries = (1 if spill_text else 0) + (1 if last_user_content else 0)
+
+        # The coordinator's handles are the third carry.  They land in the same
+        # post-compaction prompt as the other two, so they take a share of the
+        # same budget rather than a private one — a block sized outside that
+        # split is the same stacking the spill/hint pair was sized to prevent.
+        # Read BEFORE the count so the count and the render see one answer: a
+        # block that exists but wasn't counted is precisely the under-count the
+        # shared budget exists to make impossible.
+        task_lines, child_lines = self._coordinator_handle_rows()
+        handles = bool(task_lines or child_lines)
+        carries = (1 if spill_text else 0) + (1 if last_user_content else 0) + (1 if handles else 0)
         carry_budget = self._carry_budget_chars(carries) if carries else 0
 
-        # Wind-down first, then how to resume — the summary reads: sections,
+        # Handles first (state the harness knows exactly), then wind-down, then
+        # how to resume — the summary reads: sections, the ids still in play,
         # what the model recorded, then the ask to continue from.
+        if handles:
+            summary += self._render_handles_block(task_lines, child_lines, carry_budget)
+
         carry_truncated = False
         if spill_text:
             carry_truncated = len(spill_text) > carry_budget
@@ -8591,6 +9049,9 @@ class ChatSession:
                 session_model_alias=self._model_alias or "",
                 # For the temperature ladder's global rung (model.temperature).
                 config_store=self._config_store,
+                # The verdict belongs to this turn and carries the same acting
+                # principal as the model/tool activity it evaluates.
+                backend_auth_resolver=self._model_backend_auth_token,
             )
         except Exception:
             log.warning("judge.init_failed", exc_info=True)
@@ -8628,6 +9089,7 @@ class ChatSession:
                 session_model_alias=self._model_alias or "",
                 # For the temperature ladder's global rung (model.temperature).
                 config_store=self._config_store,
+                backend_auth_resolver=self._model_backend_auth_token,
             )
         except Exception:
             log.warning("output_guard_judge.init_failed", exc_info=True)
@@ -8952,6 +9414,22 @@ class ChatSession:
                         fa_tasks["status"] = it.get("status")
                     if "child_ws_id" in it:
                         fa_tasks["child_ws_id"] = it.get("child_ws_id")
+                    if "note" in it:
+                        # Free text the model authored — the judge must see
+                        # it or it rules on a mutation whose payload is
+                        # hidden from it.  Follows ``child_ws_id``, NOT
+                        # ``title``: a ``None`` passes through as-is so it
+                        # honestly reads as "unchanged", because unlike a
+                        # title an empty note is a legal value (it clears
+                        # the field).  Collapsing ``None`` to ``""`` here
+                        # would show the judge a clear that was never
+                        # requested.  Truncate only an actual string.
+                        note_val = it.get("note")
+                        fa_tasks["note"] = (
+                            honest_truncate(note_val, arg_budget)
+                            if isinstance(note_val, str)
+                            else note_val
+                        )
                 it["func_args"] = fa_tasks
             elif name == "read_resource":
                 # Gated MCP resource read.  The URI is the risk surface
@@ -9474,9 +9952,20 @@ class ChatSession:
         return cleaned, priority, msg_id
 
     def dequeue_message(self, msg_id: str) -> bool:
-        """Remove a queued message by ID.  Returns True if removed."""
+        """Remove a queued message by ID.  Returns True if removed.
+
+        A miss is RECORDED, not just reported: during the wake handoff's
+        in-flight send the items live in the dispatcher's hands, so the
+        user's retraction cannot reach the queue — the ledger lets a
+        failure-path restore honour it instead of resurrecting a message
+        the user cancelled.  (A miss for an id that was simply already
+        delivered records harmlessly: the ledger is cleared at each pop
+        and consulted only by the restore.)
+        """
         with self._queued_lock:
             popped = self._queued_messages.pop(msg_id, None)
+            if popped is None:
+                self._retracted_while_popped.add(msg_id)
         return popped is not None
 
     def flush_queued_messages(self) -> bool:
@@ -9563,14 +10052,7 @@ class ChatSession:
         Returns ``True`` when any user row was appended (prefix or
         items), ``False`` when both were empty.
         """
-        from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
-
-        with self._queued_lock:
-            items = list(self._queued_messages.values())
-            self._queued_messages.clear()
-        queued_text = "\n\n".join(
-            f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg for msg, pri in items
-        )
+        queued_text = self._pop_queued_messages_text()
         if not queued_text and not prefix:
             return False
 
@@ -9582,6 +10064,70 @@ class ChatSession:
             content = queued_text
         self._append_user_turn(content, ())
         return True
+
+    def _pop_queued_messages(self) -> dict[str, tuple[str, str]]:
+        """Atomically drain ``_queued_messages``, returning the raw items.
+
+        The pop happens under ``_queued_lock`` and is destructive: the
+        caller owns delivery of whatever comes back, and a caller whose
+        delivery can fail restores the SAME mapping via
+        :meth:`_restore_queued_messages` — ids and priorities intact, so
+        the queued-id / send-id correspondence the delete route and the
+        pending rows rely on survives a failed dispatch.
+        """
+        with self._queued_lock:
+            items = dict(self._queued_messages)
+            self._queued_messages.clear()
+            self._retracted_while_popped.clear()
+        return items
+
+    def _restore_queued_messages(self, items: dict[str, tuple[str, str]]) -> None:
+        """Put popped items back at the FRONT of ``_queued_messages``.
+
+        The undo half of :meth:`_pop_queued_messages`, for a dispatcher
+        whose delivery failed before any turn was appended.  Restores
+        unconditionally — the items were already admitted, so
+        ``_QUEUE_MAX`` (an admission gate, not a storage invariant) does
+        not re-apply — and ahead of anything queued meanwhile, keeping
+        arrival order.
+        """
+        with self._queued_lock:
+            merged = {
+                mid: row for mid, row in items.items() if mid not in self._retracted_while_popped
+            }
+            merged.update(self._queued_messages)
+            self._queued_messages.clear()
+            self._queued_messages.update(merged)
+            self._retracted_while_popped.clear()
+
+    @staticmethod
+    def _render_queued_messages(items: dict[str, tuple[str, str]]) -> str:
+        """The one rendering of popped interjection items as USER-turn
+        content — ``[IMPORTANT]``-prefixed per item priority, items
+        joined by blank lines — shared by :meth:`_flush_queued_messages`
+        (the in-send flush seams) and the wake path's interjection
+        handoff in :meth:`deliver_wake_nudge_from_queue`, so the two
+        dispatch shapes cannot drift.
+
+        Content-free items are SKIPPED, mirroring ``_collect_advisories``:
+        a priority prefix with nothing behind it (a bare ``!!!``) must
+        not become a turn — rendered alone it would read as a truthy
+        ``"[IMPORTANT] "`` and buy a content-free user turn.  Returns
+        ``""`` when nothing renderable was queued.
+        """
+        from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
+
+        return "\n\n".join(
+            f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg
+            for msg, pri in items.values()
+            if msg.strip()
+        )
+
+    def _pop_queued_messages_text(self) -> str:
+        """Pop-and-render in one step, for the flush seams whose delivery
+        cannot fail between pop and append (:meth:`_flush_queued_messages`
+        appends the turn immediately)."""
+        return self._render_queued_messages(self._pop_queued_messages())
 
     def _collect_advisories(
         self,
@@ -11668,8 +12214,10 @@ class ChatSession:
         """Drain user-channel nudges from :class:`NudgeQueue` and append each
         as a first-class operator-context ``system`` turn AFTER the user turn.
 
-        Drains entries whose ``channel`` is in ``{"user", "any"}``;
-        ``"tool"`` entries stay queued for the next tool-result batch.
+        Drains entries whose ``channel`` is in :data:`USER_DRAIN`
+        (``{"user", "any", "quiet"}``); ``"tool"`` entries stay queued for
+        the next tool-result batch, and ``"wake"`` entries stay for the
+        idle wake — the one seam allowed to deliver them.
 
         Called by ``send`` immediately after :meth:`_append_user_turn`, so
         the system turns sit after the user turn they advise (uniform attach
@@ -11738,7 +12286,7 @@ class ChatSession:
         self._nudge_queue.enqueue(nudge_type, text, "tool")
 
     def deliver_wake_nudge_from_queue(self) -> None:
-        """Drive a synthetic empty user turn so any-channel nudges drain.
+        """Drive a synthetic empty user turn so wake-eligible nudges drain.
 
         The standard pipeline does the rendering: the ``send("")`` we
         trigger lands at ``_append_user_turn`` (which stamps
@@ -11765,7 +12313,7 @@ class ChatSession:
         Drains the queue inline (running every entry's ``valid_until``
         predicate) BEFORE synthesizing the empty user turn — bails if
         no entry survives the predicate check.  Without this, the
-        watcher's ``len(queue)`` peek can succeed on entries whose
+        watcher's ``has_pending`` peek can succeed on entries whose
         predicate later drops them inside ``_emit_pending_user_nudges``'s
         drain, leaving us synthesizing an empty user turn with no nudge
         context (and risking provider rejection of empty user content).
@@ -11774,7 +12322,124 @@ class ChatSession:
         inside ``send``.  System turns are persistent (not one-shot), so a
         post-retry stream failure leaves them in place — operator
         intervention is required for the underlying failure anyway.
+
+        A queued user interjection OWNS the idle seam: when
+        ``_queued_messages`` is non-empty at wake time, the synthetic
+        wake turn yields to it — the wake-only idle nudges are dropped
+        and the interjection runs as a genuine user send instead.  See
+        the branch below for the mechanics and for why the check lives
+        HERE rather than at the watcher's gate.
         """
+        # INTERJECTION-OWNS-THE-SEAM.  A non-empty ``_queued_messages``
+        # means a user message is waiting for this exact slot: the model
+        # is idle, a worker (this one) owns the workstream, and the next
+        # turn is about to be spent.  Spending it on a self-addressed
+        # idle reminder while the user's words wait in a queue would be
+        # exactly backwards, so the wake yields:
+        #
+        # * The wake-only idle nudges are DROPPED, not deferred: their
+        #   channel may never ride a user/tool seam, and leaving them
+        #   queued would re-arm the wake gate at this worker's exit
+        #   backstop — delivering them seconds after the user's turn,
+        #   over reads that predate it.  The next genuine idle bracket
+        #   re-derives them over fresh reads: the interjection send is a
+        #   real (non-wake) send, so it clears ``_generation_abandoned``,
+        #   and its leave-IDLE fires the observer's cap reset (no
+        #   ``_wake_source_tag`` — the tag is deliberately NOT set on
+        #   this branch, so the turn counts as genuine everywhere).
+        # * ``"user"``/``"any"``/``"quiet"`` entries are NOT touched:
+        #   the interjection send is a legitimate user seam, and its own
+        #   ``_emit_pending_user_nudges`` drain delivers them right
+        #   after the user turn — better placed than on a synthetic
+        #   empty one.
+        # * The dispatch is ``send(text)``, never ``send("")`` + flush:
+        #   ``send("")`` with a queued interjection appends an EMPTY
+        #   untagged user turn, answers it, and only then flushes the
+        #   queued text as a second user turn — one assistant turn late,
+        #   with a bogus empty user row in history.  Popping first and
+        #   sending the popped text runs the same worker-thread path a
+        #   real send takes and yields exactly one user turn carrying
+        #   the interjection.
+        #
+        # The check lives here — not at ``wake_workstream_if_pending`` —
+        # because this method runs ON the worker thread that owns the
+        # workstream slot, so it can legally run the full send; the
+        # watcher's gate runs on the state-transition thread and can only
+        # spawn-or-skip, and skipping there would strand the interjection
+        # with no consumer (nothing re-checks ``_queued_messages`` while
+        # idle).  A message queued AFTER this pop lands mid-send and
+        # rides the send's ordinary flush seams — the pre-existing
+        # mid-turn interjection behaviour of every send.
+        #
+        # ``_budget_exhausted`` is checked BEFORE the pop: on that latch
+        # ``send`` refuses without appending a turn unless a human
+        # approves the override, and a wake is unattended — popping
+        # first would destroy the message on a refusal that raises
+        # nothing.  Skipping the branch (no pop) leaves the interjection
+        # queued for the user's next real send, where the approval
+        # prompt has someone in front of it, and falls through to the
+        # wake drain so this worker's exit keeps its convergence.
+        if not self._budget_exhausted:
+            popped = self._pop_queued_messages()
+            interjection = self._render_queued_messages(popped)
+            if interjection:
+                dropped = self._nudge_queue.clear_channels({WAKE_CHANNEL})
+                log.info(
+                    "wake_nudge.interjection_owns_seam ws=%s dropped_wake_nudges=%d",
+                    self._ws_id[:8],
+                    dropped,
+                )
+                appended_before = len(self.messages)
+                try:
+                    self.send(interjection)
+                except GenerationCancelled:
+                    # Same containment as the wake send below: this
+                    # method IS the wake worker's run() closure and
+                    # ``session_worker`` catches only ``Exception``.
+                    # Deliberately NO restore on this arm: a cancel here
+                    # is the operator's Stop, and re-arming their
+                    # pre-Stop words for a later seam would deliver a
+                    # message the Stop may have been meant to overtake.
+                    log.info("wake_nudge.interjection_cancelled ws=%s", self._ws_id[:8])
+                except BaseException:
+                    # A non-cancel escape can happen on either side of
+                    # the user-turn append: send's PREAMBLE can raise
+                    # before anything reached history (the popped items
+                    # would be destroyed with only a log line), but
+                    # send's LATE handlers re-raise after the turn was
+                    # appended AND persisted — restoring there would
+                    # deliver the user's words twice at the next flush
+                    # seam.  The length snapshot is the discriminator:
+                    # restore only when nothing was appended.  (A
+                    # mid-send compaction rewrites the list and could
+                    # coincidentally match the old length; compaction
+                    # implies the turn appended, so that corner
+                    # restores a duplicate — accepted as vanishingly
+                    # rare against the common preamble-loss case.)
+                    #
+                    # The wake entries stay dropped on this arm — caps
+                    # charged, nothing delivered, the accepted
+                    # fail-closed drop — and re-queueing them would
+                    # re-arm the worker-exit wake retry into a hot
+                    # loop against a persistently failing send.  The
+                    # restored interjection's re-arm is the user's next
+                    # send (its flush seams deliver the restored
+                    # items); a worker-exit re-check of the interjection
+                    # queue would close that window structurally.
+                    if len(self.messages) == appended_before:
+                        self._restore_queued_messages(popped)
+                    raise
+                return
+            if popped:
+                # Everything queued was content-free (a bare priority
+                # marker) — nothing to dispatch, nothing worth a turn.
+                # Fall through to the normal wake drain below.
+                log.info(
+                    "wake_nudge.interjection_empty ws=%s discarded=%d",
+                    self._ws_id[:8],
+                    len(popped),
+                )
+
         # Two-pass drain: wake-eligible channels first.  ``"quiet"`` entries
         # (external events demoted by a user cancel) ride a wake earned by
         # others but never justify one — if every wake-eligible candidate
@@ -11784,6 +12449,9 @@ class ChatSession:
         # batch is re-sorted by queue insertion ``seq`` so cross-channel
         # chronology survives the two passes (a demoted poll-4 fire must
         # not render after the poll-5 fire that earned the wake).
+        # ``WAKE_PENDING`` includes the wake-only ``"wake"`` channel, so
+        # the idle nudges join this first pass — the wake is the single
+        # seam that may deliver them.
         drained = self._nudge_queue.drain_entries(WAKE_PENDING)
         if not drained:
             return
@@ -11833,16 +12501,24 @@ class ChatSession:
                 # send failure would respawn wake workers in an unbounded
                 # hot loop (persisting an orphan synthetic user turn per
                 # spin).  Losing a generation-scoped metacog hint on a
-                # rare failed wake is the strictly smaller harm.
+                # rare failed wake is the strictly smaller harm.  A
+                # ``"wake"``-channel idle nudge is DROPPED for the union
+                # of both reasons: quiet would deliver it at the user/tool
+                # seams its channel exists to be invisible to, and
+                # re-queueing it wake-eligible is the same hot loop as the
+                # ``"user"`` case.  Dropping a charged entry is this
+                # class's standing fail-closed price; the next genuine
+                # idle bracket re-derives it over fresh reads.
                 for reminder in undelivered:
                     recovered = entry_by_reminder.get(id(reminder))
                     if recovered is None or not recovered.text:
                         continue
-                    if recovered.channel == "user":
+                    if recovered.channel in ("user", WAKE_CHANNEL):
                         log.debug(
-                            "wake_nudge.user_advisory_dropped ws=%s type=%s",
+                            "wake_nudge.advisory_dropped ws=%s type=%s channel=%s",
                             self._ws_id[:8],
                             recovered.nudge_type,
+                            recovered.channel,
                         )
                         continue
                     self._nudge_queue.requeue(recovered, channel=QUIET_CHANNEL)
@@ -14124,11 +14800,84 @@ class ChatSession:
             "execute": self._exec_tasks,
             "action": action,
         }
+
+        # Deferred import shared by every mutating branch below — ONE site,
+        # above the branches, so per-branch copies cannot drift.  Deferred
+        # to keep ``judge`` (and its provider-client dependencies) off this
+        # module's import cost until a tasks mutation actually needs a
+        # preview; NOT a cycle guard — no judge<->session import cycle
+        # exists at HEAD.
+        from turnstone.core.judge import honest_truncate
+
+        def _pf(value: str) -> str:
+            """Preview-field render for the approval surface.
+
+            EVERY model-controlled string on the header/preview goes
+            through here — ``task_id``/``status``/``child_ws_id``/reorder
+            ids included, not just free text: a newline in ``task_id``
+            forges an extra header line in the channel formatter and in
+            ``buildConvCmd``'s line-classified command view, and a bidi
+            override reorders the decision the operator reads.
+
+            ``sanitize_display``, not ``sanitize_name``: this is an
+            OPERATOR surface, so angle brackets are kept — the operator
+            must approve the text that will be stored, and a title of
+            "cut p99 latency to <200ms" previewed as "...to 200ms" asked
+            them to approve the opposite constraint.  A non-empty value
+            that sanitises to nothing (all control/zero-width/bidi) still
+            renders an explicit marker.  Keep that marker
+            angle-bracket-free: brackets now arrive here from model text
+            unchanged, so a ``<unrenderable>``-shaped marker would read
+            as one more model-authored title.  It must never collapse to
+            ``""`` either, or it collides with the ``'-'`` explicit-clear
+            convention and vanishes from the surface the operator rules
+            on.
+            """
+            display = honest_truncate(sanitize_display(value), _TASK_PREVIEW_FIELD_CHARS)
+            if value and not display:
+                return f"[unrenderable: {len(value)} chars]"
+            return display
+
+        def _unrenderable(prefix: str, field: str, raw: str) -> dict[str, Any]:
+            """Reject-with-hint for stored text that sanitises to nothing.
+
+            The gate that decides is ``coordinator_client``'s; this early
+            refusal spares the operator an approval card for a call that
+            cannot land, and is the one the model ALWAYS hits first.  The
+            sentence is therefore not restated — it comes from
+            ``task_unrenderable_message``, which the write path reads too
+            — and only the action prefix is added here, so a batched
+            update names the row that failed.  Held as two literals, a
+            one-sided narrowing told the model two different reasons for
+            one refusal depending on which layer it reached.
+            """
+            return self._coord_tool_error(
+                call_id,
+                "tasks",
+                f"{prefix}: {task_unrenderable_message(field, len(raw))}",
+            )
+
+        def _too_long(prefix: str, field: str, length: int, cap: int) -> dict[str, Any]:
+            """Reject-with-hint for an over-cap task field.
+
+            Same shape and the same reason as ``_unrenderable`` above:
+            the write path's gate decides, this one refuses early, and
+            the wording comes from ``task_too_long_message`` rather than
+            a second literal.  Both layers read the caps from
+            ``turnstone.core.metacognition`` too, so they cannot disagree
+            about the number either.
+            """
+            return self._coord_tool_error(
+                call_id,
+                "tasks",
+                f"{prefix}: {task_too_long_message(field, length, cap)}",
+            )
+
         if action == "add":
             # Reject non-string title / status / child_ws_id up front so
             # a malformed model call (``title=42``) produces a clean tool
             # error rather than an AttributeError during ``.strip()``.
-            for field_name in ("title", "status", "child_ws_id"):
+            for field_name in ("title", "status", "child_ws_id", "note"):
                 raw = args.get(field_name)
                 if raw is not None and not isinstance(raw, str):
                     return self._coord_tool_error(
@@ -14139,11 +14888,59 @@ class ChatSession:
                 return self._coord_tool_error(call_id, "tasks", "add: title is required")
             status = self._coord_str_arg(args, "status", "pending").strip() or "pending"
             child_ws_id = self._coord_str_arg(args, "child_ws_id").strip()
-            item["header"] = f"\u2699 tasks add: {title[:60]}"
-            item["preview"] = f"status={status} child_ws_id={child_ws_id or '-'}"
+            note = self._coord_str_arg(args, "note").strip()
+            # Over-cap fields are refused here for the same reason the
+            # unrenderable ones below are: ``tasks_add`` will refuse them,
+            # so an approval card for one costs the operator a decision on
+            # a call that cannot land.  LENGTH BEFORE RENDERABILITY, on
+            # the stripped value — the write path's per-field masking
+            # order, so a 250-char run of zero-widths hears "too long" at
+            # BOTH layers instead of "unrenderable" here and "too long"
+            # there.  NOT gated: ``child_ws_id``.  The write path has no
+            # length cap for it, and gating it here alone would build the
+            # reverse split — prepare refusing what the write path stores
+            # — which is the divergence class this early copy exists to
+            # remove.
+            if len(title) > TASK_TITLE_MAX:
+                return _too_long("add", "title", len(title), TASK_TITLE_MAX)
+            if len(note) > TASK_NOTE_MAX:
+                return _too_long("add", "note", len(note), TASK_NOTE_MAX)
+            # Reject-with-hint for text that sanitises to NOTHING — the
+            # genuinely-invisible class only (control chars, zero-width
+            # runs, bidi overrides, tag chars): stored verbatim it would
+            # render on no operator surface while ``tasks(list)`` feeds
+            # it back to the model every call — the write path
+            # (``tasks_add``) rejects it authoritatively too; this early
+            # copy spares the operator an approval card for a call that
+            # cannot land.  The oracle is ``sanitize_display``, the same
+            # function both copies use, so a title of "<>" is storable
+            # (it renders) and prepare and write can never disagree about
+            # what is renderable.
+            if not sanitize_display(title):
+                return _unrenderable("add", "title", title)
+            if note and not sanitize_display(note):
+                return _unrenderable("add", "note", note)
+            # The approval preview reads the RAW tool args, before any
+            # write, so the storage-side sanitiser never sees these
+            # bytes.  The operator rules on this string — a bidi
+            # override or zero-width run here renders them a decision
+            # different from the one they are approving.  Render every
+            # model-controlled field through ``_pf``; ``item[...]`` stays
+            # raw so ``_exec_tasks`` still hands the write path what the
+            # model actually sent.
+            item["header"] = f"\u2699 tasks add: {_pf(title)}"
+            # The note rides the preview because it is the operator-facing
+            # payload of the mutation — approving a ``needs_user`` task
+            # without seeing what the coordinator is asking for defeats the
+            # point of the approval.
+            add_bits = [f"status={_pf(status)}", f"child_ws_id={_pf(child_ws_id) or '-'}"]
+            if note:
+                add_bits.append(f"note={_pf(note)}")
+            item["preview"] = " ".join(add_bits)
             item["title"] = title
             item["status"] = status
             item["child_ws_id"] = child_ws_id
+            item["note"] = note
         elif action == "update":
             task_id = self._coord_str_arg(args, "task_id").strip()
             if not task_id:
@@ -14158,10 +14955,12 @@ class ChatSession:
             upd_title: Any = args.get("title")
             upd_status: Any = args.get("status")
             upd_child: Any = args.get("child_ws_id")
+            upd_note: Any = args.get("note")
             for field_name, field_val in (
                 ("title", upd_title),
                 ("status", upd_status),
                 ("child_ws_id", upd_child),
+                ("note", upd_note),
             ):
                 if field_val is not None and not isinstance(field_val, str):
                     return self._coord_tool_error(
@@ -14169,30 +14968,107 @@ class ChatSession:
                         "tasks",
                         f"update: {field_name} must be a string",
                     )
-            if upd_title is None and upd_status is None and upd_child is None:
+            # ``note`` counts toward "something to update" — a note-only
+            # update (recording what the coordinator needs from the
+            # operator without touching status) is a legitimate call, and
+            # omitting it here would reject the exact shape the idle-tasks
+            # nudge tells the model to make.
+            if upd_title is None and upd_status is None and upd_child is None and upd_note is None:
                 return self._coord_tool_error(
                     call_id,
                     "tasks",
-                    "update: at least one of title / status / child_ws_id is required",
+                    "update: at least one of title / status / child_ws_id / note is required",
                 )
-            item["header"] = f"\u2699 tasks update: {task_id}"
+            # Strip ONCE, here — every string field, not just the note —
+            # so the preview, the judge projection, and ``tasks_update``
+            # all see the same value.  A whitespace-only note otherwise
+            # previews as a note being SET (truthy before the strip)
+            # while execute strips it to ``""`` and takes the CLEAR
+            # branch — the operator approves "set a note" and the tool
+            # deletes one.  A whitespace-only title/status/child_ws_id
+            # previewed as ``[unrenderable: N chars]`` — the marker for
+            # the genuinely-invisible steering class — when the model
+            # authored ordinary spaces; stripped, the marker's trigger
+            # is that class only, and a whitespace-only ``child_ws_id``
+            # previews as the explicit clear (``-``) it now performs.
+            # The strip must preserve ``None`` ("unchanged"): only a
+            # present string is stripped, and ``""`` (clear/empty) stays
+            # distinct from ``None`` throughout.
+            if isinstance(upd_title, str):
+                upd_title = upd_title.strip()
+            if isinstance(upd_status, str):
+                upd_status = upd_status.strip()
+            if isinstance(upd_child, str):
+                upd_child = upd_child.strip()
+            if isinstance(upd_note, str):
+                upd_note = upd_note.strip()
+            # The length gates, mirroring the add branch — and NOTE
+            # BEFORE TITLE across the two fields, which is the order
+            # ``tasks_update`` actually evaluates in: it checks the note
+            # before the row loop and the title inside it.  Title-first
+            # here would make the two layers name a DIFFERENT field when
+            # an update is over cap on both, and the claim being made is
+            # the same hint per field at both layers.
+            if isinstance(upd_note, str) and len(upd_note) > TASK_NOTE_MAX:
+                return _too_long("update", "note", len(upd_note), TASK_NOTE_MAX)
+            if isinstance(upd_title, str) and len(upd_title) > TASK_TITLE_MAX:
+                return _too_long("update", "title", len(upd_title), TASK_TITLE_MAX)
+            # For a task_id that does not exist the write path answers
+            # "task not found" for an over-cap TITLE (the row loop never
+            # matches) while still answering "note too long" for an
+            # over-cap note.  Both layers reject either way, so this gate
+            # refuses nothing the write path would have stored — the same
+            # nuance the landed renderability reject on this branch has.
+            #
+            # The renderability rejects below keep the OPPOSITE cross-field
+            # order (title first, while the write path checks the note
+            # first).  That divergence shipped already, needs two
+            # simultaneously-unrenderable fields to reach, and stays.
+            # Reject-with-hint, mirroring the add branch: a title/note
+            # that sanitises to nothing must never reach the approval
+            # card; its preview would read as absent (title) or as the
+            # explicit CLEAR marker (note=-) while execute stores the raw
+            # payload, so the operator would approve the opposite of what
+            # runs.  upd_note == "" stays a legal CLEAR, not rejected.
+            if isinstance(upd_title, str) and upd_title and not sanitize_display(upd_title):
+                return _unrenderable("update", "title", upd_title)
+            if upd_note and not sanitize_display(upd_note):
+                return _unrenderable("update", "note", upd_note)
+
+            item["header"] = f"\u2699 tasks update: {_pf(task_id)}"
             bits: list[str] = []
+            # Preview strings are rendered through ``_pf`` and NOT stored
+            # back onto the item — the approval surface reads raw args
+            # before any write, so the storage sanitiser never sees them,
+            # while ``item[...]`` must stay raw for the write path:
+            # ``task_id`` feeds ``tasks_update``/``tasks_remove`` by exact
+            # match and ``task_ids`` feeds the reorder permutation check,
+            # so sanitising the STORED values would silently turn every
+            # mutation into "task not found".
             if upd_title is not None:
-                bits.append(f"title={upd_title[:60]}")
+                bits.append(f"title={_pf(upd_title)}")
             if upd_status is not None:
-                bits.append(f"status={upd_status}")
+                bits.append(f"status={_pf(upd_status)}")
             if upd_child is not None:
-                bits.append(f"child_ws_id={upd_child or '-'}")
+                bits.append(f"child_ws_id={_pf(upd_child) or '-'}")
+            if upd_note is not None:
+                # ``or '-'`` renders an explicit clear (``""``) the same
+                # way ``child_ws_id`` renders one, so the operator sees
+                # "note=-" rather than an empty tail.  The sanitise-to-
+                # empty case cannot reach here (rejected above), so ``-``
+                # is unambiguous again.
+                bits.append(f"note={_pf(upd_note) or '-'}")
             item["preview"] = " ".join(bits)
             item["task_id"] = task_id
             item["title"] = upd_title
             item["status"] = upd_status
             item["child_ws_id"] = upd_child
+            item["note"] = upd_note
         elif action == "remove":
             task_id = self._coord_str_arg(args, "task_id").strip()
             if not task_id:
                 return self._coord_tool_error(call_id, "tasks", "remove: task_id is required")
-            item["header"] = f"\u2699 tasks remove: {task_id}"
+            item["header"] = f"\u2699 tasks remove: {_pf(task_id)}"
             item["preview"] = ""
             item["task_id"] = task_id
         elif action == "reorder":
@@ -14202,7 +15078,9 @@ class ChatSession:
                     call_id, "tasks", "reorder: task_ids must be a list of strings"
                 )
             item["header"] = f"\u2699 tasks reorder: {len(raw_ids)} ids"
-            item["preview"] = ",".join(raw_ids[:6]) + ("..." if len(raw_ids) > 6 else "")
+            item["preview"] = ",".join(_pf(x) for x in raw_ids[:6]) + (
+                "..." if len(raw_ids) > 6 else ""
+            )
             item["task_ids"] = raw_ids
         return item
 
@@ -14222,6 +15100,7 @@ class ChatSession:
                     title=item["title"],
                     status=item["status"],
                     child_ws_id=item["child_ws_id"],
+                    note=item["note"],
                 )
             elif action == "update":
                 result = self._coord_client.tasks_update(
@@ -14230,6 +15109,7 @@ class ChatSession:
                     title=item["title"],
                     status=item["status"],
                     child_ws_id=item["child_ws_id"],
+                    note=item["note"],
                 )
             elif action == "remove":
                 result = self._coord_client.tasks_remove(self._ws_id, task_id=item["task_id"])
@@ -16026,6 +16906,8 @@ class ChatSession:
             capabilities=agent_caps,
             config_store=self._config_store,
         )
+        # Resolve once per sub-agent run, outside its request retry loop.
+        agent_backend_auth_token = self._model_backend_auth_token(lane.alias)
 
         def _api_call(
             turns: list[Turn],
@@ -16060,6 +16942,7 @@ class ChatSession:
                         or (self.reasoning_effort if same_lane else None),
                         mint=mint,
                         wire_id_map=wire_id_map,
+                        backend_auth_token=agent_backend_auth_token,
                     )
                     # Sub-agent turns bypass on_status — record per-turn so
                     # task-agent spend is visible in the dashboard, attributed

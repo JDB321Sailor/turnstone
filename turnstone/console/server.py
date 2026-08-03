@@ -59,6 +59,8 @@ from turnstone.core.auth import (
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
 from turnstone.core.mcp_crypto import is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
+from turnstone.core.metacognition import field_str, sanitize_display
+from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
 from turnstone.core.rendezvous import NoAvailableNodeError
 from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_routes import (
@@ -4377,7 +4379,81 @@ async def coordinator_tasks(request: Request) -> JSONResponse:
         return err404
 
     envelope, _corrupt = await asyncio.to_thread(load_task_envelope, storage, ws_id)
+    envelope = _sanitize_task_envelope_for_display(envelope)
     return JSONResponse(envelope)
+
+
+def _sanitize_task_envelope_for_display(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Sanitise the operator-facing copy of a task envelope.
+
+    ``title`` and ``note`` are model-authored free text and this response
+    feeds the operator's tasks pane, so a bidi override or zero-width run
+    could make the pane display an ask in an order different from the one
+    stored — on a ``needs_user`` row, the one the operator acts on.
+
+    Sanitising happens at each operator-facing render (here, the nudge
+    card's producer, the approval preview) rather than at the write:
+    storing the sanitised form would rewrite the model's planning text
+    under it, which is the mutation the reject-don't-truncate rule
+    forbids.  Storage stays verbatim, so the model reads back what it
+    sent through ``tasks(action='list')``.
+
+    ``sanitize_display`` — not ``sanitize_name`` — is the sanitiser on
+    this path, so what it removes is exactly the invisible class:
+    control chars (including newlines, which would ragged the pane's
+    rows), bidi overrides, zero-width runs and tag chars.  Angle
+    brackets are KEPT here, because this response IS the operator's view
+    of storage and deleting them turned a stored "cut p99 latency to
+    <200ms" into "...to 200ms" — the constraint inverted on the pane
+    while ``tasks(action='list')`` showed the model the original.  The
+    model-facing nudge body keeps the bracket-deleting sanitiser; see
+    ``metacognition.sanitize_display``.
+
+    Ragged-row coercion goes through ``metacognition.field_str`` — the
+    same single coercion point the nudge card's producer uses — so the
+    two operator-facing surfaces cannot disagree on a ragged row (the
+    previous ``str(x or "")`` mapped ``0``/``False`` to ``""`` while the
+    card rendered ``"0"``).  ``status`` is coerced too, which keeps a
+    falsy-but-real value (``0``/``False``) out of the FE's
+    ``task.status || "pending"`` fallback — but ``field_str(None)`` is
+    the falsy ``""``, so a null/absent status still hits that fallback:
+    the row renders a ``pending`` chip on the pane while the idle-tasks
+    nudge (whose ``_open_tasks`` coerces the same way and drops the
+    row) is blind to it.  Accepted ragged-row residual, same
+    hand-edited-envelope class as ``created``/``updated`` below;
+    server-side normalisation is deferred.  ``id``/``child_ws_id`` are
+    coerced for contract compliance (``CoordinatorTaskInfo`` publishes
+    them as required strings while this handler returns unvalidated
+    JSON).
+    ``child_ws_id`` is additionally SANITISED where ``id`` is not: the
+    id is server-minted (``tsk_`` + hex), while ``child_ws_id`` is
+    whatever the model passed, so it carries the same steering risk as
+    ``title``/``note`` and renders on the same pane.
+    ``created``/``updated`` stay uncoerced — accepted residual under the
+    same contract caveat.
+
+    Rows that are not dicts pass through untouched — the envelope is a
+    JSON blob and ``load_task_envelope`` shape-checks only its top level.
+    """
+    rows = envelope.get("tasks")
+    if not isinstance(rows, list):
+        return envelope
+    clean: list[Any] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            clean.append(row)
+            continue
+        row = {
+            **row,
+            "id": field_str(row.get("id")),
+            "title": sanitize_display(field_str(row.get("title"))),
+            "status": field_str(row.get("status")),
+            "child_ws_id": sanitize_display(field_str(row.get("child_ws_id"))),
+        }
+        if "note" in row:
+            row["note"] = sanitize_display(field_str(row.get("note")))
+        clean.append(row)
+    return {**envelope, "tasks": clean}
 
 
 # ---------------------------------------------------------------------------
@@ -4784,8 +4860,10 @@ def _bootstrap_coord_subsystem(
     # ``app.state._idle_nudge_watchers``.
     try:
         coord_state_writer.start()
-        # Coord-side observer: when a coord goes IDLE with active
-        # children still running, enqueues an idle_children nudge.
+        # Coord-side observer: enqueues idle_children / idle_tasks
+        # nudges when a coord goes IDLE with unfinished work — children
+        # still running, open tasks still held, or both (the two fire
+        # independently and may co-deliver).
         # MUST register BEFORE the IdleNudgeWatcher so subscriber-fire
         # order on the same IDLE event has the observer enqueueing
         # first, then the watcher peeking.
@@ -5220,7 +5298,13 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
                 create_mcp_client,
                 config_store.get("mcp.config_path") or None,
                 storage=storage,
+                required=bool(
+                    app.state.coord_registry and app.state.coord_registry.has_dynamic_auth()
+                ),
             )
+            if app.state.mcp_client is not None:
+                app.state.mcp_client.set_storage(storage)
+                app.state.mcp_client.set_app_state(app.state)
         except Exception:
             log.warning(
                 "console MCP manager boot failed — coordinators get no MCP "
@@ -5719,10 +5803,57 @@ async def admin_list_oidc_identities(request: Request) -> JSONResponse:
     return JSONResponse({"oidc_identities": identities})
 
 
+async def _invalidate_model_auth_memos_cluster(request: Request, user_id: str) -> tuple[int, int]:
+    """Best-effort eviction of one user's delegated model memo on every node."""
+    collector = getattr(request.app.state, "collector", None)
+    client = getattr(request.app.state, "proxy_client", None)
+    token_mgr = getattr(request.app.state, "proxy_token_mgr", None)
+    if collector is None or client is None or token_mgr is None:
+        return 0, 0
+
+    headers = dict(token_mgr.bearer_header)
+    nodes = collector.get_all_nodes()
+    sem = asyncio.Semaphore(_get_fan_out_limit(request))
+
+    async def _invalidate(node: dict[str, Any]) -> bool | None:
+        node_id = str(node.get("node_id") or "")
+        url = str(node.get("server_url") or "").rstrip("/")
+        if not url:
+            return None
+        try:
+            async with sem:
+                response = await client.post(
+                    f"{url}/v1/api/_internal/model-auth-cache-invalidate",
+                    headers=headers,
+                    json={"user_id": user_id},
+                    timeout=5,
+                )
+            if response.status_code == 200:
+                return True
+            log.warning(
+                "admin.oidc_identity.model_memo_invalidate_rejected user=%s node=%s status=%s",
+                user_id,
+                node_id,
+                response.status_code,
+            )
+        except Exception:
+            log.warning(
+                "admin.oidc_identity.model_memo_invalidate_failed user=%s node=%s",
+                user_id,
+                node_id,
+                exc_info=True,
+            )
+        return False
+
+    outcomes = await asyncio.gather(*(_invalidate(node) for node in nodes))
+    return outcomes.count(True), outcomes.count(False)
+
+
 async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
     """DELETE /v1/api/admin/oidc-identities?issuer=...&subject=... — unlink OIDC identity."""
     from turnstone.core.audit import record_audit
     from turnstone.core.auth import require_permission
+    from turnstone.core.mcp_oauth import MODEL_OBO_CACHE_PREFIX
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -5784,6 +5915,44 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
                     server_name,
                     exc_info=True,
                 )
+        # Model-provider OBO rows use synthetic server keys and therefore are
+        # not present in mcp_servers/obo_server_names. Purge only delegated
+        # model rows for this user; __model_app__ rows belong to the shared
+        # __app__ identity and intentionally survive user deprovisioning.
+        try:
+            metadata = token_store.list_user_token_metadata(user_id)
+        except Exception:
+            metadata = []
+            log.warning(
+                "admin.oidc_identity.model_obo_cache_list_failed user=%s",
+                user_id,
+                exc_info=True,
+            )
+        for row in metadata:
+            server_name = str(row.get("server_name") or "")
+            if not server_name.startswith(MODEL_OBO_CACHE_PREFIX):
+                continue
+            try:
+                if token_store.delete_user_token(user_id, server_name):
+                    obo_cache_purged += 1
+            except Exception:
+                log.warning(
+                    "admin.oidc_identity.model_obo_cache_purge_failed user=%s server=%s",
+                    user_id,
+                    server_name,
+                    exc_info=True,
+                )
+    # The console-hosted coordinator has its own manager/memo and is not in the
+    # node collector, so invalidate it directly as well as fanning out below.
+    mcp_client = getattr(request.app.state, "mcp_client", None)
+    if mcp_client is not None and hasattr(mcp_client, "invalidate_model_mint_memo_sync"):
+        mcp_client.invalidate_model_mint_memo_sync(
+            user_id=user_id,
+            server_prefix=MODEL_OBO_CACHE_PREFIX,
+        )
+    memo_nodes_invalidated, memo_nodes_failed = await _invalidate_model_auth_memos_cluster(
+        request, user_id
+    )
 
     audit_uid, ip = _audit_context(request)
     record_audit(
@@ -5796,20 +5965,19 @@ async def admin_delete_oidc_identity(request: Request) -> JSONResponse:
             "user_id": user_id,
             "obo_credential_revoked": credential_revoked,
             "obo_cache_rows_purged": obo_cache_purged,
+            "model_memo_nodes_invalidated": memo_nodes_invalidated,
+            "model_memo_nodes_failed": memo_nodes_failed,
         },
         ip,
     )
 
-    # Note: warmed per-user pool sessions on server nodes hold the bearer
-    # in-memory and self-clear at token TTL / idle eviction; the console has no
-    # per-user cross-node eviction primitive. Credential + cache purge stop all
-    # FUTURE dispatch (next call re-reads the now-empty cache → mint → missing
-    # credential → re-login), bounding residual access to the current token TTL.
     return JSONResponse(
         {
             "status": "ok",
             "obo_credential_revoked": credential_revoked,
             "obo_cache_rows_purged": obo_cache_purged,
+            "model_memo_nodes_invalidated": memo_nodes_invalidated,
+            "model_memo_nodes_failed": memo_nodes_failed,
         }
     )
 
@@ -9495,7 +9663,9 @@ def _clean_oauth_text(value: Any, *, max_length: int = 512) -> str | None:
     """
     if value is None:
         return None
-    text = str(value).strip()
+    # OAuth identifiers/URLs have no valid C0 controls. Removing them here
+    # prevents log/header ambiguity and benefits both MCP and model auth.
+    text = re.sub(r"[\x00-\x1f\x7f]", "", str(value)).strip()
     if not text:
         return None
     return text[:max_length]
@@ -10693,11 +10863,28 @@ def _ensure_console_mcp_client(app: Any) -> dict[str, Any]:
 
             cs = getattr(app.state, "config_store", None)
             cfg_path = cs.get("mcp.config_path") if cs is not None else None
-            mgr = create_mcp_client(cfg_path or None, storage=storage)
+            registry = getattr(app.state, "coord_registry", None)
+            mgr = create_mcp_client(
+                cfg_path or None,
+                storage=storage,
+                required=bool(registry and registry.has_dynamic_auth()),
+            )
             if mgr is None:
                 return {"skipped": "no MCP servers configured"}
             app.state.mcp_client = mgr
-        return mgr.reconcile_sync(storage)
+            mgr.set_storage(storage)
+            mgr.set_app_state(app.state)
+        result = mgr.reconcile_sync(storage)
+        coord_mgr = getattr(app.state, "coord_mgr", None)
+        if coord_mgr is not None:
+            try:
+                for ws in coord_mgr.list_all():
+                    session = getattr(ws, "session", None)
+                    if session is not None:
+                        session.set_model_mint_client(mgr)
+            except Exception:
+                log.debug("console.model_mint_client_session_refresh_failed", exc_info=True)
+        return result
 
 
 async def _notify_nodes_mcp_reload(request: Request) -> dict[str, Any]:
@@ -11253,6 +11440,47 @@ _REASONING_EFFORT_CHOICES = frozenset(
 _API_SURFACE_CHOICES = frozenset({"chat", "responses"})
 
 
+def _model_auth_audience_allowlist(request: Request) -> frozenset[str]:
+    """Exact operator-approved resource audiences for dynamic model auth."""
+    config_store = getattr(request.app.state, "config_store", None)
+    raw = config_store.get("model.auth_audience_allowlist") if config_store is not None else ""
+    return frozenset(item.strip() for item in re.split(r"[,\n]", str(raw or "")) if item.strip())
+
+
+def _validate_dynamic_model_auth(
+    request: Request,
+    *,
+    auth_mode: str,
+    audience: str,
+) -> JSONResponse | None:
+    """Validate allow-list/profile constraints for a changed dynamic config."""
+    if auth_mode == "static":
+        return None
+    if audience not in _model_auth_audience_allowlist(request):
+        return JSONResponse(
+            {
+                "error": (
+                    "obo_audience is not in the operator-configured model.auth_audience_allowlist"
+                )
+            },
+            status_code=400,
+        )
+    profile = str(
+        getattr(getattr(request.app.state, "oidc_config", None), "obo_grant_profile", "") or ""
+    )
+    if auth_mode == "entra_app" and profile != "entra":
+        return JSONResponse(
+            {
+                "error": (
+                    "auth_mode 'entra_app' requires [oidc] obo_grant_profile='entra'; "
+                    "RFC 8693 client-credentials is not supported"
+                )
+            },
+            status_code=400,
+        )
+    return None
+
+
 def _validate_api_surface(caps: Any) -> str | None:
     """Return an error message if ``caps["server_compat"]["api_surface"]`` is invalid.
 
@@ -11541,6 +11769,8 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
         cfg_temperature = None
         cfg_max_tokens = None
         cfg_reasoning_effort = None
+        cfg_auth_mode = "static"
+        cfg_obo_audience = ""
         for node_models in node_statuses.values():
             nm = node_models.get(alias)
             if nm:
@@ -11550,6 +11780,8 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
                 cfg_temperature = nm.get("temperature")
                 cfg_max_tokens = nm.get("max_tokens")
                 cfg_reasoning_effort = nm.get("reasoning_effort")
+                cfg_auth_mode = nm.get("auth_mode", "static")
+                cfg_obo_audience = nm.get("obo_audience", "")
                 break
         result.append(
             {
@@ -11565,6 +11797,8 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
                 "temperature": cfg_temperature,
                 "max_tokens": cfg_max_tokens,
                 "reasoning_effort": cfg_reasoning_effort,
+                "auth_mode": cfg_auth_mode,
+                "obo_audience": cfg_obo_audience,
                 "source": "config",
                 "created_by": "",
                 "created": "",
@@ -11690,6 +11924,30 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     surface_persisted_reasoning = bool(body.get("surface_persisted_reasoning", True))
     replay_reasoning_to_model = bool(body.get("replay_reasoning_to_model", False))
 
+    auth_mode = str(body.get("auth_mode", "static")).strip() or "static"
+    if auth_mode not in _MODEL_AUTH_MODES:
+        return JSONResponse({"error": f"Invalid auth_mode: {auth_mode!r}"}, status_code=400)
+    obo_audience = _clean_oauth_text(body.get("obo_audience"), max_length=2048) or ""
+    if auth_mode in ("entra_obo", "entra_app") and not obo_audience:
+        return JSONResponse(
+            {"error": "obo_audience is required when auth_mode is 'entra_obo' or 'entra_app'"},
+            status_code=400,
+        )
+    dynamic_auth_error = _validate_dynamic_model_auth(
+        request,
+        auth_mode=auth_mode,
+        audience=obo_audience,
+    )
+    if dynamic_auth_error is not None:
+        return dynamic_auth_error
+    if auth_mode != "static":
+        # Redeeming an operator-chosen audience is the same capability as
+        # configuring oauth_audience on MCP. Service credentials do not bypass
+        # this capability-escalation gate.
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
+
     storage.create_model_definition(
         definition_id=definition_id,
         alias=alias,
@@ -11706,6 +11964,8 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         reasoning_effort=reasoning_effort,
         surface_persisted_reasoning=surface_persisted_reasoning,
         replay_reasoning_to_model=replay_reasoning_to_model,
+        auth_mode=auth_mode,
+        obo_audience=obo_audience,
     )
 
     record_audit(
@@ -11723,6 +11983,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     # model promotes the coord subsystem from "not initialized" to ready
     # without a console restart.  No-op when already built.
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
+    await asyncio.to_thread(_ensure_console_mcp_client, request.app)
     _emit_models_changed(request)
 
     created = storage.get_model_definition(definition_id)
@@ -11872,6 +12133,51 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
     if "replay_reasoning_to_model" in body:
         updates["replay_reasoning_to_model"] = bool(body["replay_reasoning_to_model"])
 
+    if "auth_mode" in body:
+        am = str(body["auth_mode"]).strip() or "static"
+        if am not in _MODEL_AUTH_MODES:
+            return JSONResponse({"error": f"Invalid auth_mode: {am!r}"}, status_code=400)
+        updates["auth_mode"] = am
+    if "obo_audience" in body:
+        updates["obo_audience"] = _clean_oauth_text(body["obo_audience"], max_length=2048) or ""
+    # Cross-field: entra_obo needs an audience. Validate the POST-merge state so
+    # a request that touches only one of the pair still checks against the other.
+    eff_auth_mode = updates.get("auth_mode", existing.get("auth_mode", "static"))
+    eff_audience = updates.get("obo_audience", existing.get("obo_audience", ""))
+    if eff_auth_mode in ("entra_obo", "entra_app") and not eff_audience:
+        return JSONResponse(
+            {"error": "obo_audience is required when auth_mode is 'entra_obo' or 'entra_app'"},
+            status_code=400,
+        )
+    old_auth_mode = str(existing.get("auth_mode") or "static")
+    old_audience = str(existing.get("obo_audience") or "")
+    old_base_url = str(existing.get("base_url") or "")
+    eff_base_url = str(updates.get("base_url", old_base_url))
+    auth_config_changed = (
+        str(eff_auth_mode) != old_auth_mode
+        or str(eff_audience) != old_audience
+        # A base-URL change on either side of a dynamic configuration can
+        # redirect a valid bearer even when the auth fields are unchanged.
+        or (
+            eff_base_url != old_base_url
+            and (
+                old_auth_mode in ("entra_obo", "entra_app")
+                or eff_auth_mode in ("entra_obo", "entra_app")
+            )
+        )
+    )
+    if auth_config_changed:
+        dynamic_auth_error = _validate_dynamic_model_auth(
+            request,
+            auth_mode=str(eff_auth_mode),
+            audience=str(eff_audience),
+        )
+        if dynamic_auth_error is not None:
+            return dynamic_auth_error
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
+
     if updates:
         storage.update_model_definition(definition_id, **updates)
 
@@ -11892,6 +12198,7 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
     if updates:
         await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
         await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
+        await asyncio.to_thread(_ensure_console_mcp_client, request.app)
         _emit_models_changed(request)
 
     model_def = storage.get_model_definition(definition_id)

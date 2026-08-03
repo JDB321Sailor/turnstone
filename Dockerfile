@@ -8,7 +8,7 @@ FROM python:3.14-slim
 LABEL org.opencontainers.image.title="turnstone" \
       org.opencontainers.image.description="Multi-node AI orchestration platform"
 
-COPY --from=ghcr.io/astral-sh/uv:0.11.29 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.12.1 /uv /usr/local/bin/uv
 
 # Remove the slim image's man page exclusion so man-db has actual content
 RUN rm -f /etc/dpkg/dpkg.cfg.d/docker
@@ -55,7 +55,7 @@ COPY docker/healthcheck.py /usr/local/bin/healthcheck.py
 
 # Entrypoint script — runs migrations before starting
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-
+RUN chmod +x /usr/local/bin/entrypoint.sh
 # Data directory — SQLite DB is created in CWD
 WORKDIR /data
 RUN chown turnstone:turnstone /data

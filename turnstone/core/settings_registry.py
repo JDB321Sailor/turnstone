@@ -53,6 +53,30 @@ def _build_registry() -> dict[str, SettingDef]:
             "without restarting.",
         ),
         SettingDef(
+            "model.auth_audience_allowlist",
+            "str",
+            "",
+            "Comma- or newline-separated model gateway audience allow-list",
+            "model",
+            help="Exact Entra resource App ID URIs that model definitions may redeem. "
+            "Required before an administrator can save entra_obo or entra_app auth. "
+            "Use literal values such as api://<application-id>; no wildcard or host "
+            "matching is performed.",
+        ),
+        SettingDef(
+            "model.auth_fail_closed",
+            "bool",
+            False,
+            "Refuse dynamic-auth model calls when token minting fails",
+            "model",
+            help="When enabled, an entra_obo or entra_app model call is refused if its "
+            "runtime credential cannot be minted. This also prevents routing that "
+            "failure into the model fallback chain. A delegated call without a user, "
+            "or any dynamic alias without a real static key, always refuses regardless "
+            "of this setting. Leave disabled only to permit fallback to an explicitly "
+            "configured static key after a mint failure.",
+        ),
+        SettingDef(
             "model.temperature",
             "float",
             None,
@@ -782,9 +806,12 @@ def _build_registry() -> dict[str, SettingDef]:
             "Seconds between metacognitive nudges",
             "memory",
             min_value=0,
-            help="Metacognitive nudges are gentle reminders to the AI to save useful information "
-            "from the conversation (e.g. user preferences, project decisions). This controls "
-            "the minimum time between nudges to avoid being repetitive.",
+            help="Minimum seconds between nudges of the same type. Applies to the "
+            "memory-save reminders (gentle prompts to record useful information such as "
+            "user preferences or project decisions) and to the coordinator's open-task "
+            "reminder. Does not apply to the coordinator's 'children still running' "
+            "liveness wake, which has no cooldown so an idle coordinator is never "
+            "silently stranded. Set to 0 to disable the spacing entirely.",
         ),
         SettingDef(
             "memory.nudges",
@@ -794,7 +821,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "memory",
             help="When enabled, the system periodically reminds the AI to save important "
             "information from conversations into long-term memory. This helps the AI "
-            "remember context across separate conversations.",
+            "remember context across separate conversations. Also gates the coordinator's "
+            "open-task reminder. Does not affect coordinator liveness wakes (the 'children "
+            "still running' nudge), which fire regardless so an idle coordinator is never "
+            "silently stranded.",
         ),
         # -- tls ----------------------------------------------------------------
         SettingDef(

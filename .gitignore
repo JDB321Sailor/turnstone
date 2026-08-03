@@ -39,3 +39,4 @@ production/caddy/
 production/config/
 production/searxng/
 production/setup-production.env
+/.idea

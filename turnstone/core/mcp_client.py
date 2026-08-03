@@ -57,7 +57,10 @@ from turnstone.core.mcp_oauth import (
     emit_oauth_failure_audit,
     get_obo_access_token_classified,
     get_user_access_token_classified,
+    invalidate_model_mint_memo,
     is_user_scoped_auth,
+    mint_app_access_token,
+    mint_obo_access_token,
 )
 
 if TYPE_CHECKING:
@@ -677,6 +680,18 @@ class MCPClientManager:
         self._db_managed: set[str] = set()
         # Per-server last-error tracking (set on failure, cleared on success)
         self._last_error: dict[str, str] = {}
+        # Last tool-DISCOVERY error for pool (oauth_user / oauth_obo) servers,
+        # keyed (user_id, server_name) like the pool entries it describes: set
+        # when a user's prime/connect raises during discovery (transport, 5xx,
+        # timeout), cleared when THAT user's pool connects. Surfaced per-user
+        # via get_server_status(...)["discovery_error"] so a swallowed
+        # discovery failure (e.g. a 500 from the MCP endpoint) is visible
+        # instead of the server silently contributing zero tools — and visible
+        # only to the user it happened to: the recorded exception text is
+        # per-user data (another account's failure must never render in this
+        # user's results), and another user's success must not erase a signal
+        # that is still true for this one.
+        self._pool_discovery_error: dict[tuple[str, str], str] = {}
         self._MAX_ERROR_LEN = 256
 
         # Listener infrastructure (tool-change callbacks for ChatSession).
@@ -869,6 +884,10 @@ class MCPClientManager:
         # asserts non-None when it actually runs, so static-only callers
         # never hit it.
         self._app_state: Any = None
+        # Long-lived HTTP client created and closed on the mcp-loop. Model-token
+        # mints run on that loop and must not borrow the lifespan-loop OAuth
+        # client or pay a DNS/TLS setup on every turn.
+        self._model_auth_http_client: httpx.AsyncClient | None = None
 
         # In-memory cache of server names whose ``auth_type='oauth_user'``.
         # ``_db_servers_to_config`` strips oauth_user rows on the way into
@@ -969,12 +988,22 @@ class MCPClientManager:
                 self._user_pool_locks[key] = lock
             entry = PoolEntryState(key=key, open_lock=lock)
             self._user_pool_entries[key] = entry
-            # First pool entry — start the idle-eviction loop. Deferred
-            # until the first pool key materializes so static-only
-            # deployments never spawn the task.
-            if self._user_pool_eviction_task is None:
-                self._user_pool_eviction_task = asyncio.create_task(self._user_pool_eviction_loop())
+            self._ensure_eviction_loop()
         return entry
+
+    def _ensure_eviction_loop(self) -> None:
+        """Start the idle-eviction loop if it isn't running. Loop-only.
+
+        Deferred until the first pool entry OR discovery record
+        materializes, so static-only deployments never spawn the task.
+        The record trigger matters: the eviction tick's orphan sweep is
+        the only reaper for entry-less discovery records, and a prime
+        can fail (and record) before ``_ensure_pool_entry`` ever runs —
+        on a node where no pool entry materializes, records would
+        otherwise accumulate for the process lifetime with no reaper.
+        """
+        if self._user_pool_eviction_task is None:
+            self._user_pool_eviction_task = asyncio.create_task(self._user_pool_eviction_loop())
 
     def set_app_state(self, app_state: Any) -> None:
         """Wire the OAuth ``app.state`` into the manager.
@@ -986,6 +1015,104 @@ class MCPClientManager:
         deployments may leave it unset.
         """
         self._app_state = app_state
+        if self._model_auth_http_client is not None:
+            app_state.obo_http_client = self._model_auth_http_client
+
+    def mint_model_obo_token_sync(
+        self, *, user_id: str, audience: str, timeout: float = 20.0
+    ) -> str | None:
+        """Resolve a per-user model-provider OBO access token synchronously.
+
+        Bridges the sync agent/model loop to :func:`mint_obo_access_token` on
+        the mcp-loop (same thread that owns the token store's asyncio locks),
+        mirroring ``call_tool_sync``.  Returns ``None`` on any failure — no
+        credential, mint rejected, OAuth unwired, timeout — so the model call
+        falls back to the backend's static credential.
+        """
+        if not user_id or not audience:
+            return None
+        loop = self._loop
+        if loop is None or self._app_state is None:
+            return None
+        future = asyncio.run_coroutine_threadsafe(
+            mint_obo_access_token(app_state=self._app_state, user_id=user_id, audience=audience),
+            loop,
+        )
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            log.warning(
+                "model obo token mint timed out user=%s audience=%s",
+                user_id,
+                audience,
+            )
+            return None
+        except Exception:
+            log.debug(
+                "model obo token mint failed user=%s audience=%s",
+                user_id,
+                audience,
+                exc_info=True,
+            )
+            return None
+
+    def mint_app_token_sync(self, *, audience: str, timeout: float = 20.0) -> str | None:
+        """Resolve an app-identity (client-credentials) model token synchronously.
+
+        The ``auth_mode='entra_app'`` sibling of ``mint_model_obo_token_sync``:
+        bridges to :func:`mint_app_access_token` on the mcp-loop. No user needed
+        — Turnstone's own SSO app registration is the identity. Returns ``None``
+        on any failure so the model call falls back to the static credential.
+        """
+        if not audience:
+            return None
+        loop = self._loop
+        if loop is None or self._app_state is None:
+            return None
+        future = asyncio.run_coroutine_threadsafe(
+            mint_app_access_token(app_state=self._app_state, audience=audience),
+            loop,
+        )
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            log.warning("model app token mint timed out audience=%s", audience)
+            return None
+        except Exception:
+            log.debug("model app token mint failed audience=%s", audience, exc_info=True)
+            return None
+
+    def invalidate_model_mint_memo_sync(
+        self,
+        *,
+        user_id: str,
+        server_prefix: str,
+        timeout: float = 5.0,
+    ) -> int:
+        """Invalidate model-token memo entries on their owning MCP loop."""
+        loop = self._loop
+        if loop is None or self._app_state is None:
+            return 0
+
+        async def _invalidate() -> int:
+            return invalidate_model_mint_memo(
+                self._app_state,
+                user_id=user_id,
+                server_prefix=server_prefix,
+            )
+
+        future = asyncio.run_coroutine_threadsafe(_invalidate(), loop)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            log.warning("model token memo invalidation timed out user=%s", user_id)
+            return 0
+        except Exception:
+            log.warning("model token memo invalidation failed user=%s", user_id, exc_info=True)
+            return 0
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -1006,6 +1133,9 @@ class MCPClientManager:
 
     async def _connect_all(self) -> None:
         """Connect to every configured server (runs on the background loop)."""
+        self._model_auth_http_client = httpx.AsyncClient(timeout=10.0)
+        if self._app_state is not None:
+            self._app_state.obo_http_client = self._model_auth_http_client
         self._exit_stack = AsyncExitStack()
         await self._exit_stack.__aenter__()
 
@@ -2916,6 +3046,11 @@ class MCPClientManager:
         # ``_user_resources`` / ``_user_prompts``. Per-user fan-out
         # ensures another user's session never observes this change.
         self._rebuild_and_notify_user_catalogs(user_id)
+        # Discovery just succeeded for THIS user's pool — clear their recorded
+        # failure so a healed outage doesn't linger on status. Other users'
+        # records for the server stay: this connect proves nothing about a
+        # failure another account experienced.
+        self._pool_discovery_error.pop(key, None)
         return entry
 
     # -- pool priming ---------------------------------------------------------
@@ -3147,7 +3282,19 @@ class MCPClientManager:
                             user_id,
                             server_name,
                         )
-                    except Exception:
+                    except Exception as exc:
+                        # Record the discovery failure so it is visible via
+                        # THIS user's server status (and their tool_search
+                        # unavailable-server advisory) instead of being
+                        # swallowed to a debug log with the server silently
+                        # contributing zero tools.
+                        # Token-level outcomes (missing / dead grant) return
+                        # earlier and never reach here, so this is a genuine
+                        # connect/discovery failure (transport, 5xx, timeout).
+                        self._pool_discovery_error[key] = self._sanitize_error_detail(
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        self._ensure_eviction_loop()
                         log.debug(
                             "mcp pool auto-prime failed user=%s server=%s",
                             user_id,
@@ -3635,12 +3782,29 @@ class MCPClientManager:
         those; they are bounded by live-session users × pool servers
         and reaped by the TTL pass within a tick of their user's last
         listener going away.
+
+        Also the SINGLE reaper for discovery records: the full-drop path
+        deliberately leaves them in place (a live session must keep its
+        outage advisory past its stub's eviction), so this sweep pops any
+        record whose key has no backing entry once the user's last listener
+        is gone — within a tick of departure. It must run BEFORE the
+        empty-map early return: the orphan case has no entries by
+        definition, and a prime can fail (and record) without ever
+        allocating an entry.
         """
+        live_uids = self._live_listener_uids()
+        # list(): sync-thread clears (_drop_pool_discovery_errors) mutate
+        # the record map concurrently with this loop-side iteration.
+        for key in [
+            k
+            for k in list(self._pool_discovery_error)
+            if k not in self._user_pool_entries and k[0] not in live_uids
+        ]:
+            self._pool_discovery_error.pop(key, None)
         if not self._user_pool_entries:
             return
         now = time.monotonic()
         ttl = self._user_pool_idle_ttl_s
-        live_uids = self._live_listener_uids()
 
         # First pass: TTL-based eviction. Run closes in parallel so a tick
         # that needs to evict many entries doesn't block on serial teardowns.
@@ -3753,6 +3917,14 @@ class MCPClientManager:
             had_catalog = self._entry_has_catalog(entry)
             self._user_pool_entries.pop(key, None)
             self._user_pool_last_used.pop(key, None)
+            # Deliberately NOT popping the discovery record here: it must
+            # outlive the entry exactly as long as a live session could
+            # still consult it (a failed prime leaves a catalog-less stub
+            # with last_used=0.0, so the FIRST tick full-drops it here, and
+            # there is no mid-session re-record path). The eviction tick's
+            # orphan sweep is the single reaper: once the key is entry-less
+            # AND the user's last listener is gone, the record goes — one
+            # policy site instead of a second liveness predicate here.
             if had_catalog:
                 # Dropping the entry without rebuilding the per-user
                 # catalogs would leave ``is_mcp_tool`` / per-user
@@ -5357,6 +5529,20 @@ class MCPClientManager:
             except Exception:
                 log.debug("Error closing MCP exit stack", exc_info=True)
 
+        if self._loop and self._model_auth_http_client is not None:
+            mint_client = self._model_auth_http_client
+            future = asyncio.run_coroutine_threadsafe(mint_client.aclose(), self._loop)
+            try:
+                future.result(timeout=10)
+            except Exception:
+                log.debug("Error closing model-auth HTTP client", exc_info=True)
+            if (
+                self._app_state is not None
+                and getattr(self._app_state, "obo_http_client", None) is mint_client
+            ):
+                self._app_state.obo_http_client = None
+            self._model_auth_http_client = None
+
         if self._loop:
             self._loop.call_soon_threadsafe(self._loop.stop)
         if self._thread:
@@ -5664,6 +5850,7 @@ class MCPClientManager:
                         # nothing would cover the dropped change.
                         self._static_servers.pop(name, None)
                         self._last_error.pop(name, None)
+                        self._drop_pool_discovery_errors(name)
                         self._clear_static_push_state(name, markers=True)
                         self._cb_clear(name)
                         # Clear health-loop backoff/ping state so a later
@@ -5706,6 +5893,7 @@ class MCPClientManager:
             self._server_configs.pop(name, None)
             self._static_servers.pop(name, None)
             self._last_error.pop(name, None)
+            self._drop_pool_discovery_errors(name)
             self._clear_static_push_state(name, markers=True)
             self._cb_clear(name)
             self._rebuild_tools()
@@ -5721,10 +5909,53 @@ class MCPClientManager:
         log.info("Removed MCP server '%s'", name)
         return was_connected
 
+    def _sanitize_error_detail(self, msg: str) -> str:
+        """Single-line, bounded rendering for recorded server-error text.
+
+        ONE pipeline for every recorded surface (``_last_error``, the pool
+        discovery record) so a future sanitizer hardening cannot land on
+        one and silently miss the other.
+        """
+        return msg.replace("\n", " ").replace("\r", "").strip()[: self._MAX_ERROR_LEN]
+
     def _set_error(self, name: str, msg: str) -> None:
         """Store a sanitized error string for a server."""
-        clean = msg.replace("\n", " ").replace("\r", "")
-        self._last_error[name] = clean[: self._MAX_ERROR_LEN]
+        self._last_error[name] = self._sanitize_error_detail(msg)
+
+    def _drop_pool_discovery_errors(self, server_name: str) -> None:
+        """Drop every user's recorded discovery failure for *server_name*.
+
+        Registration-lifecycle clear (removal, reconcile-observed pool removal,
+        or a pool auth-type flip): the records describe a registration that no
+        longer exists, so a later same-name registration must not inherit them
+        — for ANY user. ``list()`` first: the keys copy is a single C-level
+        call, so a sync-thread caller (remove / reconcile) can't trip over the
+        mcp-loop's concurrent writes mid-iteration; the comprehension then
+        filters a private snapshot.
+        """
+        for key in [k for k in list(self._pool_discovery_error) if k[1] == server_name]:
+            self._pool_discovery_error.pop(key, None)
+
+    def _pool_discovery_error_for(
+        self, server_name: str, user_id: str | None, *, aggregate: bool = False
+    ) -> str:
+        """Recorded discovery failure, scoped like pool status itself: the
+        requesting user's own record, or any user's under the admin
+        ``aggregate`` view. No user context → ``""`` — a failure another
+        account experienced is per-user data, the same rule ``connected``
+        follows in :meth:`_oauth_user_server_status`.
+        """
+        if aggregate:
+            # list(): sync-thread status reads race mcp-loop writes; same
+            # snapshot discipline as the pool-entries scan in
+            # _oauth_user_server_status.
+            for (_uid, sname), detail in list(self._pool_discovery_error.items()):
+                if sname == server_name:
+                    return detail
+            return ""
+        if not user_id:
+            return ""
+        return self._pool_discovery_error.get((user_id, server_name), "")
 
     def get_server_status(
         self, name: str, user_id: str | None = None, *, aggregate: bool = False
@@ -5761,6 +5992,9 @@ class MCPClientManager:
             ),
             "prompts": len(state.prompts) if state is not None and state.session is not None else 0,
             "error": self._last_error.get(name, ""),
+            # Shape parity with the pool branch; only pool primes record
+            # discovery failures, so a static server has none by construction.
+            "discovery_error": "",
             "transport": transport,
             "command": cfg.get("command", "") if transport == "stdio" else "",
             "url": cfg.get("url", "") if transport != "stdio" else "",
@@ -5826,6 +6060,7 @@ class MCPClientManager:
             "resources": len(rep.resources) if rep is not None and rep.resources else 0,
             "prompts": len(rep.prompts) if rep is not None and rep.prompts else 0,
             "error": self._last_error.get(name, ""),
+            "discovery_error": self._pool_discovery_error_for(name, user_id, aggregate=aggregate),
             "transport": "streamable-http",
             "command": "",
             "url": "",
@@ -5900,6 +6135,13 @@ class MCPClientManager:
         self._obo_server_names = new_obo_names
         new_pool_auth = {n: "oauth_user" for n in self._oauth_user_server_names}
         new_pool_auth.update(dict.fromkeys(self._obo_server_names, "oauth_obo"))
+        # Pool-backed rows never enter ``_server_configs`` and therefore do
+        # not pass through remove_server_sync. Clear the old registration's
+        # discovery failure here when a pool server is removed or changes its
+        # auth model, so a later same-name registration cannot inherit it.
+        for name, auth_type in prev_pool_auth.items():
+            if new_pool_auth.get(name) != auth_type:
+                self._drop_pool_discovery_errors(name)
         # Pool servers newly registered OR migrated between pool auth types
         # since active sessions last primed.
         newly_added_pool = {
@@ -7864,6 +8106,14 @@ class MCPClientManager:
         time.
         """
         self._evict_session(key)
+        # The grant for this (user, server) is GONE — an outage advisory
+        # for access the user no longer holds would be misleading, and with
+        # the grant gone no healing connect can ever clear the record (prime
+        # returns at the token lookup; zero catalog tools means no lazy
+        # dispatch). The not-consented state has its own rails; the record
+        # retires with the grant. Before the early returns below: the
+        # record's stub is typically already catalog-less or dropped.
+        self._pool_discovery_error.pop(key, None)
         evict = self._user_pool_entries.get(key)
         if evict is None:
             return
@@ -9085,11 +9335,14 @@ def create_mcp_client(
     config_path: str | None = None,
     *,
     storage: Any = None,
+    required: bool = False,
 ) -> MCPClientManager | None:
     """Create and start an MCP client manager.
 
     Returns *None* if nothing is configured — no static servers from any
-    source AND no pool-backed (``oauth_user``/``oauth_obo``) DB rows.
+    source AND no pool-backed (``oauth_user``/``oauth_obo``) DB rows — unless
+    ``required`` is true. Dynamic model authentication uses an empty-config
+    manager solely for its mint loop and therefore sets ``required``.
     Pool-backed rows alone construct an empty-config manager: their
     connections form lazily per user, so they contribute nothing to the
     static *servers* dict, but the host still needs a running manager
@@ -9115,7 +9368,7 @@ def create_mcp_client(
             log.warning("Failed to load DB-managed MCP servers", exc_info=True)
 
     servers = load_mcp_config(config_path, storage=storage)
-    if not servers and not oauth_user_names and not obo_names:
+    if not required and not servers and not oauth_user_names and not obo_names:
         return None
 
     mgr = MCPClientManager(servers)

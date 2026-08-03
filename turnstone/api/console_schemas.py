@@ -1011,6 +1011,10 @@ class ModelDefinitionInfo(BaseModel):
     reasoning_effort: str | None = None
     surface_persisted_reasoning: bool = True
     replay_reasoning_to_model: bool = False
+    # "static" (send api_key), "entra_obo" (delegated-user token), or
+    # "entra_app" (shared app token) for obo_audience at call time.
+    auth_mode: str = "static"
+    obo_audience: str = ""
     source: str = ""
     created_by: str = ""
     created: str = ""
@@ -1031,6 +1035,8 @@ class CreateModelDefinitionRequest(BaseModel):
     reasoning_effort: str | None = None
     surface_persisted_reasoning: bool = True
     replay_reasoning_to_model: bool = False
+    auth_mode: str = "static"
+    obo_audience: str = ""
 
 
 class UpdateModelDefinitionRequest(BaseModel):
@@ -1047,6 +1053,8 @@ class UpdateModelDefinitionRequest(BaseModel):
     reasoning_effort: str | None = None
     surface_persisted_reasoning: bool | None = None
     replay_reasoning_to_model: bool | None = None
+    auth_mode: str | None = None
+    obo_audience: str | None = None
 
 
 class ListModelDefinitionsResponse(BaseModel):
@@ -1395,8 +1403,24 @@ class CoordinatorTaskInfo(BaseModel):
 
     id: str
     title: str
-    status: str = Field(description="One of: pending / in_progress / done / blocked.")
+    status: str = Field(
+        description=(
+            "One of: pending / in_progress / done / blocked / needs_user.  "
+            "``blocked`` is waiting on a dependency the coordinator may clear "
+            "itself; ``needs_user`` is waiting on a decision only the "
+            "operator can make."
+        )
+    )
     child_ws_id: str = Field(default="")
+    note: str = Field(
+        default="",
+        description=(
+            "Optional one-sentence note, typically what the coordinator needs "
+            "from the operator on a ``needs_user`` task.  Absent from the "
+            "stored record when unset (there is no backfill for rows written "
+            "before the field existed), so it defaults to the empty string here."
+        ),
+    )
     created: str
     updated: str
 

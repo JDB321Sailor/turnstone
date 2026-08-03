@@ -17,6 +17,12 @@ from turnstone.core.providers import LLMProvider, create_client, create_provider
 
 log = get_logger(__name__)
 
+MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app"})
+
+
+class ModelAuthConfigError(ValueError):
+    """A model definition contains unsafe or internally inconsistent auth settings."""
+
 
 # ---------------------------------------------------------------------------
 # Model configuration
@@ -48,6 +54,39 @@ class ModelConfig:
     # Server compatibility settings for openai-compatible backends.
     # Populated from capabilities["server_compat"] during load.
     server_compat: dict[str, Any] = field(default_factory=dict)
+    # Backend credential mode. ``static`` (default) sends ``api_key`` unchanged;
+    # ``entra_obo`` mints a caller-delegated Entra token; ``entra_app`` mints a
+    # shared app-identity token. Dynamic tokens are bound as the SDK credential
+    # (x-api-key for Anthropic surfaces, Authorization: Bearer for OpenAI-style).
+    # ``obo_audience`` is the exact operator-approved resource App ID URI.
+    auth_mode: str = "static"
+    obo_audience: str = ""
+
+
+def _normalize_auth_mode(alias: str, mode: Any, audience: Any) -> tuple[str, str]:
+    """Validate and normalize one model's backend-auth configuration.
+
+    DB and config.toml rows share this path so a typo cannot silently downgrade
+    dynamic authentication to a static key. Audience values remain literal:
+    environment expansion would make authorization node-dependent and could
+    bypass the admin allow-list and length boundary.
+    """
+    normalized_mode = str(mode or "static").strip() or "static"
+    normalized_audience = str(audience or "").strip()
+    if normalized_mode not in MODEL_AUTH_MODES:
+        raise ModelAuthConfigError(
+            f"Model '{alias}' has invalid auth_mode {normalized_mode!r}; "
+            f"expected one of {sorted(MODEL_AUTH_MODES)}"
+        )
+    if normalized_mode != "static" and not normalized_audience:
+        raise ModelAuthConfigError(
+            f"Model '{alias}' requires obo_audience when auth_mode is {normalized_mode!r}"
+        )
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in normalized_audience):
+        raise ModelAuthConfigError(f"Model '{alias}' obo_audience contains control characters")
+    if len(normalized_audience) > 2048:
+        raise ModelAuthConfigError(f"Model '{alias}' obo_audience exceeds 2048 characters")
+    return normalized_mode, normalized_audience
 
 
 def _api_surface_of(cfg: ModelConfig) -> str | None:
@@ -145,9 +184,18 @@ class ModelRegistry:
                 raise ValueError(f"Unknown model alias: {alias}")
             if alias not in self._clients:
                 cfg = self._models[alias]
+                # An entra_obo / entra_app backend authenticates per-call via a
+                # minted token bound with ``client.with_options(api_key=...)``, so
+                # the cached client only needs to CONSTRUCT — feed a placeholder
+                # when no static fallback key is set (the SDKs reject an empty key
+                # that also has no env fallback).  The real credential is supplied
+                # per call and never rides on this base client object.
+                client_key = cfg.api_key
+                if not client_key and cfg.auth_mode in ("entra_obo", "entra_app"):
+                    client_key = "backend-auth-placeholder-unused"
                 try:
                     self._clients[alias] = create_client(
-                        cfg.provider, base_url=cfg.base_url, api_key=cfg.api_key
+                        cfg.provider, base_url=cfg.base_url, api_key=client_key
                     )
                 except ValueError:
                     # create_client's own misconfig errors already carry
@@ -197,6 +245,10 @@ class ModelRegistry:
     def has_alias(self, alias: str) -> bool:
         """Check if *alias* exists in the registry."""
         return alias in self._models
+
+    def has_dynamic_auth(self) -> bool:
+        """Return whether any alias needs a runtime-minted backend credential."""
+        return any(cfg.auth_mode != "static" for cfg in self._models.values())
 
     def list_aliases(self) -> list[str]:
         """Return all registered model aliases."""
@@ -272,8 +324,8 @@ class ModelRegistry:
             self.task_model = task_model
             self.task_effort = task_effort
             # Selective teardown — close + drop only clients whose
-            # connection target actually changed (alias removed, or
-            # base_url / api_key / provider differs).  Keeps connection
+            # construction/connection target changed (alias removed, or
+            # base_url / api_key / provider / auth_mode differs). Keeps connection
             # pools warm for the common admin-edit case where only
             # ``model`` / ``temperature`` / ``context_window`` changed.
             for alias, client in list(self._clients.items()):
@@ -285,6 +337,7 @@ class ModelRegistry:
                     or old_cfg.base_url != new_cfg.base_url
                     or old_cfg.api_key != new_cfg.api_key
                     or old_cfg.provider != new_cfg.provider
+                    or old_cfg.auth_mode != new_cfg.auth_mode
                 ):
                     if hasattr(client, "close"):
                         client.close()
@@ -432,6 +485,13 @@ def load_model_registry(
                 # pre-052 row missing these columns degrades gracefully.
                 row_surface_persisted_reasoning = bool(row.get("surface_persisted_reasoning", True))
                 row_replay_reasoning = bool(row.get("replay_reasoning_to_model", False))
+                # Per-user OBO auth (defaults match a pre-068 row missing the
+                # columns → "static", no audience → unchanged behaviour).
+                row_auth_mode, row_obo_audience = _normalize_auth_mode(
+                    alias,
+                    row.get("auth_mode"),
+                    row.get("obo_audience"),
+                )
                 configs[alias] = ModelConfig(
                     alias=alias,
                     base_url=row_base_url,
@@ -449,7 +509,14 @@ def load_model_registry(
                     surface_persisted_reasoning=row_surface_persisted_reasoning,
                     replay_reasoning_to_model=row_replay_reasoning,
                     server_compat=row_server_compat,
+                    auth_mode=row_auth_mode,
+                    obo_audience=row_obo_audience,
                 )
+        except ModelAuthConfigError:
+            # Configuration errors are authoritative row content, not a
+            # transient storage-read failure. Never degrade past them into a
+            # config-only registry or provider SDK environment credentials.
+            raise
         except Exception:
             if strict:
                 raise
@@ -502,6 +569,11 @@ def load_model_registry(
         entry_server_compat = entry_caps.pop("server_compat", {})
         if not isinstance(entry_server_compat, dict):
             entry_server_compat = {}
+        entry_auth_mode, entry_obo_audience = _normalize_auth_mode(
+            alias,
+            entry.get("auth_mode", "static"),
+            entry.get("obo_audience", ""),
+        )
         configs[alias] = ModelConfig(
             alias=alias,
             base_url=entry_base_url,
@@ -520,6 +592,8 @@ def load_model_registry(
             max_tokens=entry_max_tokens,
             reasoning_effort=entry_effort,
             server_compat=entry_server_compat,
+            auth_mode=entry_auth_mode,
+            obo_audience=entry_obo_audience,
         )
 
     # 3. Back-compat shim: synthesize a "default" alias from CLI/auto-detected
