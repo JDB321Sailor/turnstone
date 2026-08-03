@@ -31,12 +31,12 @@ design_ideas/
 docs/design/
 
 override.compose.yaml
-production/compose.yaml
-production/override.compose.yaml
-production/tls.compose.yaml
-production/Caddyfile
-production/caddy/
-production/config/
-production/searxng/
-production/setup-production.env
+deploy/auto-deployment/compose.yaml
+deploy/auto-deployment/override.compose.yaml
+deploy/auto-deployment/tls.compose.yaml
+deploy/auto-deployment/Caddyfile
+deploy/auto-deployment/caddy/
+deploy/auto-deployment/config/
+deploy/auto-deployment/searxng/
+deploy/auto-deployment/setup-production.env
 /.idea
