@@ -32,7 +32,6 @@ docs/design/
 
 override.compose.yaml
 deploy/auto-deployment/compose.yaml
-deploy/auto-deployment/override.compose.yaml
 deploy/auto-deployment/tls.compose.yaml
 deploy/auto-deployment/Caddyfile
 deploy/auto-deployment/caddy/

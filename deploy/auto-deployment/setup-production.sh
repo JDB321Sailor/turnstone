@@ -3,12 +3,12 @@
 #
 # Produces every file needed to run the stack in this folder:
 #   compose.yaml            pulled production stack (ghcr.io images)
-#   override.compose.yaml   deployment-specific service adjustments
+#   compose.override.yaml   deployment-specific service adjustments
 #   tls.compose.yaml        service-to-service mTLS overlay (optional)
 #   Caddyfile               browser TLS termination for the dashboard
 #   caddy/Dockerfile        Caddy build with a DNS-challenge plugin (optional)
 #   config/turnstone-oidc.env  OIDC single sign-on settings (optional)
-#   .env                    secrets, image tag, and compose file chain
+#   .env                    secrets and image tag
 #
 # After a successful run:  cd into this folder and `docker compose up -d`.
 
@@ -23,7 +23,7 @@ SRC_SEARXNG_DIR="$REPO_DIR/turnstone/deploy/searxng"
 SRC_TLS_OVERLAY="$REPO_DIR/deploy/docker-compose.tls.yml"
 
 OUT_COMPOSE="$SCRIPT_DIR/compose.yaml"
-OUT_OVERRIDE="$SCRIPT_DIR/override.compose.yaml"
+OUT_OVERRIDE="$SCRIPT_DIR/compose.override.yaml"
 OUT_TLS_OVERLAY="$SCRIPT_DIR/tls.compose.yaml"
 OUT_CADDYFILE="$SCRIPT_DIR/Caddyfile"
 OUT_CADDY_DIR="$SCRIPT_DIR/caddy"
@@ -317,6 +317,14 @@ S2
         _a TURNSTONE_SETUP_IMAGE_CHANNEL
         printf '%s\n' "# Specific release tag when IMAGE_CHANNEL=pinned (e.g. v1.2.3)."
         _a TURNSTONE_SETUP_IMAGE_TAG
+        cat <<'S2A'
+
+# ---------------------------------------------------------------------------
+# Server nodes
+# ---------------------------------------------------------------------------
+# How many turnstone-server nodes to run. Positive integer  (default: 1)
+S2A
+        _a TURNSTONE_SETUP_NODE_COUNT
         cat <<'S3'
 
 # ---------------------------------------------------------------------------
@@ -485,6 +493,24 @@ section_image_tag() {
         warn "could not resolve a release tag automatically."
         prompt_value IMAGE_TAG TURNSTONE_SETUP_IMAGE_TAG "Image tag to pin (e.g. v1.2.3)"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# Server node count. Node 1 is the base compose `server` service; any extra
+# node is generated into compose.override.yaml with its own identity.
+# ---------------------------------------------------------------------------
+section_nodes() {
+    while :; do
+        prompt_value NODE_COUNT TURNSTONE_SETUP_NODE_COUNT \
+            "How many turnstone-server nodes should this deployment run?" "1"
+        [[ "$NODE_COUNT" =~ ^[1-9][0-9]*$ ]] && return
+        # Re-prompting cannot fix a bad exported/non-interactive value.
+        if [[ -v TURNSTONE_SETUP_NODE_COUNT ]] || _no_tty; then
+            die "node count must be a positive integer (got '$NODE_COUNT')"
+        fi
+        _FILE_DEFAULTS[TURNSTONE_SETUP_NODE_COUNT]=""
+        printf 'Enter a positive whole number.\n' >/dev/tty
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -786,10 +812,60 @@ EOF
     chmod 600 "$OUT_OIDC_ENV"
 }
 
+# Nodes 2…N. Each extends the base `server` service and overrides only its
+# own identity. `extends` does not carry depends_on, so it is restated here.
+write_extra_nodes() {
+    local i
+    for ((i = 2; i <= NODE_COUNT; i++)); do
+        cat <<EOF
+  server-$i:
+    extends:
+      file: compose.yaml
+      service: server
+    environment:
+      TURNSTONE_NODE_ID: node-$i
+      TURNSTONE_ADVERTISE_URL: http://server-$i:8080
+EOF
+        if [ "$MTLS_ENABLED" = 1 ]; then
+            cat <<EOF
+      TURNSTONE_TLS_ENABLED: "true"
+      TURNSTONE_TLS_SANS: server-$i
+EOF
+        fi
+        if [ "$OIDC_ENABLED" = 1 ]; then
+            cat <<'EOF'
+    env_file:
+      - ./config/turnstone-oidc.env
+EOF
+        fi
+        cat <<'EOF'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      searxng:
+        condition: service_healthy
+EOF
+        if [ "$MTLS_ENABLED" = 1 ]; then
+            # Mirrors tls.compose.yaml's `server` patch: the node enrolls its
+            # cert through the console and then only speaks mTLS, which the
+            # plain-HTTP healthcheck cannot probe.
+            cat <<'EOF'
+      console:
+        condition: service_healthy
+    volumes:
+      - tls-certs:/certs:ro
+    healthcheck:
+      disable: true
+EOF
+        fi
+    done
+}
+
 write_override() {
     local need_override=0
     if [ "$OIDC_ENABLED" = 1 ]; then need_override=1; fi
     if [ "$PUBLIC_DNS_ENABLED" = 1 ]; then need_override=1; fi
+    if [ "$NODE_COUNT" -gt 1 ]; then need_override=1; fi
     if [ "$need_override" != 1 ]; then
         rm -f "$OUT_OVERRIDE"
         return
@@ -806,6 +882,9 @@ write_override() {
       - ./config/turnstone-oidc.env
 EOF
             done
+        fi
+        if [ "$NODE_COUNT" -gt 1 ]; then
+            write_extra_nodes
         fi
         if [ "$PUBLIC_DNS_ENABLED" = 1 ]; then
             # pull_policy: build — the image only exists locally (built from
@@ -833,9 +912,15 @@ EOF
 }
 
 write_env_file() {
-    local compose_chain="compose.yaml"
-    if [ -f "$OUT_OVERRIDE" ]; then compose_chain="$compose_chain:override.compose.yaml"; fi
-    if [ "$MTLS_ENABLED" = 1 ]; then compose_chain="$compose_chain:tls.compose.yaml"; fi
+    # Compose auto-loads compose.override.yaml, but only while COMPOSE_FILE is
+    # unset — so the variable is written for the mTLS chain only, and must then
+    # name the override explicitly.
+    local compose_chain=""
+    if [ "$MTLS_ENABLED" = 1 ]; then
+        compose_chain="compose.yaml"
+        if [ -f "$OUT_OVERRIDE" ]; then compose_chain="$compose_chain:compose.override.yaml"; fi
+        compose_chain="$compose_chain:tls.compose.yaml"
+    fi
 
     info "Generating secrets and writing $OUT_ENV"
     local jwt_secret pg_password existing_jwt="" existing_pg=""
@@ -952,7 +1037,9 @@ Remedies — choose one and rerun: \
 
     {
         echo "# Generated deployment settings. Keep this file private (contains secrets)."
-        echo "COMPOSE_FILE=$compose_chain"
+        if [ -n "$compose_chain" ]; then
+            echo "COMPOSE_FILE=$compose_chain"
+        fi
         echo "TURNSTONE_IMAGE_TAG=$IMAGE_TAG"
         echo "TURNSTONE_JWT_SECRET=$jwt_secret"
         echo "POSTGRES_PASSWORD=$pg_password"
@@ -1027,6 +1114,7 @@ main() {
     # generated automatically, so answering 'no' everywhere below still
     # yields a secure stack (local-CA HTTPS, random credentials).
     section_image_tag
+    section_nodes
 
     # Optional feature sections — each starts with a yes/no.
     section_oidc
