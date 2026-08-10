@@ -95,6 +95,31 @@ class TestServerSpec:
         assert "requestBody" in send
         assert "application/json" in send["requestBody"]["content"]
 
+    def test_approval_and_cancel_preserve_extended_response_contracts(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        spec = build_server_spec()
+        approve = spec["paths"]["/v1/api/workstreams/{ws_id}/approve"]["post"]
+        cancel = spec["paths"]["/v1/api/workstreams/{ws_id}/cancel"]["post"]
+        assert approve["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/ApproveResponse"
+        }
+        assert cancel["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/CancelResponse"
+        }
+        assert cancel["requestBody"]["required"] is False
+        assert "cycle_id" in spec["components"]["schemas"]["ApproveResponse"]["properties"]
+        assert "dropped" in spec["components"]["schemas"]["CancelResponse"]["properties"]
+
+    def test_create_status_is_optional_but_never_advertised_as_null(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        spec = build_server_spec()
+        schema = spec["components"]["schemas"]["CreateWorkstreamResponse"]
+        status = schema["properties"]["initial_message_status"]
+        assert status["enum"] == ["queue_full", "refused_closed"]
+        assert "initial_message_status" not in schema.get("required", [])
+
     def test_health_endpoint_not_versioned(self):
         from turnstone.api.server_spec import build_server_spec
 
@@ -173,6 +198,66 @@ class TestConsoleSpec:
         }
         assert expected.issubset(paths), f"Missing: {expected - paths}"
 
+    def test_routing_paths_and_extended_response_contracts(self):
+        from turnstone.api.console_spec import build_console_spec
+
+        spec = build_console_spec()
+        paths = spec["paths"]
+        for suffix in ("send", "approve", "cancel", "rewind", "retry", "close"):
+            assert f"/v1/api/route/workstreams/{{ws_id}}/{suffix}" in paths
+        assert "/v1/api/route/send" not in paths
+        assert "/v1/api/route/approve" not in paths
+        assert "/v1/api/route/cancel" not in paths
+        assert "/v1/api/route/workstreams/close" not in paths
+
+        coordinator_approve = paths["/v1/api/workstreams/{ws_id}/approve"]["post"]
+        coordinator_cancel = paths["/v1/api/workstreams/{ws_id}/cancel"]["post"]
+        assert coordinator_approve["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/ApproveResponse"
+        }
+        assert coordinator_cancel["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/CancelResponse"
+        }
+        assert coordinator_cancel["requestBody"]["required"] is False
+
+    def test_route_create_and_live_contracts(self):
+        from turnstone.api.console_spec import build_console_spec
+
+        spec = build_console_spec()
+        route_create = spec["paths"]["/v1/api/route/workstreams/new"]["post"]
+        assert route_create["requestBody"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/RouteCreateRequest"
+        }
+        ws_id_param = next(p for p in route_create["parameters"] if p["name"] == "ws_id")
+        assert ws_id_param["required"] is False
+        assert "multipart" in ws_id_param["description"]
+        assert route_create["responses"]["200"]["content"]["application/json"]["schema"] == {
+            "$ref": "#/components/schemas/RouteCreateResponse"
+        }
+        route_response = spec["components"]["schemas"]["RouteCreateResponse"]
+        assert "routing_strategy" in route_response["properties"]
+        assert {"node_url", "node_id", "routing_strategy"}.issubset(set(route_response["required"]))
+        assert route_response["properties"]["routing_strategy"]["enum"] == [
+            "rendezvous",
+            "target_node",
+            "resume",
+        ]
+        assert set(route_create["responses"]) == {
+            "200",
+            "400",
+            "403",
+            "404",
+            "409",
+            "413",
+            "429",
+            "500",
+            "502",
+            "503",
+        }
+
+        live = spec["paths"]["/v1/api/route/workstreams/{ws_id}/live"]["get"]
+        assert set(live["responses"]) == {"200", "400", "502", "503"}
+
     def test_coordinator_create_has_request_body_and_200(self):
         """Coordinator create returns 200 and accepts a body.
 
@@ -210,3 +295,65 @@ class TestConsoleSpec:
                 assert "Coordinator" in op.get("tags", []), (
                     f"{path} missing Coordinator tag (tags={op.get('tags')})"
                 )
+
+
+def test_model_max_concurrency_schema_is_strict_non_nullable_integer() -> None:
+    from turnstone.api.console_spec import build_console_spec
+
+    schemas = build_console_spec()["components"]["schemas"]
+    for name in ("ModelDefinitionInfo", "CreateModelDefinitionRequest"):
+        prop = schemas[name]["properties"]["max_concurrency"]
+        assert prop["type"] == "integer"
+        assert prop["default"] == 0
+        assert prop["minimum"] == 0
+        assert prop["maximum"] == 2_147_483_647
+        assert "anyOf" not in prop
+
+    update_prop = schemas["UpdateModelDefinitionRequest"]["properties"]["max_concurrency"]
+    assert update_prop["type"] == "integer"
+    assert update_prop["minimum"] == 0
+    assert update_prop["maximum"] == 2_147_483_647
+    assert "anyOf" not in update_prop
+    assert "default" not in update_prop
+
+
+class TestCheckedInArtifactFreshness:
+    """The checked-in `sdk/typescript/*.json` specs must match their source.
+
+    ``info.version`` is normalised out on purpose: it tracks
+    ``turnstone.__version__``, so comparing it would fail every release bump
+    with a misdiagnosing "spec is stale" message.
+    """
+
+    @staticmethod
+    def _schema_only(spec: dict) -> dict:
+        """The spec with the release-coupled version stripped."""
+        pruned = dict(spec)
+        pruned["info"] = {k: v for k, v in spec.get("info", {}).items() if k != "version"}
+        return pruned
+
+    def _checked_in(self, name: str) -> dict:
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        return json.loads((root / "sdk" / "typescript" / name).read_text())
+
+    def test_server_spec_matches_checked_in_artifact(self):
+        from turnstone.api.server_spec import build_server_spec
+
+        assert self._schema_only(build_server_spec()) == self._schema_only(
+            self._checked_in("openapi-server.json")
+        ), (
+            "openapi-server.json is stale; regenerate with "
+            "`uv run python scripts/generate-types.py` in sdk/typescript/"
+        )
+
+    def test_console_spec_matches_checked_in_artifact(self):
+        from turnstone.api.console_spec import build_console_spec
+
+        assert self._schema_only(build_console_spec()) == self._schema_only(
+            self._checked_in("openapi-console.json")
+        ), (
+            "openapi-console.json is stale; regenerate with "
+            "`uv run python scripts/generate-types.py` in sdk/typescript/"
+        )

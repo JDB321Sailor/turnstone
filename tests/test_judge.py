@@ -5,18 +5,46 @@ from __future__ import annotations
 import json
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from tests._session_helpers import as_stream
 from tests._session_helpers import mock_completion_result as _mock_result
+from turnstone.core.admission import ModelAdmission
 from turnstone.core.judge import IntentJudge, IntentVerdict, JudgeConfig, evaluate_heuristic
+from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+from turnstone.core.model_registry import ModelConfig
+from turnstone.core.model_turn import ModelLane, ResolvedModelBinding
+from turnstone.core.providers._protocol import IncompleteStreamError, ModelCapabilities
 from turnstone.core.trajectory import Role
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class _VersionedConfigStore:
+    def __init__(self, temperature: float, reasoning_effort: str) -> None:
+        self.version = 0
+        self._values: dict[str, Any] = {
+            "model.temperature": temperature,
+            "model.reasoning_effort": reasoning_effort,
+        }
+
+    def get(self, key: str) -> Any:
+        return self._values.get(key)
+
+    def set_sampling(self, temperature: float, reasoning_effort: str) -> None:
+        self._values = {
+            **self._values,
+            "model.temperature": temperature,
+            "model.reasoning_effort": reasoning_effort,
+        }
+        self.version += 1
 
 
 def _make_mock_provider(
@@ -28,10 +56,13 @@ def _make_mock_provider(
     """Create a mock LLM provider that returns a fixed response."""
     provider = MagicMock()
     provider.provider_name = "openai"
-    caps = MagicMock()
-    caps.context_window = 100_000
-    caps.max_output_tokens = 4096
-    provider.get_capabilities.return_value = caps
+    # A REAL ModelCapabilities, never a MagicMock: every attribute of a
+    # mock is truthy, so any boolean capability the code consults (the
+    # drain's ``server_parses_reasoning`` scan gate, and whatever field
+    # lands next) would silently flip behavior for the whole suite.
+    provider.get_capabilities.return_value = ModelCapabilities(
+        context_window=100_000, max_output_tokens=4096
+    )
 
     if side_effect:
         provider.create_streaming.side_effect = side_effect
@@ -45,12 +76,43 @@ def _make_mock_provider(
     return provider
 
 
+def _binding(
+    provider: Any,
+    client: Any,
+    model: str,
+    *,
+    capabilities: ModelCapabilities | None = None,
+    registry: Any | None = None,
+    alias: str = "",
+    config: Any | None = None,
+    generation: int = 0,
+    temperature: float | None = None,
+    reasoning_effort: str | None = None,
+) -> ResolvedModelBinding:
+    caps = capabilities or provider.get_capabilities(model)
+    return ResolvedModelBinding(
+        lane=ModelLane(
+            provider=provider,
+            client=client,
+            model=model,
+            alias=alias,
+            capabilities=caps,
+            registry=registry,
+            temperature=temperature,
+            reasoning_effort=reasoning_effort,
+        ),
+        config=config,
+        registry_generation=generation,
+    )
+
+
 def _make_judge(
     provider: MagicMock | None = None,
     *,
     confidence_threshold: float = 0.7,
     read_only_tools: bool = True,
     timeout: float = 60.0,
+    parallel_evaluations: int = 1,
 ) -> IntentJudge:
     """Create a judge with a mock provider."""
     if provider is None:
@@ -61,16 +123,19 @@ def _make_judge(
         confidence_threshold=confidence_threshold,
         read_only_tools=read_only_tools,
         timeout=timeout,
+        parallel_evaluations=parallel_evaluations,
     )
     client = MagicMock()
     client.base_url = "https://api.openai.com/v1"
     client.api_key = "test-key"
     return IntentJudge(
         config=config,
-        session_provider=provider,
-        session_client=client,
-        session_model="test-model",
-        session_capabilities=MagicMock(context_window=100_000),
+        session_binding=_binding(
+            provider,
+            client,
+            "test-model",
+            capabilities=ModelCapabilities(context_window=100_000),
+        ),
     )
 
 
@@ -98,6 +163,54 @@ def _good_verdict_json(**overrides: Any) -> str:
     }
     verdict.update(overrides)
     return json.dumps(verdict)
+
+
+def _llm_verdict_for(item: dict[str, Any]) -> IntentVerdict:
+    """Build one deterministic successful verdict for scheduler tests."""
+    call_id = str(item.get("call_id", ""))
+    func_name = str(item.get("func_name", ""))
+    return IntentVerdict(
+        verdict_id=f"v-{call_id}",
+        call_id=call_id,
+        func_name=func_name,
+        func_args=json.dumps(item.get("func_args", {}), sort_keys=True),
+        intent_summary=f"Evaluate {call_id}",
+        risk_level="low",
+        confidence=0.99,
+        recommendation="approve",
+        reasoning="Deterministic scheduler-test verdict.",
+        evidence=[],
+        tier="llm",
+        judge_model="test-model",
+        latency_ms=1,
+    )
+
+
+class _TrackingClient:
+    """Tiny per-worker client whose close lifecycle is directly assertable."""
+
+    def __init__(self) -> None:
+        self.close_count = 0
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+def _tracking_client_factory(
+    judge: IntentJudge,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[_TrackingClient]:
+    clients: list[_TrackingClient] = []
+    lock = threading.Lock()
+
+    def _create() -> _TrackingClient:
+        client = _TrackingClient()
+        with lock:
+            clients.append(client)
+        return client
+
+    monkeypatch.setattr(judge, "_create_client", _create)
+    return clients
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +467,924 @@ class TestCancelEventSemantics:
         assert all(v.tier == "llm" for v in results)
         assert provider.create_streaming.call_count == 3
 
+    def test_queued_backend_auth_resolves_after_admission_per_attempt(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A queued judge never ages and reuses a pre-admission token."""
+        monkeypatch.setattr("turnstone.core.model_turn._DRAIN_RETRY_BASE_DELAY", 0.0)
+        provider = _make_mock_provider(_good_verdict_json())
+        provider.retryable_error_names = frozenset({"IncompleteStreamError"})
+
+        def _incomplete_stream() -> Any:
+            yield from ()
+            raise IncompleteStreamError("retry after admission")
+
+        provider.create_streaming.side_effect = [
+            _incomplete_stream(),
+            as_stream(_mock_result(_good_verdict_json())),
+        ]
+        judge = _make_judge(provider)
+        admission = ModelAdmission("judge", 1)
+        auth_config = MagicMock(name="pinned-auth-config")
+        judge._lane = replace(
+            judge._lane,
+            alias="judge",
+            admission=admission,
+            backend_auth_config=auth_config,
+        )
+
+        batch_client = MagicMock()
+        batch_client.with_options.side_effect = lambda *, api_key: f"client:{api_key}"
+        judge._create_client = MagicMock(return_value=batch_client)  # type: ignore[method-assign]
+
+        token_epoch = "stale"
+        resolutions: list[tuple[str, Any, str]] = []
+
+        def _resolve(alias: str, config: ModelConfig | None) -> str:
+            token = f"{token_epoch}-{len(resolutions) + 1}"
+            resolutions.append((alias, config, token))
+            return token
+
+        results: list[IntentVerdict] = []
+        done = threading.Event()
+        holder = admission.acquire()
+
+        judge.evaluate(
+            [_make_item()],
+            [{"role": "user", "content": "test"}],
+            results.append,
+            done_callback=done.set,
+            backend_auth_resolver=_resolve,
+        )
+
+        deadline = time.monotonic() + 2.0
+        while admission.snapshot().queued != 1 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        queued = admission.snapshot().queued == 1
+        resolutions_while_queued = list(resolutions)
+        token_epoch = "fresh"
+        holder.release()
+
+        assert done.wait(5.0)
+        assert queued
+        assert resolutions_while_queued == []
+        assert resolutions == [
+            ("judge", auth_config, "fresh-1"),
+            ("judge", auth_config, "fresh-2"),
+        ]
+        assert batch_client.with_options.call_count == 2
+        assert [call.kwargs["api_key"] for call in batch_client.with_options.call_args_list] == [
+            "fresh-1",
+            "fresh-2",
+        ]
+        assert [call.kwargs["client"] for call in provider.create_streaming.call_args_list] == [
+            "client:fresh-1",
+            "client:fresh-2",
+        ]
+        assert len(results) == 1
+        assert results[0].tier == "llm"
+
+    def test_lazy_auth_failure_falls_back_remaining_batch_without_dispatch(self, caplog) -> None:
+        """A fail-closed mint after admission aborts the whole judge batch."""
+        provider = _make_mock_provider(_good_verdict_json())
+        judge = _make_judge(provider)
+        admission = ModelAdmission("judge", 1)
+        auth_config = MagicMock(name="pinned-auth-config")
+        judge._lane = replace(
+            judge._lane,
+            alias="judge",
+            admission=admission,
+            backend_auth_config=auth_config,
+        )
+
+        batch_client = MagicMock()
+        judge._create_client = MagicMock(return_value=batch_client)  # type: ignore[method-assign]
+        resolver = MagicMock(side_effect=BackendAuthUnavailableError("mint unavailable"))
+        items = [_make_item(call_id=f"tc_{i}") for i in range(3)]
+        results: list[IntentVerdict] = []
+        done = threading.Event()
+        holder = admission.acquire()
+
+        with caplog.at_level("ERROR", logger="turnstone.core.judge"):
+            judge.evaluate(
+                items,
+                [{"role": "user", "content": "test"}],
+                results.append,
+                done_callback=done.set,
+                backend_auth_resolver=resolver,
+            )
+
+            deadline = time.monotonic() + 2.0
+            while admission.snapshot().queued != 1 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            queued = admission.snapshot().queued == 1
+            resolutions_while_queued = resolver.call_count
+            holder.release()
+            finished = done.wait(5.0)
+
+        assert queued
+        assert resolutions_while_queued == 0
+        assert finished
+        resolver.assert_called_once_with("judge", auth_config)
+        batch_client.with_options.assert_not_called()
+        provider.create_streaming.assert_not_called()
+        assert admission.snapshot().in_flight == 0
+        assert [verdict.call_id for verdict in results] == ["tc_0", "tc_1", "tc_2"]
+        assert all(verdict.tier == "llm_fallback" for verdict in results)
+        assert all(
+            "judge backend authentication failed" in verdict.reasoning for verdict in results
+        )
+        auth_logs = [
+            record
+            for record in caplog.records
+            if "Judge backend authentication failed" in record.getMessage()
+        ]
+        assert len(auth_logs) == 1
+
+    def test_cancelled_batch_skips_backend_auth_resolution(self):
+        """The daemon checks cancellation before doing a credential mint."""
+        judge = _make_judge(_make_mock_provider(_good_verdict_json()))
+        resolver = MagicMock(return_value="unused")
+        cancel = threading.Event()
+        cancel.set()
+        results: list[IntentVerdict] = []
+
+        judge.evaluate(
+            [_make_item()],
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=cancel,
+            backend_auth_resolver=resolver,
+        )
+        _wait_for(results, 1)
+
+        resolver.assert_not_called()
+        assert results[0].tier == "llm_fallback"
+
+
+# ---------------------------------------------------------------------------
+# Parallel batch scheduling
+# ---------------------------------------------------------------------------
+
+
+class TestParallelEvaluationScheduling:
+    def test_parallel_evaluations_default_and_strict_range(self) -> None:
+        assert JudgeConfig().parallel_evaluations == 1
+        assert JudgeConfig(parallel_evaluations=1).parallel_evaluations == 1
+        assert JudgeConfig(parallel_evaluations=16).parallel_evaluations == 16
+
+        invalid_values: list[Any] = [True, False, 0, 17, 1.0, "2", None]
+        for value in invalid_values:
+            with pytest.raises(
+                ValueError,
+                match=r"judge\.parallel_evaluations.*integer between 1 and 16",
+            ):
+                JudgeConfig(parallel_evaluations=value)
+
+    def test_configured_width_sets_exact_peak_and_completes_every_item(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        judge = _make_judge(parallel_evaluations=3)
+        clients = _tracking_client_factory(judge, monkeypatch)
+        items = [_make_item(call_id=f"tc_{idx}") for idx in range(7)]
+        lock = threading.Lock()
+        first_wave = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+        started: list[str] = []
+        active = 0
+        peak = 0
+        wait_timed_out = False
+
+        def _evaluate(
+            item: dict[str, Any],
+            _messages: list[dict[str, Any]],
+            _cancel_event: threading.Event | None,
+            _client: Any,
+            *,
+            lane: ModelLane | None = None,
+        ) -> IntentVerdict:
+            del lane
+            nonlocal active, peak, wait_timed_out
+            with lock:
+                started.append(str(item["call_id"]))
+                active += 1
+                peak = max(peak, active)
+                if active == 3:
+                    first_wave.set()
+            released = release.wait(5.0)
+            with lock:
+                active -= 1
+                wait_timed_out = wait_timed_out or not released
+            return _llm_verdict_for(item)
+
+        monkeypatch.setattr(judge, "_evaluate_single", _evaluate)
+        results: list[IntentVerdict] = []
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            results.append,
+            done_callback=done.set,
+        )
+        try:
+            reached_first_wave = first_wave.wait(2.0)
+            with lock:
+                first_snapshot = (list(started), active, peak)
+        finally:
+            release.set()
+
+        assert done.wait(5.0)
+        assert reached_first_wave
+        assert set(first_snapshot[0]) == {"tc_0", "tc_1", "tc_2"}
+        assert first_snapshot[1:] == (3, 3)
+        assert wait_timed_out is False
+        assert len(started) == 7
+        assert peak == 3
+        assert active == 0
+        assert len(results) == 7
+        assert {verdict.call_id for verdict in results} == {f"tc_{idx}" for idx in range(7)}
+        assert all(verdict.tier == "llm" for verdict in results)
+        assert len(clients) == 3
+        assert all(client.close_count == 1 for client in clients)
+
+    def test_partial_worker_start_failure_delivers_every_fallback_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        judge = _make_judge(parallel_evaluations=3)
+        clients = _tracking_client_factory(judge, monkeypatch)
+        items = [_make_item(call_id=f"tc_{idx}") for idx in range(5)]
+        first_evaluation_started = threading.Event()
+        done = threading.Event()
+        lock = threading.Lock()
+        evaluated: list[str] = []
+        results: list[IntentVerdict] = []
+        done_count = 0
+
+        def _evaluate(
+            item: dict[str, Any],
+            _messages: list[dict[str, Any]],
+            cancel_event: threading.Event | None,
+            _client: Any,
+            *,
+            lane: ModelLane | None = None,
+        ) -> None:
+            del lane
+            with lock:
+                evaluated.append(str(item["call_id"]))
+            first_evaluation_started.set()
+            if cancel_event is None or not cancel_event.wait(5.0):
+                raise RuntimeError("worker startup failure did not abort its active sibling")
+            return None
+
+        def _done() -> None:
+            nonlocal done_count
+            with lock:
+                done_count += 1
+            done.set()
+
+        real_thread = threading.Thread
+
+        class _FailingStart:
+            def start(self) -> None:
+                if not first_evaluation_started.wait(5.0):
+                    raise RuntimeError("first worker did not begin evaluation")
+                raise RuntimeError("second worker failed to start")
+
+        def _thread_factory(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("name") == "intent-judge-eval-2":
+                return _FailingStart()
+            return real_thread(*args, **kwargs)
+
+        monkeypatch.setattr("turnstone.core.judge.threading.Thread", _thread_factory)
+        monkeypatch.setattr(judge, "_evaluate_single", _evaluate)
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            results.append,
+            done_callback=_done,
+        )
+
+        assert done.wait(8.0)
+        assert first_evaluation_started.is_set()
+        assert evaluated == ["tc_0"]
+        assert len(results) == 5
+        assert sorted(verdict.call_id for verdict in results) == [f"tc_{idx}" for idx in range(5)]
+        assert all(verdict.tier == "llm_fallback" for verdict in results)
+        assert all("worker initialization failed" in verdict.reasoning for verdict in results)
+        assert done_count == 1
+        assert len(clients) == 1
+        assert clients[0].close_count == 1
+
+    def test_first_worker_start_failure_delivers_every_fallback_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        judge = _make_judge(parallel_evaluations=3)
+        clients = _tracking_client_factory(judge, monkeypatch)
+        items = [_make_item(call_id=f"tc_{idx}") for idx in range(4)]
+        done = threading.Event()
+        results: list[IntentVerdict] = []
+        done_count = 0
+        real_thread = threading.Thread
+
+        class _FailingStart:
+            def start(self) -> None:
+                raise RuntimeError("first worker failed to start")
+
+        def _thread_factory(*args: Any, **kwargs: Any) -> Any:
+            if kwargs.get("name") == "intent-judge-eval-1":
+                return _FailingStart()
+            return real_thread(*args, **kwargs)
+
+        def _done() -> None:
+            nonlocal done_count
+            done_count += 1
+            done.set()
+
+        monkeypatch.setattr("turnstone.core.judge.threading.Thread", _thread_factory)
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            results.append,
+            done_callback=_done,
+        )
+
+        assert done.wait(5.0)
+        assert len(results) == 4
+        assert sorted(verdict.call_id for verdict in results) == [f"tc_{idx}" for idx in range(4)]
+        assert all(verdict.tier == "llm_fallback" for verdict in results)
+        assert all("worker initialization failed" in verdict.reasoning for verdict in results)
+        assert done_count == 1
+        assert clients == []
+
+    def test_callbacks_follow_completion_order_without_head_of_line_blocking(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        judge = _make_judge(parallel_evaluations=2)
+        _tracking_client_factory(judge, monkeypatch)
+        started = {"tc_0": threading.Event(), "tc_1": threading.Event()}
+        release = {"tc_0": threading.Event(), "tc_1": threading.Event()}
+        second_delivered = threading.Event()
+        done = threading.Event()
+        callback_order: list[str] = []
+        callback_lock = threading.Lock()
+
+        def _evaluate(
+            item: dict[str, Any],
+            _messages: list[dict[str, Any]],
+            _cancel_event: threading.Event | None,
+            _client: Any,
+            *,
+            lane: ModelLane | None = None,
+        ) -> IntentVerdict:
+            del lane
+            call_id = str(item["call_id"])
+            started[call_id].set()
+            release[call_id].wait(5.0)
+            return _llm_verdict_for(item)
+
+        def _callback(verdict: IntentVerdict) -> None:
+            with callback_lock:
+                callback_order.append(verdict.call_id)
+                if verdict.call_id == "tc_1":
+                    second_delivered.set()
+
+        monkeypatch.setattr(judge, "_evaluate_single", _evaluate)
+        judge.evaluate(
+            [_make_item(call_id="tc_0"), _make_item(call_id="tc_1")],
+            [{"role": "user", "content": "test"}],
+            _callback,
+            done_callback=done.set,
+        )
+        try:
+            both_started = started["tc_0"].wait(2.0) and started["tc_1"].wait(2.0)
+            if both_started:
+                release["tc_1"].set()
+            delivered_before_first = second_delivered.wait(2.0)
+            with callback_lock:
+                before_first_release = list(callback_order)
+        finally:
+            release["tc_0"].set()
+            release["tc_1"].set()
+
+        assert done.wait(5.0)
+        assert both_started
+        assert delivered_before_first
+        assert before_first_release == ["tc_1"]
+        assert callback_order == ["tc_1", "tc_0"]
+
+    def test_duplicate_nonempty_call_ids_remain_distinct_indexed_work_items(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        judge = _make_judge(parallel_evaluations=2)
+        _tracking_client_factory(judge, monkeypatch)
+        items = [
+            _make_item(call_id="duplicate", func_name="bash"),
+            _make_item(call_id="duplicate", func_name="write_file"),
+        ]
+        first_wave = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+        lock = threading.Lock()
+        started: list[str] = []
+        callback_attempts: list[tuple[str, str]] = []
+
+        def _evaluate(
+            item: dict[str, Any],
+            _messages: list[dict[str, Any]],
+            _cancel_event: threading.Event | None,
+            _client: Any,
+            *,
+            lane: ModelLane | None = None,
+        ) -> IntentVerdict:
+            del lane
+            with lock:
+                started.append(str(item["func_name"]))
+                if len(started) == 2:
+                    first_wave.set()
+            release.wait(5.0)
+            return _llm_verdict_for(item)
+
+        monkeypatch.setattr(judge, "_evaluate_single", _evaluate)
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            lambda verdict: callback_attempts.append((verdict.call_id, verdict.func_name)),
+            done_callback=done.set,
+        )
+        try:
+            reached_first_wave = first_wave.wait(2.0)
+        finally:
+            release.set()
+
+        assert done.wait(5.0)
+        assert reached_first_wave
+        assert set(started) == {"bash", "write_file"}
+        assert sorted(callback_attempts) == [
+            ("duplicate", "bash"),
+            ("duplicate", "write_file"),
+        ]
+
+    def test_cancel_stops_queued_dispatch_and_delivers_each_fallback_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        judge = _make_judge(parallel_evaluations=2)
+        clients = _tracking_client_factory(judge, monkeypatch)
+        items = [_make_item(call_id=f"tc_{idx}") for idx in range(5)]
+        cancel = threading.Event()
+        first_wave = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+        lock = threading.Lock()
+        started: list[str] = []
+        results: list[IntentVerdict] = []
+        done_count = 0
+
+        def _evaluate(
+            item: dict[str, Any],
+            _messages: list[dict[str, Any]],
+            cancel_event: threading.Event | None,
+            _client: Any,
+            *,
+            lane: ModelLane | None = None,
+        ) -> IntentVerdict | None:
+            del lane
+            with lock:
+                started.append(str(item["call_id"]))
+                if len(started) == 2:
+                    first_wave.set()
+            release.wait(5.0)
+            if cancel_event is not None and cancel_event.is_set():
+                return None
+            return _llm_verdict_for(item)
+
+        def _done() -> None:
+            nonlocal done_count
+            with lock:
+                done_count += 1
+            done.set()
+
+        monkeypatch.setattr(judge, "_evaluate_single", _evaluate)
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=cancel,
+            done_callback=_done,
+        )
+        try:
+            reached_first_wave = first_wave.wait(2.0)
+            cancel.set()
+        finally:
+            release.set()
+
+        assert done.wait(5.0)
+        assert reached_first_wave
+        assert set(started) == {"tc_0", "tc_1"}
+        assert len(results) == 5
+        assert sorted(verdict.call_id for verdict in results) == [f"tc_{idx}" for idx in range(5)]
+        assert all(verdict.tier == "llm_fallback" for verdict in results)
+        assert all("cancelled" in verdict.reasoning for verdict in results)
+        assert done_count == 1
+        assert len(clients) == 2
+        assert all(client.close_count == 1 for client in clients)
+
+    def test_backend_auth_failure_aborts_unstarted_work_without_duplicate_verdicts(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        judge = _make_judge(parallel_evaluations=3)
+        clients = _tracking_client_factory(judge, monkeypatch)
+        items = [_make_item(call_id=f"tc_{idx}") for idx in range(6)]
+        all_started = threading.Event()
+        done = threading.Event()
+        lock = threading.Lock()
+        started: list[str] = []
+        results: list[IntentVerdict] = []
+
+        def _evaluate(
+            item: dict[str, Any],
+            _messages: list[dict[str, Any]],
+            cancel_event: threading.Event | None,
+            _client: Any,
+            *,
+            lane: ModelLane | None = None,
+        ) -> IntentVerdict | None:
+            del lane
+            call_id = str(item["call_id"])
+            with lock:
+                started.append(call_id)
+                if len(started) == 3:
+                    all_started.set()
+            if call_id == "tc_0":
+                if not all_started.wait(5.0):
+                    raise RuntimeError("scheduler did not start the configured first wave")
+                raise BackendAuthUnavailableError("mint unavailable")
+            if cancel_event is None or not cancel_event.wait(5.0):
+                raise RuntimeError("batch auth failure did not abort active siblings")
+            return None
+
+        monkeypatch.setattr(judge, "_evaluate_single", _evaluate)
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            results.append,
+            done_callback=done.set,
+        )
+
+        assert done.wait(8.0)
+        assert set(started) == {"tc_0", "tc_1", "tc_2"}
+        assert len(results) == 6
+        assert sorted(verdict.call_id for verdict in results) == [f"tc_{idx}" for idx in range(6)]
+        assert all(verdict.tier == "llm_fallback" for verdict in results)
+        assert all("backend authentication failed" in verdict.reasoning for verdict in results)
+        assert len(clients) == 3
+        assert all(client.close_count == 1 for client in clients)
+
+    def test_callback_failure_does_not_abort_batch_and_closes_every_worker_client(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        judge = _make_judge(parallel_evaluations=3)
+        clients = _tracking_client_factory(judge, monkeypatch)
+        items = [_make_item(call_id=f"tc_{idx}") for idx in range(5)]
+        first_wave = threading.Event()
+        release = threading.Event()
+        done = threading.Event()
+        lock = threading.Lock()
+        started_count = 0
+        callback_attempts: list[str] = []
+        closed_at_done: list[int] = []
+
+        def _evaluate(
+            item: dict[str, Any],
+            _messages: list[dict[str, Any]],
+            _cancel_event: threading.Event | None,
+            _client: Any,
+            *,
+            lane: ModelLane | None = None,
+        ) -> IntentVerdict:
+            del lane
+            nonlocal started_count
+            with lock:
+                started_count += 1
+                if started_count == 3:
+                    first_wave.set()
+            release.wait(5.0)
+            return _llm_verdict_for(item)
+
+        def _callback(verdict: IntentVerdict) -> None:
+            callback_attempts.append(verdict.call_id)
+            if verdict.call_id == "tc_1":
+                raise RuntimeError("consumer failed")
+
+        def _done() -> None:
+            closed_at_done.append(sum(client.close_count for client in clients))
+            done.set()
+
+        monkeypatch.setattr(judge, "_evaluate_single", _evaluate)
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            _callback,
+            done_callback=_done,
+        )
+        try:
+            reached_first_wave = first_wave.wait(2.0)
+        finally:
+            release.set()
+
+        assert done.wait(5.0)
+        assert reached_first_wave
+        assert sorted(callback_attempts) == [f"tc_{idx}" for idx in range(5)]
+        assert len(clients) == 3
+        assert all(client.close_count == 1 for client in clients)
+        assert closed_at_done == [3]
+
+    def test_model_alias_admission_is_a_second_concurrency_ceiling(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = _make_mock_provider(_good_verdict_json())
+        judge = _make_judge(provider, parallel_evaluations=4)
+        clients = _tracking_client_factory(judge, monkeypatch)
+        admission = ModelAdmission("judge", 2)
+        judge._lane = replace(
+            judge._lane,
+            alias="judge",
+            admission=admission,
+        )
+        items = [_make_item(call_id=f"tc_{idx}") for idx in range(6)]
+        first_wave = threading.Event()
+        release = threading.Event()
+        cancel = threading.Event()
+        done = threading.Event()
+        lock = threading.Lock()
+        calls = 0
+        active = 0
+        peak = 0
+        wait_timed_out = False
+
+        def _stream(**_kwargs: Any) -> Any:
+            nonlocal calls, active, peak, wait_timed_out
+            with lock:
+                calls += 1
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    first_wave.set()
+            released = release.wait(5.0)
+            with lock:
+                active -= 1
+                wait_timed_out = wait_timed_out or not released
+            return as_stream(_mock_result(_good_verdict_json()))
+
+        provider.create_streaming.side_effect = _stream
+        results: list[IntentVerdict] = []
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=cancel,
+            done_callback=done.set,
+        )
+        reached_first_wave = first_wave.wait(3.0)
+        active_snapshot = admission.snapshot()
+        release.set()
+        finished = done.wait(10.0)
+        if not finished:
+            cancel.set()
+            release.set()
+            done.wait(5.0)
+
+        assert finished
+        assert reached_first_wave
+        assert active_snapshot.in_flight == 2
+        assert active_snapshot.queued == 0
+        assert calls == 6
+        assert peak == 2
+        assert active == 0
+        assert wait_timed_out is False
+        assert len(results) == 6
+        assert all(verdict.tier == "llm" for verdict in results)
+        assert admission.snapshot().in_flight == 0
+        assert admission.snapshot().queued == 0
+        assert len(clients) == 2
+        assert all(client.close_count == 1 for client in clients)
+
+    def test_hot_alias_resize_narrows_subsequent_scheduler_dispatch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = _make_mock_provider(_good_verdict_json())
+        judge = _make_judge(provider, parallel_evaluations=3)
+        clients = _tracking_client_factory(judge, monkeypatch)
+        admission = ModelAdmission("judge", 3)
+        judge._lane = replace(
+            judge._lane,
+            alias="judge",
+            admission=admission,
+        )
+        items = [_make_item(call_id=f"tc_{idx}") for idx in range(6)]
+        first_wave_started = threading.Event()
+        release_first_wave = threading.Event()
+        later_started = threading.Event()
+        release_later = threading.Event()
+        cancel = threading.Event()
+        done = threading.Event()
+        lock = threading.Lock()
+        results: list[IntentVerdict] = []
+        calls = 0
+        first_active = 0
+        first_peak = 0
+        later_active = 0
+        later_peak = 0
+        wait_timed_out = False
+
+        def _stream(**_kwargs: Any) -> Any:
+            nonlocal calls, first_active, first_peak, later_active, later_peak, wait_timed_out
+            with lock:
+                calls += 1
+                call_number = calls
+                if call_number <= 3:
+                    first_active += 1
+                    first_peak = max(first_peak, first_active)
+                    if first_active == 3:
+                        first_wave_started.set()
+                else:
+                    later_active += 1
+                    later_peak = max(later_peak, later_active)
+                    later_started.set()
+            released = release_first_wave.wait(5.0) if call_number <= 3 else release_later.wait(5.0)
+            with lock:
+                wait_timed_out = wait_timed_out or not released
+                if call_number <= 3:
+                    first_active -= 1
+                else:
+                    later_active -= 1
+            return as_stream(_mock_result(_good_verdict_json()))
+
+        provider.create_streaming.side_effect = _stream
+        judge.evaluate(
+            items,
+            [{"role": "user", "content": "test"}],
+            results.append,
+            cancel_event=cancel,
+            done_callback=done.set,
+        )
+
+        reached_first_wave = first_wave_started.wait(3.0)
+        initial_snapshot = admission.snapshot()
+        admission.set_limit(1)
+        release_first_wave.set()
+        reached_later = later_started.wait(5.0)
+        queued_snapshot = False
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            snapshot = admission.snapshot()
+            with lock:
+                later_call_snapshot = calls - 3
+            if snapshot.in_flight == 1 and snapshot.queued == 2:
+                queued_snapshot = True
+                break
+            if later_call_snapshot > 1:
+                break
+            time.sleep(0.005)
+        with lock:
+            narrowed_snapshot = (calls - 3, later_active, later_peak)
+        release_later.set()
+        finished = done.wait(10.0)
+        if not finished:
+            cancel.set()
+            release_first_wave.set()
+            release_later.set()
+            done.wait(5.0)
+
+        assert finished
+        assert reached_first_wave
+        assert initial_snapshot.in_flight == 3
+        assert initial_snapshot.queued == 0
+        assert reached_later
+        assert queued_snapshot
+        assert narrowed_snapshot == (1, 1, 1)
+        assert calls == 6
+        assert first_peak == 3
+        assert later_peak == 1
+        assert first_active == 0
+        assert later_active == 0
+        assert wait_timed_out is False
+        assert len(results) == 6
+        assert sorted(verdict.call_id for verdict in results) == [f"tc_{idx}" for idx in range(6)]
+        assert all(verdict.tier == "llm" for verdict in results)
+        final_snapshot = admission.snapshot()
+        assert final_snapshot.limit == 1
+        assert final_snapshot.in_flight == 0
+        assert final_snapshot.queued == 0
+        assert len(clients) == 3
+        assert all(client.close_count == 1 for client in clients)
+
+    def test_concurrent_batches_share_one_alias_admission_ceiling(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        provider = _make_mock_provider(_good_verdict_json())
+        admission = ModelAdmission("shared-judge", 2)
+        judges = [
+            _make_judge(provider, parallel_evaluations=4),
+            _make_judge(provider, parallel_evaluations=4),
+        ]
+        client_groups = [_tracking_client_factory(judge, monkeypatch) for judge in judges]
+        for judge in judges:
+            judge._lane = replace(
+                judge._lane,
+                alias="shared-judge",
+                admission=admission,
+            )
+
+        first_wave = threading.Event()
+        release = threading.Event()
+        cancels = [threading.Event(), threading.Event()]
+        done_events = [threading.Event(), threading.Event()]
+        done_counts = [0, 0]
+        finals: list[list[IntentVerdict]] = [[], []]
+        lock = threading.Lock()
+        calls = 0
+        active = 0
+        peak = 0
+        wait_timed_out = False
+
+        def _stream(**_kwargs: Any) -> Any:
+            nonlocal calls, active, peak, wait_timed_out
+            with lock:
+                calls += 1
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    first_wave.set()
+            released = release.wait(5.0)
+            with lock:
+                active -= 1
+                wait_timed_out = wait_timed_out or not released
+            return as_stream(_mock_result(_good_verdict_json()))
+
+        def _done(batch_index: int) -> None:
+            with lock:
+                done_counts[batch_index] += 1
+            done_events[batch_index].set()
+
+        provider.create_streaming.side_effect = _stream
+        for batch_index, judge in enumerate(judges):
+            items = [
+                _make_item(call_id=f"batch-{batch_index}-tc-{item_index}")
+                for item_index in range(3)
+            ]
+            judge.evaluate(
+                items,
+                [{"role": "user", "content": f"batch {batch_index}"}],
+                finals[batch_index].append,
+                cancel_event=cancels[batch_index],
+                done_callback=lambda index=batch_index: _done(index),
+            )
+
+        reached_first_wave = first_wave.wait(3.0)
+        queued_snapshot = False
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            snapshot = admission.snapshot()
+            if snapshot.in_flight == 2 and snapshot.queued == 2:
+                queued_snapshot = True
+                break
+            time.sleep(0.005)
+        release.set()
+        finished = all(done.wait(10.0) for done in done_events)
+        if not finished:
+            for cancel in cancels:
+                cancel.set()
+            release.set()
+            for done in done_events:
+                done.wait(5.0)
+
+        assert finished
+        assert reached_first_wave
+        assert queued_snapshot
+        assert calls == 6
+        assert peak == 2
+        assert active == 0
+        assert wait_timed_out is False
+        assert [len(batch_finals) for batch_finals in finals] == [3, 3]
+        assert all(verdict.tier == "llm" for batch_finals in finals for verdict in batch_finals)
+        assert done_counts == [1, 1]
+        assert admission.snapshot().in_flight == 0
+        assert admission.snapshot().queued == 0
+        assert [len(clients) for clients in client_groups] == [2, 2]
+        assert all(client.close_count == 1 for clients in client_groups for client in clients)
+
 
 # ---------------------------------------------------------------------------
 # Multi-turn tool use
@@ -365,10 +1396,9 @@ class TestMultiTurnToolUse:
         """Provider requests read_file, then returns verdict."""
         provider = MagicMock()
         provider.provider_name = "openai"
-        caps = MagicMock()
-        caps.context_window = 100_000
-        caps.max_output_tokens = 4096
-        provider.get_capabilities.return_value = caps
+        provider.get_capabilities.return_value = ModelCapabilities(
+            context_window=100_000, max_output_tokens=4096
+        )
         provider.convert_tools.side_effect = lambda tools, **kw: tools
 
         # Turn 1: tool call
@@ -405,10 +1435,9 @@ class TestMultiTurnToolUse:
         """Provider keeps requesting tools — stops at _JUDGE_MAX_TURNS."""
         provider = MagicMock()
         provider.provider_name = "openai"
-        caps = MagicMock()
-        caps.context_window = 100_000
-        caps.max_output_tokens = 4096
-        provider.get_capabilities.return_value = caps
+        provider.get_capabilities.return_value = ModelCapabilities(
+            context_window=100_000, max_output_tokens=4096
+        )
         provider.convert_tools.side_effect = lambda tools, **kw: tools
 
         # Every turn returns a tool call
@@ -592,6 +1621,10 @@ class TestConfidenceArbitration:
 
 
 class TestPathBlocking:
+    def test_exact_protected_roots_are_blocked_without_reading_them(self):
+        for root in ("/etc", "/root", "/proc", "/sys", "/dev"):
+            assert IntentJudge._is_path_blocked(Path(root)) is True
+
     def test_etc_blocked(self):
         assert IntentJudge._is_path_blocked(Path("/etc/passwd")) is True
 
@@ -637,6 +1670,30 @@ class TestPathBlocking:
     def test_project_path_not_blocked(self):
         assert IntentJudge._is_path_blocked(Path("/home/user/project/main.py")) is False
 
+    def test_benign_symlink_to_protected_suffix_is_blocked(self, tmp_path):
+        target = tmp_path / "harmless-secret.pem"
+        target.write_text("test-only certificate material")
+        link = tmp_path / "release-notes.txt"
+        link.symlink_to(target)
+
+        assert IntentJudge._is_path_blocked(link) is True
+        result = IntentJudge._exec_read_only_tool("read_file", {"path": str(link)})
+        assert "access denied" in result
+        assert "test-only certificate material" not in result
+
+    def test_benign_symlink_to_protected_component_is_blocked(self, tmp_path):
+        protected_dir = tmp_path / ".ssh"
+        protected_dir.mkdir()
+        target = protected_dir / "test-identity"
+        target.write_text("test-only private material")
+        link = tmp_path / "meeting-notes.txt"
+        link.symlink_to(target)
+
+        assert IntentJudge._is_path_blocked(link) is True
+        result = IntentJudge._exec_read_only_tool("read_file", {"path": str(link)})
+        assert "access denied" in result
+        assert "test-only private material" not in result
+
 
 # ---------------------------------------------------------------------------
 # Read-only tool execution
@@ -666,12 +1723,88 @@ class TestReadOnlyToolExecution:
         assert "truncated" in result
         assert len(result) < 50_000
 
+    def test_read_file_bounds_the_read_request_itself(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        test_file = tmp_path / "bounded.txt"
+        test_file.write_text("placeholder")
+        requested: list[int] = []
+
+        class _BoundedReader:
+            def __enter__(self) -> _BoundedReader:
+                return self
+
+            def __exit__(self, *_exc: object) -> None:
+                return None
+
+            def read(self, size: int) -> str:
+                requested.append(size)
+                return "x" * size
+
+        def _open(_path: Path, *_args: Any, **_kwargs: Any) -> _BoundedReader:
+            return _BoundedReader()
+
+        monkeypatch.setattr(Path, "open", _open)
+        result = IntentJudge._exec_read_only_tool(
+            "read_file",
+            {"path": str(test_file)},
+        )
+
+        assert requested == [32_769]
+        assert result[:32_768] == "x" * 32_768
+        assert result[32_768:].startswith("\n... (truncated")
+
     def test_list_directory_success(self, tmp_path):
         (tmp_path / "file_a.txt").touch()
         (tmp_path / "dir_b").mkdir()
         result = IntentJudge._exec_read_only_tool("list_directory", {"path": str(tmp_path)})
         assert "dir_b/" in result
         assert "file_a.txt" in result
+
+    def test_list_directory_stops_after_limit_probe_and_marks_omission(
+        self,
+        tmp_path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        class _Entry:
+            def __init__(self, index: int) -> None:
+                self.name = f"entry-{index:03}.txt"
+
+            def is_dir(self) -> bool:
+                return False
+
+        class _BoundedEntries:
+            def __init__(self) -> None:
+                self.next_calls = 0
+
+            def __iter__(self) -> _BoundedEntries:
+                return self
+
+            def __next__(self) -> _Entry:
+                if self.next_calls >= 201:
+                    raise AssertionError("list_directory requested a 202nd entry")
+                entry = _Entry(self.next_calls)
+                self.next_calls += 1
+                return entry
+
+        entries = _BoundedEntries()
+        monkeypatch.setattr(Path, "iterdir", lambda _path: entries)
+
+        result = IntentJudge._exec_read_only_tool(
+            "list_directory",
+            {"path": str(tmp_path)},
+        )
+        lines = result.splitlines()
+
+        assert entries.next_calls == 201
+        assert len(lines) == 201
+        assert lines[:2] == ["  entry-000.txt", "  entry-001.txt"]
+        assert lines[-2:] == [
+            "  entry-199.txt",
+            "  ... (additional entries omitted)",
+        ]
 
     def test_list_directory_not_found(self):
         result = IntentJudge._exec_read_only_tool("list_directory", {"path": "/nonexistent/dir"})
@@ -899,11 +2032,18 @@ class TestModelAliasResolution:
         # resolution path is exercised, not a MagicMock leak.
         cfg.temperature = 0.3
         registry.has_alias.side_effect = lambda a: a == alias
-        registry.resolve.return_value = (alias_client, underlying_model, cfg)
+        # One locked snapshot: resolve_binding binds client + config +
+        # provider together, never a pair a reload could tear.
+        registry.resolve_binding.return_value = (
+            alias_client,
+            underlying_model,
+            cfg,
+            alias_provider,
+            0,
+        )
         # The unified lane resolver (model_turn.resolve_capabilities) fetches
-        # the config itself rather than taking resolve()'s copy.
+        # the config itself rather than taking the resolve copy.
         registry.get_config.return_value = cfg
-        registry.get_provider.return_value = alias_provider
         return registry
 
     def test_alias_capabilities_merged_and_threaded_to_wire(self):
@@ -925,13 +2065,17 @@ class TestModelAliasResolution:
             "local-9b",
             capabilities={"supports_tools": False, "effort_passthrough": True},
         )
+        session_provider = _make_mock_provider()
         judge = IntentJudge(
             config=JudgeConfig(enabled=True, model="judge-mini"),
-            session_provider=_make_mock_provider(),
-            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
-            session_model="session-model",
-            session_capabilities=MagicMock(context_window=100_000),
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                MagicMock(base_url="https://s/v1", api_key="s"),
+                "session-model",
+                capabilities=ModelCapabilities(context_window=100_000),
+                registry=registry,
+                alias="session",
+            ),
         )
         # Merged at construction: overrides applied, untouched fields survive.
         assert judge._capabilities.supports_tools is False
@@ -963,13 +2107,17 @@ class TestModelAliasResolution:
             MagicMock(base_url="https://a/v1", api_key="k"),
             "local-9b",
         )
+        session_provider = _make_mock_provider()
         IntentJudge(
             config=JudgeConfig(enabled=True, model="judge-mini"),
-            session_provider=_make_mock_provider(),
-            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
-            session_model="session-model",
-            session_capabilities=MagicMock(context_window=100_000),
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                MagicMock(base_url="https://s/v1", api_key="s"),
+                "session-model",
+                capabilities=ModelCapabilities(context_window=100_000),
+                registry=registry,
+                alias="session",
+            ),
         )
         assert registry.get_config.call_count == 0
 
@@ -982,10 +2130,12 @@ class TestModelAliasResolution:
         provider = _make_mock_provider(response_content=_good_verdict_json())
         judge = IntentJudge(
             config=JudgeConfig(enabled=True, model=""),  # no alias → fallback
-            session_provider=provider,
-            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
-            session_model="session-model",
-            session_capabilities=sess_caps,
+            session_binding=_binding(
+                provider,
+                MagicMock(base_url="https://s/v1", api_key="s"),
+                "session-model",
+                capabilities=sess_caps,
+            ),
         )
         assert judge._capabilities is sess_caps
         assert judge._judge_context_window == 54_321
@@ -1025,13 +2175,16 @@ class TestModelAliasResolution:
         config = JudgeConfig(enabled=True, model="judge-mini")
         judge = IntentJudge(
             config=config,
-            session_provider=session_provider,
-            session_client=session_client,
-            session_model="session-default-model",
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                session_client,
+                "session-default-model",
+                registry=registry,
+                alias="session",
+            ),
         )
 
-        assert judge._provider is alias_provider
+        assert judge._lane.provider is alias_provider
         assert judge._model == "gpt-5-mini-resolved"
         # Client factory args reflect the alias's client, not the session's.
         assert judge._client_factory_args["base_url"] == "https://alias.example/v1"
@@ -1049,12 +2202,16 @@ class TestModelAliasResolution:
         alias_provider.get_capabilities = MagicMock(return_value=MagicMock(context_window=200_000))
         alias_client = MagicMock(base_url="https://alias/v1", api_key="k")
         registry = self._make_alias_registry("judge-mini", alias_provider, alias_client, "local-9b")
+        session_provider = _make_mock_provider()
         judge = IntentJudge(
             config=JudgeConfig(enabled=True, model="judge-mini"),
-            session_provider=_make_mock_provider(),
-            session_client=MagicMock(base_url="https://s/v1", api_key="s"),
-            session_model="session-model",
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                MagicMock(base_url="https://s/v1", api_key="s"),
+                "session-model",
+                registry=registry,
+                alias="session",
+            ),
         )
         assert judge._judge_context_window == 50_000
 
@@ -1067,15 +2224,24 @@ class TestModelAliasResolution:
         cfg.context_window = 0
         registry = MagicMock()
         registry.has_alias.side_effect = lambda a: a == "judge-mini"
-        registry.resolve.return_value = (MagicMock(base_url="http://a", api_key="k"), "m", cfg)
-        registry.get_provider.return_value = _make_mock_provider()
+        registry.resolve_binding.return_value = (
+            MagicMock(base_url="http://a", api_key="k"),
+            "m",
+            cfg,
+            _make_mock_provider(),
+            0,
+        )
+        session_provider = _make_mock_provider()
         judge = IntentJudge(
             config=JudgeConfig(enabled=True, model="judge-mini"),
-            session_provider=_make_mock_provider(),
-            session_client=MagicMock(base_url="http://s", api_key="s"),
-            session_model="session-model",
-            session_capabilities=MagicMock(context_window=100_000),
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                MagicMock(base_url="http://s", api_key="s"),
+                "session-model",
+                capabilities=ModelCapabilities(context_window=100_000),
+                registry=registry,
+                alias="session",
+            ),
         )
         assert judge._judge_context_window == 100_000  # session window, not 0
 
@@ -1099,17 +2265,52 @@ class TestModelAliasResolution:
         config = JudgeConfig(enabled=True, model="gpt-5-mini")
         judge = IntentJudge(
             config=config,
-            session_provider=session_provider,
-            session_client=session_client,
-            session_model="session-default-model",
-            session_capabilities=MagicMock(context_window=100_000),
-            model_registry=registry,
+            session_binding=_binding(
+                session_provider,
+                session_client,
+                "session-default-model",
+                capabilities=ModelCapabilities(context_window=100_000),
+                registry=registry,
+                alias="session",
+            ),
         )
 
-        assert judge._provider is session_provider
+        assert judge._lane.provider is session_provider
         assert judge._model == "session-default-model"
         # Context window mirrors the session, not the (uncalled) caps lookup.
         assert judge._judge_context_window == 100_000
+
+    def test_construction_failure_warns_with_cause_not_registration_advice(self, caplog):
+        """A REGISTERED alias whose binding cannot be built keeps the
+        session-model fallback, but the warning names the construction
+        cause — the register-the-alias advice would misdiagnose a row
+        that is already registered."""
+        from turnstone.core.model_registry import ModelClientConstructionError
+
+        registry = MagicMock()
+        registry.has_alias.side_effect = lambda a: a == "judge-mini"
+        registry.resolve_binding.side_effect = ModelClientConstructionError(
+            "provider 'openai' does not support api_surface 'messages'"
+        )
+
+        with caplog.at_level("WARNING", logger="turnstone.core.judge"):
+            session_provider = _make_mock_provider()
+            judge = IntentJudge(
+                config=JudgeConfig(enabled=True, model="judge-mini"),
+                session_binding=_binding(
+                    session_provider,
+                    MagicMock(base_url="https://s/v1", api_key="s"),
+                    "session-model",
+                    capabilities=ModelCapabilities(context_window=100_000),
+                    registry=registry,
+                    alias="session",
+                ),
+            )
+
+        assert judge._model == "session-model"  # fallback behavior unchanged
+        warned = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert any("does not support api_surface" in m for m in warned)
+        assert not any("not a registered alias" in m for m in warned)
 
     def test_empty_model_inherits_session_model(self):
         """Empty ``config.model`` is the documented self-consistency path."""
@@ -1122,12 +2323,14 @@ class TestModelAliasResolution:
         config = JudgeConfig(enabled=True, model="")
         judge = IntentJudge(
             config=config,
-            session_provider=session_provider,
-            session_client=session_client,
-            session_model="session-default-model",
+            session_binding=_binding(
+                session_provider,
+                session_client,
+                "session-default-model",
+            ),
         )
 
-        assert judge._provider is session_provider
+        assert judge._lane.provider is session_provider
         assert judge._model == "session-default-model"
 
     def test_coordinator_tool_call_returns_llm_verdict_not_fallback(self):
@@ -1162,3 +2365,248 @@ class TestModelAliasResolution:
         assert callback_results[0].tier == "llm"
         assert callback_results[0].tier != "llm_fallback"
         assert "did not return a verdict" not in callback_results[0].reasoning
+
+
+class TestJudgeBindingFreshness:
+    def test_constructor_consumed_config_change_invalidates(self):
+        session_binding = _binding(
+            _make_mock_provider(),
+            MagicMock(base_url="https://session/v1", api_key="session-key"),
+            "session-model",
+        )
+        config = JudgeConfig(enabled=True, timeout=30.0)
+        judge = IntentJudge(config, session_binding)
+
+        assert judge.binding_is_current(session_binding, config)
+        assert not judge.binding_is_current(
+            session_binding,
+            JudgeConfig(enabled=True, timeout=45.0),
+        )
+
+    def test_explicit_alias_tracks_config_store_sampling_without_registry_reload(self):
+        store = _VersionedConfigStore(temperature=0.2, reasoning_effort="low")
+        registry = MagicMock()
+        registry.generation = 0
+        alias_provider = _make_mock_provider()
+        alias_client = MagicMock(base_url="https://judge/v1", api_key="judge-key")
+        alias_cfg = ModelConfig(
+            "judge-mini",
+            "https://judge/v1",
+            "judge-key",
+            "judge-model",
+        )
+        registry.resolve_binding.return_value = (
+            alias_client,
+            alias_cfg.model,
+            alias_cfg,
+            alias_provider,
+            0,
+        )
+        session_binding = _binding(
+            _make_mock_provider(),
+            MagicMock(base_url="https://session/v1", api_key="session-key"),
+            "session-model",
+            registry=registry,
+            alias="session",
+        )
+        config = JudgeConfig(enabled=True, model="judge-mini")
+        judge = IntentJudge(config, session_binding, config_store=store)
+
+        assert judge._lane.temperature == 0.2
+        assert judge._lane.reasoning_effort == "low"
+
+        store.set_sampling(temperature=0.8, reasoning_effort="high")
+        assert registry.generation == 0
+        assert not judge.binding_is_current(session_binding)
+
+        replacement = IntentJudge(config, session_binding, config_store=store)
+        assert replacement._lane.temperature == 0.8
+        assert replacement._lane.reasoning_effort == "high"
+
+    def test_inherited_lane_resamples_config_store_instead_of_session_lane_knobs(self):
+        store = _VersionedConfigStore(temperature=0.15, reasoning_effort="low")
+        provider = _make_mock_provider()
+        cfg = ModelConfig(
+            "session",
+            "https://session/v1",
+            "session-key",
+            "session-model",
+        )
+        session_binding = _binding(
+            provider,
+            MagicMock(base_url="https://session/v1", api_key="session-key"),
+            cfg.model,
+            alias=cfg.alias,
+            config=cfg,
+            temperature=0.95,
+            reasoning_effort="max",
+        )
+        config = JudgeConfig(enabled=True)
+        judge = IntentJudge(config, session_binding, config_store=store)
+
+        # Pre-refactor judges resolved their own sampling ladder per
+        # evaluation; they did not inherit the session lane's persisted knobs.
+        assert judge._lane.temperature == 0.15
+        assert judge._lane.reasoning_effort == "low"
+
+        store.set_sampling(temperature=0.65, reasoning_effort="high")
+        assert not judge.binding_is_current(session_binding)
+
+        replacement = IntentJudge(config, session_binding, config_store=store)
+        assert replacement._lane.temperature == 0.65
+        assert replacement._lane.reasoning_effort == "high"
+
+    def test_explicit_alias_ignores_unrelated_generation_but_detects_own_config_change(self):
+        registry = MagicMock()
+        registry.generation = 0
+        alias_provider = _make_mock_provider(response_content=_good_verdict_json())
+        alias_client = MagicMock(base_url="https://judge/v1", api_key="judge-key")
+        cfg = ModelConfig(
+            "judge-mini",
+            "https://judge/v1",
+            "judge-key",
+            "judge-model",
+            context_window=50_000,
+            temperature=0.3,
+        )
+        registry.resolve_binding.return_value = (
+            alias_client,
+            cfg.model,
+            cfg,
+            alias_provider,
+            0,
+        )
+        session_provider = _make_mock_provider()
+        session_client = MagicMock(base_url="https://session/v1", api_key="session-key")
+        session_binding = _binding(
+            session_provider,
+            session_client,
+            "session-model",
+            registry=registry,
+            alias="session",
+        )
+        judge = IntentJudge(
+            config=JudgeConfig(enabled=True, model="judge-mini"),
+            session_binding=session_binding,
+        )
+        pinned_lane = judge._lane
+        assert registry.resolve_binding.call_count == 1
+
+        # Another alias changed: resolving judge-mini at generation 1 yields
+        # the same semantic binding.  Keep the exact judge lane and stamp the
+        # generation so subsequent checks are cheap.
+        registry.generation = 1
+        registry.resolve_binding.return_value = (
+            alias_client,
+            cfg.model,
+            cfg,
+            alias_provider,
+            1,
+        )
+        session_at_1 = ResolvedModelBinding(
+            lane=session_binding.lane,
+            config=session_binding.config,
+            registry_generation=1,
+        )
+        assert judge.binding_is_current(session_at_1)
+        assert judge._lane is pinned_lane
+        assert registry.resolve_binding.call_count == 2
+        assert judge.binding_is_current(session_at_1)
+        assert registry.resolve_binding.call_count == 2
+
+        # A value change on the effective judge alias invalidates at the next
+        # evaluation boundary even when provider/client/model identities hold.
+        changed_cfg = ModelConfig(
+            "judge-mini",
+            "https://judge/v1",
+            "judge-key",
+            "judge-model",
+            context_window=64_000,
+            temperature=0.3,
+        )
+        registry.generation = 2
+        registry.resolve_binding.return_value = (
+            alias_client,
+            changed_cfg.model,
+            changed_cfg,
+            alias_provider,
+            2,
+        )
+        assert not judge.binding_is_current(session_at_1)
+        assert judge._lane is pinned_lane  # in-flight users are never mutated
+
+    def test_inherited_judge_tracks_primary_binding_without_generation_noise(self):
+        registry = MagicMock()
+        registry.generation = 0
+        provider = _make_mock_provider()
+        client = MagicMock(base_url="https://session/v1", api_key="key")
+        session_binding = _binding(
+            provider,
+            client,
+            "session-model",
+            registry=registry,
+            alias="session",
+        )
+        judge = IntentJudge(config=JudgeConfig(enabled=True), session_binding=session_binding)
+
+        registry.generation = 1
+        # The registry reload changed an unrelated alias.  The fallback
+        # candidate still carries the primary binding's generation-0 stamp,
+        # but the freshness watermark must advance to the observed registry
+        # generation so this no-op does not trigger perpetual rechecks.
+        assert judge.binding_is_current(session_binding)
+        assert judge._binding_state.checked_registry_generation == 1
+        same_binding = ResolvedModelBinding(
+            lane=session_binding.lane,
+            config=session_binding.config,
+            registry_generation=1,
+        )
+        assert judge.binding_is_current(same_binding)
+
+        changed_primary = _binding(
+            provider,
+            MagicMock(base_url="https://moved/v1", api_key="key"),
+            "session-model",
+            registry=registry,
+            alias="session",
+            generation=1,
+        )
+        assert not judge.binding_is_current(changed_primary)
+
+
+class TestInlineReasoningSeam:
+    """#965 per-lane pins: judge content arrives IR-clean from the drain."""
+
+    def test_think_wrapped_verdict_parses_clean(self):
+        # Reasoning around the verdict JSON is segregated at the seam, so
+        # _parse_verdict reads pure JSON — a draft verdict INSIDE the think
+        # block can no longer shadow the real one.
+        content = (
+            '<think>draft: {"recommendation": "block", "risk_level": "critical"}</think>'
+            + _good_verdict_json()
+        )
+        provider = _make_mock_provider(response_content=content)
+        judge = _make_judge(provider)
+        result = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "test"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+        assert result is not None
+        assert result.recommendation == "approve"
+        assert result.risk_level == "low"
+
+    def test_think_only_response_takes_empty_ladder(self):
+        # An all-reasoning judge turn drains to empty content and rides the
+        # SAME empty-response ladder as a genuinely empty turn — it never
+        # reaches _parse_verdict with tag text.
+        provider = _make_mock_provider(response_content="<think>only deliberation</think>")
+        judge = _make_judge(provider)
+        result = judge._evaluate_single(
+            _make_item(),
+            [{"role": "user", "content": "test"}],
+            cancel_event=None,
+            client=MagicMock(),
+        )
+        assert result is None

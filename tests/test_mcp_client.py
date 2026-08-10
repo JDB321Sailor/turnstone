@@ -771,27 +771,27 @@ class TestSessionIntegration:
         assert "Malformed tool call" in session.ui.on_error.call_args[0][0]
 
     def test_ensure_tool_call_ids_dict(self, tmp_db):
-        """_ensure_tool_call_ids fills empty IDs on streaming-style dict."""
-        from turnstone.core.session import ChatSession
+        """ensure_tool_call_ids fills empty IDs on streaming-style dict."""
+        from turnstone.core.model_turn import ensure_tool_call_ids
 
         tool_calls_acc = {
             0: {"id": "", "function": {"name": "bash", "arguments": "{}"}},
             1: {"id": "", "function": {"name": "read_file", "arguments": "{}"}},
         }
-        ChatSession._ensure_tool_call_ids(tool_calls_acc)
+        ensure_tool_call_ids(tool_calls_acc)
         ids = [tc["id"] for tc in tool_calls_acc.values()]
         assert all(id_.startswith("call_") for id_ in ids)
         assert len(set(ids)) == 2  # unique
 
     def test_ensure_tool_call_ids_list(self, tmp_db):
-        """_ensure_tool_call_ids fills empty IDs on list (agent path)."""
-        from turnstone.core.session import ChatSession
+        """ensure_tool_call_ids fills empty IDs on list (agent path)."""
+        from turnstone.core.model_turn import ensure_tool_call_ids
 
         tool_calls = [
             {"id": None, "function": {"name": "bash", "arguments": "{}"}},
             {"id": "call_existing", "function": {"name": "bash", "arguments": "{}"}},
         ]
-        ChatSession._ensure_tool_call_ids(tool_calls)
+        ensure_tool_call_ids(tool_calls)
         assert tool_calls[0]["id"].startswith("call_")
         assert tool_calls[1]["id"] == "call_existing"  # preserved
 
@@ -2229,13 +2229,16 @@ class TestTCPProbe:
     def test_tcp_probe_default_port_http(self):
         """Default port 80 used for http:// URLs without explicit port."""
         mgr = MCPClientManager({})
+        connect = AsyncMock(side_effect=OSError("unreachable"))
 
         async def _run():
-            # Will fail (nothing on port 80), but should not crash on parsing
             with pytest.raises(ConnectionError):
                 await mgr._tcp_probe("srv", "http://127.0.0.1")
 
-        asyncio.run(_run())
+        with patch("asyncio.open_connection", connect):
+            asyncio.run(_run())
+
+        connect.assert_awaited_once_with("127.0.0.1", 80)
 
     def test_tcp_probe_dns_failure(self):
         """Unresolvable hostname raises ConnectionError."""

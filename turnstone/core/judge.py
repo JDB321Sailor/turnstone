@@ -8,14 +8,16 @@ is a fast, pure-function rule engine with zero external dependencies.
 from __future__ import annotations
 
 import fnmatch
+import itertools
 import json
 import math
 import os
+import queue
 import re
 import threading
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -25,17 +27,31 @@ from turnstone.core.deadline import (
     run_abortable_with_deadline,
 )
 from turnstone.core.log import get_logger
-from turnstone.core.model_turn import model_turn, resolve_capabilities, resolve_lane
+from turnstone.core.model_backend_auth import BackendAuthUnavailableError
+from turnstone.core.model_registry import ModelClientConstructionError
+from turnstone.core.model_turn import (
+    ModelLane,
+    ResolvedModelBinding,
+    model_turn,
+    require_lane_capabilities,
+    resolve_lane,
+    resolve_model_binding,
+    same_model_lane_binding,
+)
 from turnstone.core.trajectory import Turn
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from turnstone.core.deadline import StreamAbortRef
+    from turnstone.core.model_registry import ModelConfig
     from turnstone.core.model_turn import ModelTurnResult
-    from turnstone.core.providers._protocol import LLMProvider, ModelCapabilities
 
 log = get_logger(__name__)
+
+_MAX_PARALLEL_EVALUATIONS = 16
+_JUDGE_READ_LIMIT = 32_768
+_JUDGE_DIRECTORY_LIMIT = 200
 
 # ---------------------------------------------------------------------------
 # Data structures
@@ -108,6 +124,50 @@ class JudgeConfig:
     # False (default) = the daemon runs every item to completion; only a
     # generation supersede (next batch) or session close aborts it.
     cancel_on_approval: bool = False
+    # Maximum tool-call evaluations this judge may run concurrently within
+    # one approval batch.  The selected model alias's admission limit remains
+    # the process-wide ceiling across judge and non-judge traffic.
+    parallel_evaluations: int = 1
+
+    def __post_init__(self) -> None:
+        if type(self.parallel_evaluations) is not int or not (
+            1 <= self.parallel_evaluations <= _MAX_PARALLEL_EVALUATIONS
+        ):
+            raise ValueError(
+                "judge.parallel_evaluations must be an integer between 1 and "
+                f"{_MAX_PARALLEL_EVALUATIONS}"
+            )
+
+
+@dataclass
+class _JudgeWorkOutcome:
+    """One indexed worker result awaiting coordinator delivery."""
+
+    index: int
+    verdict: IntentVerdict | None
+    fallback_reason: str
+    acknowledged: threading.Event = field(default_factory=threading.Event)
+
+
+class _JudgeBatchCancelEvent(threading.Event):
+    """Private batch abort composed with the caller-owned cancel event."""
+
+    def __init__(self, upstream: threading.Event | None) -> None:
+        super().__init__()
+        self._upstream = upstream
+
+    def is_set(self) -> bool:
+        return super().is_set() or bool(self._upstream and self._upstream.is_set())
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Wait for either the private abort or the upstream event."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            super().wait(0.05 if remaining is None else min(0.05, remaining))
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +907,174 @@ def _positive_window(*candidates: Any, floor: int = _DEFAULT_JUDGE_CONTEXT_WINDO
     return floor
 
 
+def _model_bindings_match(left: ResolvedModelBinding, right: ResolvedModelBinding) -> bool:
+    """Whether two resolved bindings have the same judge-visible semantics.
+
+    Registry generation is deliberately excluded: an unrelated alias edit bumps
+    it without changing this judge.  Identity-sensitive plant handles retain the
+    same comparison used by the session binding, while the frozen config and
+    resolved lane facets catch capability, extra-parameter, and sampling changes.
+    """
+    return (
+        same_model_lane_binding(left.lane, right.lane)
+        and left.config == right.config
+        and left.lane.capabilities == right.lane.capabilities
+        and left.lane.extra_params == right.lane.extra_params
+        and left.lane.temperature == right.lane.temperature
+        and left.lane.reasoning_effort == right.lane.reasoning_effort
+    )
+
+
+def _config_store_version(config_store: Any | None) -> int | None:
+    """Return a real ConfigStore version, or ``None`` for legacy test doubles.
+
+    Some callers intentionally pass duck-typed stores.  In particular, a bare
+    ``MagicMock`` manufactures a ``.version`` attribute on demand; treating
+    that object as a generation would make every equality check depend on mock
+    truthiness rather than on a monotone integer.
+    """
+    if config_store is None:
+        return None
+    try:
+        version = config_store.version
+    except Exception:
+        log.debug("judge.config_version_read_failed", exc_info=True)
+        return None
+    return version if type(version) is int else None
+
+
+def _judge_binding_from_session(
+    session_binding: ResolvedModelBinding,
+    config_store: Any | None,
+) -> ResolvedModelBinding:
+    """Build the session-model fallback lane with judge sampling semantics.
+
+    Before judges held a frozen :class:`ResolvedModelBinding`, every
+    evaluation called :func:`resolve_lane`: provider/client/model and
+    capabilities stayed pinned to the session, while the operator sampling
+    ladder was read from ConfigStore.  Rebuilding that lane at judge
+    construction keeps those semantics without mutating an in-flight judge.
+    """
+    session_lane = session_binding.lane
+    judge_lane = resolve_lane(
+        session_lane.provider,
+        session_lane.client,
+        session_lane.model,
+        alias=session_lane.alias,
+        registry=session_lane.registry,
+        capabilities=require_lane_capabilities(session_lane),
+        cfg=session_binding.config,
+        config_store=config_store,
+        backend_auth_resolver=session_lane.backend_auth_resolver,
+    )
+    return replace(session_binding, lane=judge_lane)
+
+
+@dataclass
+class _JudgeBindingState:
+    """Pinned judge binding plus mutable no-op generation stamps.
+
+    The binding and lane never mutate.  The checked generations are freshness
+    watermarks: after an unrelated registry or ConfigStore update resolves to
+    the same binding, advancing them avoids repeating that work without
+    replacing the judge or its lane.
+    """
+
+    binding: ResolvedModelBinding
+    requested_alias: str
+    resolved_explicitly: bool
+    config_store: Any | None
+    checked_registry_generation: int
+    checked_config_version: int | None
+
+    def is_current(
+        self,
+        session_binding: ResolvedModelBinding,
+        *,
+        requested_alias: str | None = None,
+    ) -> bool:
+        """Return whether constructing now would select this same binding.
+
+        Explicit judge aliases are checked independently of the primary session
+        alias.  An inherited/failed-alias judge instead follows the supplied
+        session binding.  A generation-only unrelated edit advances only the
+        watermark; a changed effective binding returns ``False`` so the session
+        can replace the whole judge between evaluations.
+        """
+        desired = self.requested_alias if requested_alias is None else requested_alias.strip()
+        if desired != self.requested_alias:
+            return False
+
+        registry = session_binding.lane.registry
+        if registry is not self.binding.lane.registry:
+            return False
+
+        current_config_version = _config_store_version(self.config_store)
+        if registry is None:
+            current_generation = session_binding.registry_generation
+        else:
+            try:
+                current_generation = registry.generation
+            except Exception:
+                log.debug("judge.binding_generation_read_failed", exc_info=True)
+                return False
+
+        # A primary /model switch need not bump the registry generation.  An
+        # explicitly routed judge is independent of it; an inherited judge is
+        # current only while the primary binding (projected through the judge's
+        # sampling ladder) still matches.  ConfigStore has its own generation:
+        # temperature/effort updates do not reload the model registry.
+        generation_changed = current_generation != self.checked_registry_generation
+        config_changed = current_config_version != self.checked_config_version
+        if self.resolved_explicitly and not generation_changed and not config_changed:
+            return True
+
+        candidate = _judge_binding_from_session(session_binding, self.config_store)
+        resolved_explicitly = False
+        if registry is not None and desired and (self.resolved_explicitly or generation_changed):
+            try:
+                candidate = resolve_model_binding(
+                    registry,
+                    desired,
+                    config_store=self.config_store,
+                    backend_auth_resolver=session_binding.lane.backend_auth_resolver,
+                )
+                resolved_explicitly = True
+            except (ModelClientConstructionError, ValueError, KeyError):
+                # Reconstructing at this generation would take the documented
+                # session-model fallback.  Compare that outcome below.
+                candidate = _judge_binding_from_session(session_binding, self.config_store)
+            except Exception:
+                log.debug("judge.binding_refresh_failed", exc_info=True)
+                return False
+
+        if resolved_explicitly != self.resolved_explicitly:
+            return False
+        if not _model_bindings_match(self.binding, candidate):
+            return False
+
+        # Stamp the registry generation actually observed, not the fallback
+        # candidate's session-binding stamp: an unrelated reload can leave the
+        # effective primary binding unchanged while its caller-supplied stamp
+        # still names the previous generation.  Re-read before committing so a
+        # concurrent second reload cannot bless an unchecked generation.
+        observed_registry_generation = current_generation
+        if registry is not None:
+            try:
+                observed_registry_generation = registry.generation
+            except Exception:
+                log.debug("judge.binding_generation_read_failed", exc_info=True)
+                return False
+            if observed_registry_generation != current_generation:
+                return False
+        observed_config_version = _config_store_version(self.config_store)
+        if observed_config_version != current_config_version:
+            return False
+        self.checked_registry_generation = observed_registry_generation
+        self.checked_config_version = observed_config_version
+        return True
+
+
 def honest_truncate(text: str, budget: int) -> str:
     """Return *text* untouched when it fits *budget* characters, otherwise the
     leading ``budget`` characters followed by an explicit note of exactly how
@@ -971,32 +1199,17 @@ class IntentJudge:
     def __init__(
         self,
         config: JudgeConfig,
-        session_provider: LLMProvider,
-        session_client: Any,
-        session_model: str,
-        session_capabilities: ModelCapabilities | None = None,
+        session_binding: ResolvedModelBinding,
         rule_registry: Any | None = None,
-        model_registry: Any | None = None,
-        session_model_alias: str = "",
         config_store: Any | None = None,
-        backend_auth_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self._config = config
+        self._config_fingerprint = self._fingerprint_config(config)
         self._rule_registry = rule_registry
-        # Carried into the per-evaluation ModelLane so extra_params, the
-        # live operator flags, and the temperature ladder (per-model value →
-        # global ``model.temperature``) resolve like every other lane.
-        self._model_registry = model_registry
-        self._config_store = config_store
-        self._backend_auth_resolver = backend_auth_resolver
-        # The caller (ChatSession) resolves the session model's real caps from
-        # _get_capabilities (config/registry-aware) and passes them in; they are
-        # this judge's wire capabilities and window when it inherits the session
-        # model.  The window is taken ONLY from these resolved caps (else a
-        # floor) — NEVER provider.get_capabilities(), whose static 200000 for a
-        # local model would blind the budget to overflow.
-        session_window = (
-            session_capabilities.context_window if session_capabilities is not None else None
+        session_caps = require_lane_capabilities(session_binding.lane)
+        session_window = _positive_window(
+            getattr(session_binding.config, "context_window", None),
+            session_caps.context_window,
         )
 
         # Resolve judge model via ModelRegistry alias, otherwise self-
@@ -1010,80 +1223,102 @@ class IntentJudge:
         # returned ``llm_fallback``).  Operators register an alias
         # instead; an unknown value here logs a warning and inherits the
         # session model.
+        requested_alias = str(config.model or "").strip()
+        registry = session_binding.lane.registry
+        config_version_at_start = _config_store_version(config_store)
+        binding = _judge_binding_from_session(session_binding, config_store)
         resolved = False
-        if config.model and model_registry is not None:
+        construction_error: ModelClientConstructionError | None = None
+        if requested_alias and registry is not None:
             try:
-                if model_registry.has_alias(config.model):
-                    client, model_name, model_cfg = model_registry.resolve(config.model)
-                    self._provider = model_registry.get_provider(config.model)
-                    self._client_factory_args = self._extract_client_config(
-                        client,
-                        self._provider.provider_name,
-                    )
-                    self._model = model_name
-                    self._alias = config.model
-                    # The shared lane resolver (model_turn) merges the alias's
-                    # capability overrides; it deliberately does NOT fold in
-                    # ModelConfig.context_window — that is a separate field,
-                    # sized into the judge's window budget right below (the
-                    # static caps table reports 200000 for local models, which
-                    # would silently over-budget them).
-                    # ``cfg=model_cfg`` reuses the config resolve() already
-                    # fetched — one lookup, one generation; a hot-reload
-                    # between two fetches cannot mix client/window with
-                    # foreign capability overrides.
-                    self._capabilities = resolve_capabilities(
-                        self._provider, self._model, config.model, model_registry, cfg=model_cfg
-                    )
-                    # Use the registry's per-model context window, NOT
-                    # ``provider.get_capabilities().context_window``: the static
-                    # capability table returns 200000 for every model absent
-                    # from it (i.e. every local / self-hosted judge), so keying
-                    # the budget off it silently over-budgets a small local
-                    # judge into overflow.  ModelConfig.context_window is the
-                    # operator-configured / auto-detected real window.
-                    # ``_positive_window`` is defensive: a malformed ModelConfig
-                    # (missing attr) or any stray non-positive window degrades to
-                    # the session ``context_window`` then a floor, so it neither
-                    # aborts resolution nor zeroes the budgets.
-                    self._judge_context_window = _positive_window(
-                        getattr(model_cfg, "context_window", None),
-                        session_window,
-                    )
-                    resolved = True
+                # One locked registry snapshot builds provider, client, model,
+                # capabilities, extra params, and sampling facets from the SAME
+                # ModelConfig.  No second config read can mix generations.
+                binding = resolve_model_binding(
+                    registry,
+                    requested_alias,
+                    config_store=config_store,
+                    backend_auth_resolver=session_binding.lane.backend_auth_resolver,
+                )
+                resolved = True
+            except ModelClientConstructionError as exc:
+                construction_error = exc
+            except (ValueError, KeyError):
+                pass
             except Exception:
-                log.debug("Model alias resolution failed for %r, falling back", config.model)
+                log.debug("Model alias resolution failed for %r, falling back", requested_alias)
 
         if not resolved:
-            if config.model:
+            if construction_error is not None:
+                # The alias IS registered; its binding could not be built.
+                # Same session-model fallback, but name the construction
+                # cause — the register-the-alias advice below would
+                # misdiagnose a row that is already registered.
+                log.warning(
+                    "judge.model=%r is registered but its client could not be "
+                    "constructed (%s) — falling back to session model %r.",
+                    requested_alias,
+                    construction_error,
+                    session_binding.lane.model,
+                )
+            elif requested_alias:
                 log.warning(
                     "judge.model=%r is not a registered alias — falling back to "
                     "session model %r.  Register the model in the Models tab and "
                     "set judge.model to its alias.",
-                    config.model,
-                    session_model,
+                    requested_alias,
+                    session_binding.lane.model,
                 )
-            self._provider = session_provider
-            self._client_factory_args = self._extract_client_config(
-                session_client,
-                session_provider.provider_name,
-            )
-            self._model = session_model
-            # Inherit the session's registry alias so the lane resolves
-            # extra_params / replay flag / vLLM attach exactly like every
-            # other lane on the same model — with alias "" (no registry
-            # alias, or a legacy caller) each registry pass degrades to its
-            # documented miss behavior, matching the pre-#827 judges.
-            self._alias = session_model_alias
-            # Wire caps: the caller's resolved session caps, or the provider's
-            # static table as a last resort for degraded / legacy callers.
-            self._capabilities = (
-                session_capabilities
-                if session_capabilities is not None
-                else session_provider.get_capabilities(session_model)
-            )
-            # Coerce here too, defensively against a non-positive session window.
-            self._judge_context_window = _positive_window(session_window)
+            binding = _judge_binding_from_session(session_binding, config_store)
+
+        self._binding_state = _JudgeBindingState(
+            binding=binding,
+            requested_alias=requested_alias,
+            resolved_explicitly=resolved,
+            config_store=config_store,
+            checked_registry_generation=binding.registry_generation,
+            checked_config_version=config_version_at_start,
+        )
+        # The semantic lane is pinned for the judge object's lifetime.  Intent
+        # evaluations still substitute a fresh client per daemon worker for
+        # thread isolation; no provider/model/config facet is re-resolved.
+        self._lane = binding.lane
+        self._model = self._lane.model
+        self._capabilities = require_lane_capabilities(self._lane)
+        self._client_factory_args = self._extract_client_config(
+            self._lane.client,
+            self._lane.provider.provider_name,
+        )
+        self._judge_context_window = _positive_window(
+            getattr(binding.config, "context_window", None),
+            session_window,
+        )
+
+    @staticmethod
+    def _fingerprint_config(config: JudgeConfig) -> tuple[str, float, float, int, bool]:
+        """Constructor-consumed behavior that requires a fresh judge object."""
+        return (
+            str(config.model or "").strip(),
+            config.max_context_ratio,
+            config.timeout,
+            config.parallel_evaluations,
+            config.read_only_tools,
+        )
+
+    def binding_is_current(
+        self,
+        session_binding: ResolvedModelBinding,
+        config: JudgeConfig | None = None,
+    ) -> bool:
+        """Whether this judge can be reused for the next evaluation.
+
+        In-flight daemon work keeps this object's pinned lane.  The session calls
+        this only at the next evaluation boundary and replaces the whole object
+        when it returns ``False``.
+        """
+        if config is not None and self._fingerprint_config(config) != self._config_fingerprint:
+            return False
+        return self._binding_state.is_current(session_binding)
 
     # -- Client lifecycle helpers -------------------------------------------
 
@@ -1107,6 +1342,7 @@ class IntentJudge:
         callback: Callable[[IntentVerdict], None],
         cancel_event: threading.Event | None = None,
         done_callback: Callable[[], None] | None = None,
+        backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
     ) -> list[IntentVerdict]:
         """Evaluate tool calls. Returns heuristic verdicts immediately.
 
@@ -1128,11 +1364,16 @@ class IntentJudge:
                 close, and — only when ``cancel_on_approval`` is
                 enabled — as soon as the approval gate resolves.
             done_callback: Invoked exactly once from the daemon's
-                ``finally`` when this generation finishes — normally,
-                cancelled, or by escape of a delivery error.  ChatSession
+                ``finally`` when this generation finishes — normally or
+                cancelled. Callback errors are isolated per item. ChatSession
                 uses it to retire the generation's cancel event from its
                 live set (parallel task agents each spawn a generation;
                 ``close()`` aborts whatever is still live).
+            backend_auth_resolver: Batch-scoped resolver whose closure pins
+                the initiating principal.  The resolver remains on the
+                batch's lane so each plant-call attempt mints after acquiring
+                alias admission.  The mint cache keeps this inexpensive while
+                preventing a queued bearer from expiring before dispatch.
 
         Returns:
             List of heuristic verdicts (one per item), available immediately.
@@ -1158,7 +1399,15 @@ class IntentJudge:
         # Spawn daemon thread for LLM judge
         thread = threading.Thread(
             target=self._run_judge,
-            args=(items, messages, heuristic_verdicts, callback, cancel_event, done_callback),
+            args=(
+                items,
+                messages,
+                heuristic_verdicts,
+                callback,
+                cancel_event,
+                done_callback,
+                backend_auth_resolver,
+            ),
             daemon=True,
             name="intent-judge",
         )
@@ -1174,8 +1423,9 @@ class IntentJudge:
         callback: Callable[[IntentVerdict], None],
         cancel_event: threading.Event | None = None,
         done_callback: Callable[[], None] | None = None,
+        backend_auth_resolver: Callable[[str, ModelConfig | None], str | None] | None = None,
     ) -> None:
-        """Daemon thread: run LLM judge for each item and invoke callback.
+        """Daemon coordinator: run bounded LLM evaluations and invoke callback.
 
         ``cancel_event`` is an unconditional abort signal: once it fires,
         in-flight work stops and every remaining item is delivered as an
@@ -1190,79 +1440,203 @@ class IntentJudge:
         no supersede, every evaluation runs to completion so all
         verdicts are delivered.
         """
-        client = self._create_client()
         try:
-            for idx, (item, h_verdict) in enumerate(zip(items, heuristic_verdicts, strict=True)):
-                if cancel_event and cancel_event.is_set():
-                    log.info("judge.cancelled", remaining=len(items) - idx)
-                    self._deliver_fallbacks(
-                        items[idx:],
-                        heuristic_verdicts[idx:],
-                        callback,
-                        "judge cancelled before evaluating this call",
-                    )
-                    return
+            if cancel_event and cancel_event.is_set():
+                self._deliver_fallbacks(
+                    items,
+                    heuristic_verdicts,
+                    callback,
+                    "judge cancelled before evaluating this call",
+                )
+                return
+
+            if not items:
+                return
+
+            # Preserve the caller-pinned principal on the batch lane, but let
+            # model_turn resolve credentials only after alias admission.  An
+            # admission backlog can outlive a bearer token; carrying the
+            # resolver refreshes near-expiry tokens at the dispatch boundary
+            # without allowing a later shared-workstream actor to take over.
+            batch_lane = self._lane
+            if backend_auth_resolver is not None:
+                batch_lane = replace(
+                    batch_lane,
+                    backend_auth_resolver=backend_auth_resolver,
+                )
+
+            if cancel_event and cancel_event.is_set():
+                self._deliver_fallbacks(
+                    items,
+                    heuristic_verdicts,
+                    callback,
+                    "judge cancelled before evaluating this call",
+                )
+                return
+
+            width = min(
+                max(1, int(self._config.parallel_evaluations)),
+                _MAX_PARALLEL_EVALUATIONS,
+                len(items),
+            )
+            alias_limit = batch_lane.admission.limit if batch_lane.admission is not None else 0
+            if alias_limit > 0:
+                width = min(width, alias_limit)
+            log.info(
+                "judge.batch.start",
+                items=len(items),
+                parallel_evaluations=width,
+                configured_parallel_evaluations=self._config.parallel_evaluations,
+                model_alias=batch_lane.alias,
+                model_alias_limit=alias_limit,
+            )
+            work: queue.Queue[int | None] = queue.Queue()
+            outcomes: queue.Queue[_JudgeWorkOutcome] = queue.Queue()
+            batch_cancel = _JudgeBatchCancelEvent(cancel_event)
+            abort_lock = threading.Lock()
+            abort_reason = ""
+
+            for idx in range(len(items)):
+                work.put(idx)
+            for _ in range(width):
+                work.put(None)
+
+            def _current_abort_reason() -> str:
+                if cancel_event is not None and cancel_event.is_set():
+                    return "judge cancelled before evaluating this call"
+                with abort_lock:
+                    return abort_reason
+
+            def _abort_batch(reason: str) -> bool:
+                nonlocal abort_reason
+                with abort_lock:
+                    first = not abort_reason
+                    if first:
+                        abort_reason = reason
+                batch_cancel.set()
+                return first
+
+            def _worker() -> None:
+                client: Any | None = None
                 try:
-                    llm_verdict = self._evaluate_single(
-                        item,
-                        messages,
-                        cancel_event,
-                        client,
-                    )
-                    if llm_verdict:
-                        log.info(
-                            "judge.verdict.llm",
-                            recommendation=llm_verdict.recommendation,
-                            confidence=llm_verdict.confidence,
-                            call_id=llm_verdict.call_id,
-                        )
-                        callback(llm_verdict)
-                    else:
-                        fallback = IntentVerdict(
-                            verdict_id=h_verdict.verdict_id,
-                            call_id=h_verdict.call_id,
-                            func_name=h_verdict.func_name,
-                            func_args=h_verdict.func_args,
-                            intent_summary=h_verdict.intent_summary,
-                            risk_level=h_verdict.risk_level,
-                            confidence=h_verdict.confidence,
-                            recommendation=h_verdict.recommendation,
-                            reasoning=h_verdict.reasoning + " (LLM judge did not return a verdict)",
-                            evidence=h_verdict.evidence,
-                            tier="llm_fallback",
-                            judge_model=self._model,
-                            latency_ms=h_verdict.latency_ms,
-                        )
-                        log.info(
-                            "judge.verdict.fallback",
-                            recommendation=fallback.recommendation,
-                            confidence=fallback.confidence,
-                            call_id=fallback.call_id,
-                        )
-                        callback(fallback)
-                    # After delivering this item's verdict, check whether the
-                    # abort signal fired while we were evaluating it.
-                    if cancel_event and cancel_event.is_set():
-                        log.info("judge.cancelled.after_eval", call_id=item.get("call_id", ""))
-                        self._deliver_fallbacks(
-                            items[idx + 1 :],
-                            heuristic_verdicts[idx + 1 :],
-                            callback,
-                            "judge cancelled before evaluating this call",
-                        )
-                        return
-                except Exception:
-                    log.exception(
-                        "Judge evaluation failed for %s",
-                        item.get("func_name", "?"),
-                    )
-                    self._deliver_fallbacks([item], [h_verdict], callback, "judge evaluation error")
-        finally:
+                    while True:
+                        idx = work.get()
+                        if idx is None:
+                            work.task_done()
+                            return
+                        outcome: _JudgeWorkOutcome
+                        try:
+                            reason = _current_abort_reason()
+                            if reason:
+                                outcome = _JudgeWorkOutcome(idx, None, reason)
+                            else:
+                                if client is None:
+                                    try:
+                                        client = self._create_client()
+                                    except BaseException:  # noqa: BLE001 - contain daemon failure
+                                        reason = "judge client initialization failed"
+                                        if _abort_batch(reason):
+                                            log.exception("Judge client initialization failed")
+                                        outcome = _JudgeWorkOutcome(idx, None, reason)
+                                if client is not None:
+                                    worker_lane = replace(batch_lane, client=client)
+                                    try:
+                                        verdict = self._evaluate_single(
+                                            items[idx],
+                                            messages,
+                                            batch_cancel,
+                                            client,
+                                            lane=worker_lane,
+                                        )
+                                        reason = _current_abort_reason()
+                                        outcome = _JudgeWorkOutcome(
+                                            idx,
+                                            verdict,
+                                            reason
+                                            or (
+                                                ""
+                                                if verdict is not None
+                                                else "LLM judge did not return a verdict"
+                                            ),
+                                        )
+                                    except BackendAuthUnavailableError:
+                                        reason = "judge backend authentication failed"
+                                        if _abort_batch(reason):
+                                            log.exception("Judge backend authentication failed")
+                                        outcome = _JudgeWorkOutcome(idx, None, reason)
+                                    except BaseException:  # noqa: BLE001 - contain daemon failure
+                                        log.exception(
+                                            "Judge evaluation failed for %s",
+                                            items[idx].get("func_name", "?"),
+                                        )
+                                        outcome = _JudgeWorkOutcome(
+                                            idx,
+                                            None,
+                                            "judge evaluation error",
+                                        )
+                        finally:
+                            work.task_done()
+                        outcomes.put(outcome)
+                        # Callback delivery is the cancellation commit point.
+                        # Do not refill this worker until the coordinator has
+                        # invoked the callback and observed any resulting abort.
+                        outcome.acknowledged.wait()
+                finally:
+                    try:
+                        if client is not None and hasattr(client, "close"):
+                            client.close()
+                    except Exception:
+                        log.debug("judge.client_close_failed", exc_info=True)
+
+            workers: list[threading.Thread] = []
             try:
-                if hasattr(client, "close"):
-                    client.close()
-            except Exception:
-                log.debug("judge.client_close_failed", exc_info=True)
+                for idx in range(width):
+                    worker = threading.Thread(
+                        target=_worker,
+                        daemon=True,
+                        name=f"intent-judge-eval-{idx + 1}",
+                    )
+                    worker.start()
+                    workers.append(worker)
+            except BaseException:  # noqa: BLE001 - preserve exact-once fallbacks
+                reason = "judge worker initialization failed"
+                _abort_batch(reason)
+                log.exception("Judge worker initialization failed")
+            if not workers:
+                self._deliver_fallbacks(items, heuristic_verdicts, callback, abort_reason)
+                return
+
+            delivered: set[int] = set()
+            for _ in range(len(items)):
+                outcome = outcomes.get()
+                try:
+                    if outcome.index in delivered:
+                        log.error("judge.verdict.duplicate", index=outcome.index)
+                        continue
+                    delivered.add(outcome.index)
+                    h_verdict = heuristic_verdicts[outcome.index]
+                    verdict = outcome.verdict or self._fallback_verdict(
+                        h_verdict,
+                        outcome.fallback_reason,
+                    )
+                    log.info(
+                        "judge.verdict.llm"
+                        if outcome.verdict is not None
+                        else "judge.verdict.fallback",
+                        recommendation=verdict.recommendation,
+                        confidence=verdict.confidence,
+                        call_id=verdict.call_id,
+                    )
+                    try:
+                        callback(verdict)
+                    except Exception:
+                        log.debug("judge.verdict_delivery_failed", exc_info=True)
+                finally:
+                    outcome.acknowledged.set()
+
+            for worker in workers:
+                worker.join()
+        finally:
             if done_callback is not None:
                 try:
                     done_callback()
@@ -1278,31 +1652,43 @@ class IntentJudge:
     ) -> None:
         """Deliver ``llm_fallback`` verdicts (heuristic content) for items the judge didn't complete."""
         for _item, h_verdict in zip(remaining_items, remaining_verdicts, strict=True):
-            fallback = IntentVerdict(
-                verdict_id=h_verdict.verdict_id,
-                call_id=h_verdict.call_id,
-                func_name=h_verdict.func_name,
-                func_args=h_verdict.func_args,
-                intent_summary=h_verdict.intent_summary,
-                risk_level=h_verdict.risk_level,
-                confidence=h_verdict.confidence,
-                recommendation=h_verdict.recommendation,
-                reasoning=h_verdict.reasoning + f" ({reason})",
-                evidence=h_verdict.evidence,
-                tier="llm_fallback",
-                judge_model=self._model,
-                latency_ms=h_verdict.latency_ms,
-            )
-            callback(fallback)
+            try:
+                callback(self._fallback_verdict(h_verdict, reason))
+            except Exception:
+                log.debug("judge.verdict_delivery_failed", exc_info=True)
+
+    def _fallback_verdict(self, h_verdict: IntentVerdict, reason: str) -> IntentVerdict:
+        """Relabel one heuristic verdict as an LLM fallback."""
+        return IntentVerdict(
+            verdict_id=h_verdict.verdict_id,
+            call_id=h_verdict.call_id,
+            func_name=h_verdict.func_name,
+            func_args=h_verdict.func_args,
+            intent_summary=h_verdict.intent_summary,
+            risk_level=h_verdict.risk_level,
+            confidence=h_verdict.confidence,
+            recommendation=h_verdict.recommendation,
+            reasoning=h_verdict.reasoning + f" ({reason})",
+            evidence=h_verdict.evidence,
+            tier="llm_fallback",
+            judge_model=self._model,
+            latency_ms=h_verdict.latency_ms,
+        )
 
     def _evaluate_single(
         self,
         item: dict[str, Any],
         messages: list[dict[str, Any]],
         cancel_event: threading.Event | None,
-        client: Any,
+        client: Any | None,
+        *,
+        lane: ModelLane | None = None,
     ) -> IntentVerdict | None:
         """Run LLM judge for a single tool call. Returns verdict or None."""
+        if lane is None:
+            if client is None:
+                raise ValueError("intent judge evaluation requires a client or pinned lane")
+            lane = replace(self._lane, client=client)
         start = time.monotonic()
         func_name = item.get("func_name", item.get("name", ""))
         func_args = item.get("func_args", {})
@@ -1338,25 +1724,10 @@ class IntentJudge:
         if self._config.read_only_tools:
             tools = list(_JUDGE_TOOL_SCHEMAS)
 
-        # The judge's resolved lane for this evaluation: fresh client per run
-        # (thread isolation), extra_params / live flags / temperature ladder
-        # from the registry like every other lane.  Capabilities are
-        # DELIBERATELY the constructor-frozen set (not re-resolved here):
-        # the judge's window budget was sized against them at construction,
-        # and the session swaps the whole judge on model/credential change —
-        # an in-place capabilities edit to the same alias applies on the
-        # next judge swap, keeping caps and window from ever disagreeing
-        # within one judge lifetime.
-        lane = resolve_lane(
-            self._provider,
-            client,
-            self._model,
-            alias=self._alias,
-            registry=self._model_registry,
-            capabilities=self._capabilities,
-            config_store=self._config_store,
-            backend_auth_resolver=self._backend_auth_resolver,
-        )
+        # ``lane`` is the constructor-pinned binding with only the worker's
+        # fresh client substituted.  No registry/config facet is re-resolved
+        # inside an evaluation; window sizing and wire capabilities therefore
+        # cannot disagree.
 
         # Multi-turn judge loop
         result = None  # will hold the last ModelTurnResult
@@ -1442,6 +1813,8 @@ class IntentJudge:
                         log.info("judge.verdict.from_partial", turn=turn + 1)
                         return verdict
                 return None
+            except BackendAuthUnavailableError:
+                raise
             except Exception as e:
                 log.info("judge.turn.failed", turn=turn + 1, error=str(e))
                 return None
@@ -1676,12 +2049,15 @@ class IntentJudge:
         ]
 
     # Paths the judge is never allowed to read (security hardening).
-    _BLOCKED_PREFIXES: tuple[str, ...] = (
-        "/etc/",
-        "/root/",
-        "/proc/",
-        "/sys/",
-        "/dev/",
+    _BLOCKED_ROOTS: tuple[Path, ...] = tuple(
+        Path(root).resolve()
+        for root in (
+            "/etc",
+            "/root",
+            "/proc",
+            "/sys",
+            "/dev",
+        )
     )
     _BLOCKED_PARTS: frozenset[str] = frozenset(
         {
@@ -1694,14 +2070,18 @@ class IntentJudge:
     _BLOCKED_SUFFIXES: tuple[str, ...] = (".pem", ".key", ".p12", ".pfx")
 
     @staticmethod
-    def _is_path_blocked(path: Path) -> bool:
-        """Return True if *path* should not be readable by the judge."""
-        resolved = str(path.resolve())
-        if any(resolved.startswith(p) for p in IntentJudge._BLOCKED_PREFIXES):
+    def _is_resolved_path_blocked(path: Path) -> bool:
+        """Return whether an already-resolved path is protected."""
+        if any(path == root or root in path.parents for root in IntentJudge._BLOCKED_ROOTS):
             return True
         if IntentJudge._BLOCKED_PARTS & set(path.parts):
             return True
         return path.suffix.lower() in IntentJudge._BLOCKED_SUFFIXES
+
+    @staticmethod
+    def _is_path_blocked(path: Path) -> bool:
+        """Return True if *path* resolves to a protected location."""
+        return IntentJudge._is_resolved_path_blocked(path.resolve())
 
     @staticmethod
     def _exec_read_only_tool(name: str, args: dict[str, Any]) -> str:
@@ -1712,27 +2092,46 @@ class IntentJudge:
         try:
             if name == "read_file":
                 path = Path(str(args.get("path", "")))
-                if IntentJudge._is_path_blocked(path):
+                resolved_path = path.resolve()
+                if IntentJudge._is_resolved_path_blocked(resolved_path):
                     return f"Error: access denied: {path}"
-                if not path.is_file():
+                if not resolved_path.is_file():
                     return f"Error: file not found: {path}"
-                content = path.read_text(encoding="utf-8", errors="replace")
-                # Cap at 32KB to avoid blowing context
-                if len(content) > 32768:
-                    return content[:32768] + f"\n... (truncated, {len(content)} bytes total)"
+                # Bound acquisition itself, not merely the returned string:
+                # a parallel batch must not materialize one unbounded file per
+                # worker before applying the judge context cap.
+                with resolved_path.open("r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read(_JUDGE_READ_LIMIT + 1)
+                if len(content) > _JUDGE_READ_LIMIT:
+                    try:
+                        total_bytes = resolved_path.stat().st_size
+                        size_note = f", {total_bytes} bytes total"
+                    except OSError:
+                        size_note = ""
+                    return content[:_JUDGE_READ_LIMIT] + f"\n... (truncated{size_note})"
                 return content
 
             if name == "list_directory":
                 path = Path(str(args.get("path", "")))
-                if IntentJudge._is_path_blocked(path):
+                resolved_path = path.resolve()
+                if IntentJudge._is_resolved_path_blocked(resolved_path):
                     return f"Error: access denied: {path}"
-                if not path.is_dir():
+                if not resolved_path.is_dir():
                     return f"Error: directory not found: {path}"
-                entries = sorted(path.iterdir())[:200]  # cap at 200 entries
+                # Bound collection before sorting so concurrent evidence
+                # workers retain at most N+1 directory entries each.
+                entries = sorted(
+                    itertools.islice(resolved_path.iterdir(), _JUDGE_DIRECTORY_LIMIT + 1),
+                    key=lambda entry: entry.name,
+                )
+                truncated = len(entries) > _JUDGE_DIRECTORY_LIMIT
+                entries = entries[:_JUDGE_DIRECTORY_LIMIT]
                 lines: list[str] = []
                 for entry in entries:
                     suffix = "/" if entry.is_dir() else ""
                     lines.append(f"  {entry.name}{suffix}")
+                if truncated:
+                    lines.append("  ... (additional entries omitted)")
                 return "\n".join(lines) or "(empty directory)"
 
             return f"Error: unknown tool: {name}"

@@ -708,6 +708,147 @@ def test_audio_roles_gated_to_openai_sdk_providers() -> None:
     assert '_providerCarriesAudio((md && md.provider) || "openai")' in body
 
 
+def test_judge_integer_settings_render_as_bounded_number_inputs() -> None:
+    """The Judge tab has a custom schema renderer separate from Settings.
+
+    Integer settings must not fall through to its text-input branch: doing so
+    drops the registry's step/min/max affordances for parallel_evaluations.
+    """
+    governance = _CONSOLE_GOVERNANCE_JS.read_text(encoding="utf-8")
+    start = governance.index("function renderJudgeSettings()")
+    end = governance.index("\nfunction saveJudgeSetting(", start)
+    body = governance[start:end]
+    assert 's.type === "float" || s.type === "int"' in body
+    assert '(s.type === "int" ? "1" : "0.01")' in body
+    assert "s.min_value" in body
+    assert "s.max_value" in body
+
+
+# Tile keys that are deliberately NOT ``ModelCapabilities`` fields.
+# ``supports_rerank`` is a registry-level flag read off the model row.
+_NON_DATACLASS_TILES = {"supports_rerank"}
+
+
+def test_capability_bool_lift_agrees_with_the_backend_coercion() -> None:
+    """The tile lift coerces a stored capability the way the backend does.
+
+    The capabilities dict is hand-edited JSON, so a stored string
+    ``"false"`` is TRUTHY to JS while ``apply_capability_overrides`` reads
+    it as ``False``.  Lifting it into a tile with bare ``!!`` renders the
+    row checked and then persists boolean ``true`` on the next save —
+    inverting the capability without the operator touching it.  For
+    ``server_parses_reasoning`` that silently disables the inline tag scan,
+    which is the leak model_turn's own comment names.
+
+    Cases are generated FROM the Python table, so a spelling added on one
+    side and not the other fails here rather than in the field.
+    """
+    import tempfile
+
+    from turnstone.core.model_turn import _CAPABILITY_BOOL_STRINGS
+
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    table = re.search(r"const _CAP_BOOL_STRINGS = \{.*?\n\};", admin, re.S)
+    fn = re.search(r"function _capBool\(value\) \{.*?\n\}", admin, re.S)
+    assert table and fn, "capability bool coercion not found in admin.js"
+
+    checks: list[str] = []
+    for spelling, expected in _CAPABILITY_BOOL_STRINGS.items():
+        # Same spelling, uppercased, and padded — the Python arm strips and
+        # lowercases before lookup, so the JS must too.
+        for variant in (spelling, spelling.upper(), f"  {spelling}  "):
+            lit = json.dumps(variant)
+            checks.append(
+                f"if (_capBool({lit}) !== {json.dumps(expected)}) "
+                f"throw new Error('spelling ' + {lit} + ' -> ' + _capBool({lit}));"
+            )
+    checks += [
+        "if (_capBool(true) !== true) throw new Error('boolean true');",
+        "if (_capBool(false) !== false) throw new Error('boolean false');",
+        "if (_capBool(1) !== true) throw new Error('number 1');",
+        "if (_capBool(0) !== false) throw new Error('number 0');",
+        # Unrecognized values must NOT coerce — the caller leaves them in the
+        # raw JSON instead of rewriting them (the thinking_mode policy).
+        "if (_capBool('maybe') !== undefined) throw new Error('garbage string');",
+        "if (_capBool(null) !== undefined) throw new Error('null');",
+        "if (_capBool({}) !== undefined) throw new Error('object');",
+    ]
+    harness = table.group(0) + chr(10) + fn.group(0) + chr(10) + chr(10).join(checks)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as f:
+        f.write(harness)
+        tmp = f.name
+    try:
+        proc = subprocess.run(["node", tmp], capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        pytest.skip("node binary not available on PATH")
+    finally:
+        os.unlink(tmp)
+    assert proc.returncode == 0, (
+        f"_capBool disagrees with the backend coercion.  stderr={proc.stderr!r}"
+    )
+
+    # The lift must actually USE it — a reverted call site would leave the
+    # helper in place and every case above still passing.
+    assert "_modelCapsExplicit[k] = !!capsObj[k]" not in admin
+    assert "const asBool = _capBool(capsObj[k]);" in admin
+
+
+def test_capability_tiles_agree_with_the_capabilities_dataclass() -> None:
+    """Every tile is a real capability, rendered, and defaulted like Python.
+
+    The tile matrix is a hand-maintained mirror of
+    :class:`ModelCapabilities`, so it drifts silently: a renamed field
+    leaves a tile that writes a key nothing reads, and a JS default that
+    disagrees with the dataclass shows the operator a state the backend
+    would not apply.  A tile whose key is not a capability field is
+    allowed only by NAME (``_NON_DATACLASS_TILES``) — a blanket
+    "skip what the dataclass lacks" would exempt exactly the rename this
+    test exists to catch.
+    """
+    from turnstone.core.providers._protocol import ModelCapabilities
+
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    html = _CONSOLE_INDEX.read_text(encoding="utf-8")
+
+    keys_block = re.search(r"const _MODEL_CAP_KEYS = \[(.*?)\];", admin, re.S)
+    defaults_block = re.search(r"const _MODEL_CAP_DEFAULTS = \{(.*?)\};", admin, re.S)
+    assert keys_block and defaults_block, "capability tile matrix not found in admin.js"
+    keys = re.findall(r'"(\w+)"', keys_block.group(1))
+    defaults = {
+        k: v == "true" for k, v in re.findall(r"(\w+):\s*(true|false)", defaults_block.group(1))
+    }
+    assert keys, "no capability tile keys parsed"
+
+    # The tile is only reachable if it renders INSIDE the container
+    # ``_modelTileEl`` queries; outside it, ``_modelGetTile`` silently falls
+    # back to the default and a saved ``true`` is rewritten as ``false``.
+    grid_start = html.index('id="model-capgrid"')
+    grid = html[grid_start : html.index("</div>", grid_start)]
+
+    caps = ModelCapabilities()
+    for key in keys:
+        assert f'data-cap="{key}"' in grid, f"tile {key} renders outside #model-capgrid"
+        assert key in defaults, f"tile {key} has no entry in _MODEL_CAP_DEFAULTS"
+        # No hasattr escape hatch: a tile whose key is neither a capability
+        # field nor a known registry flag writes a key nothing reads, which
+        # is the first drift this test exists to catch.
+        assert hasattr(caps, key) or key in _NON_DATACLASS_TILES, (
+            f"tile {key} is neither a ModelCapabilities field nor a known registry flag"
+        )
+        if hasattr(caps, key):
+            assert defaults[key] == getattr(caps, key), (
+                f"tile default for {key} disagrees with ModelCapabilities"
+            )
+    assert set(defaults) == set(keys), "_MODEL_CAP_DEFAULTS and _MODEL_CAP_KEYS disagree"
+
+    # The inline-tag scan is a FALLBACK for servers with no reasoning parser
+    # (and for misconfigured ones).  An operator running vLLM/llama.cpp with a
+    # parser configured needs a discoverable way to say so — without it the
+    # only route is hand-editing the raw capabilities JSON.
+    assert "server_parses_reasoning" in keys
+
+
 def test_model_response_controls_are_capability_driven_and_sparse() -> None:
     """The model shelf surfaces Responses-only scalar controls without
     hard-coding GPT-5.6 IDs or pinning inherited capability-table values."""
@@ -782,6 +923,29 @@ def test_model_response_controls_are_capability_driven_and_sparse() -> None:
     assert "_modelCapsSeq++" in change, "model changes must invalidate in-flight baselines"
     assert "_modelCapsBaseline = {}" in change
     assert 'apiSurfEl.addEventListener("change", _onModelFieldChange)' in admin
+
+
+def test_model_max_concurrency_form_round_trips_strict_integer() -> None:
+    html = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+
+    assert 'id="model-max-concurrency"' in html
+    assert 'max="2147483647"' in html
+    assert "0 = unlimited" in html
+
+    create = _slice_function_body(admin, "showCreateModelModal")
+    edit = _slice_function_body(admin, "showEditModelModal")
+    render = _slice_function_body(admin, "_renderModels")
+    assert create is not None and edit is not None and render is not None
+    assert 'getElementById("model-max-concurrency").value = "0"' in create
+    assert "m.max_concurrency != null ? m.max_concurrency : 0" in edit
+    # submitCreateModel is longer than the balanced-slice helper's bounded
+    # window; these names are unique to that form path, so whole-file pins are
+    # both stable and unambiguous.
+    assert "Number.isInteger(maxConcurrency)" in admin
+    assert "maxConcurrency > 2147483647" in admin
+    assert "form.max_concurrency = maxConcurrency" in admin
+    assert 'overrides.push("limit=" + m.max_concurrency)' in render
 
 
 def test_shared_utils_defines_set_safe_html_helper() -> None:
@@ -3662,3 +3826,52 @@ def test_coordinator_tool_output_pres_are_focusable() -> None:
         "the coordinator retry sweep must remove a bar emptied of its last "
         "control — screen readers announce empty 'Message actions' toolbars"
     )
+
+
+def test_admin_js_auth_mode_fallbacks_match_registry() -> None:
+    """The model shelf's fail-open fallback literals track the server maps.
+
+    At runtime the served constraints are authoritative and these hand-kept
+    fallbacks only cover a missing/failed fetch — but a drifted fallback
+    silently misclassifies exactly when the authority is unavailable, so
+    each one is pinned against the registry's classification maps.
+    """
+    from turnstone.core.model_registry import (
+        DYNAMIC_MODEL_AUTH_MODES,
+        MODEL_AUTH_MODE_PROFILES,
+        MODEL_AUTH_MODES,
+        SCOPES_MODEL_AUTH_MODES,
+    )
+
+    body = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    # The ONE hoisted fallback pairing map (_AUTH_MODE_FALLBACK_PROFILES):
+    # _syncModelAuthFields uses it directly and _isDynamicAuthMode's
+    # fallback list derives from its keys, so pinning the map's entries
+    # covers both consumers.
+    for mode, profile in MODEL_AUTH_MODE_PROFILES.items():
+        assert f'{mode}: "{profile}"' in body, f"fallback pairing for {mode} missing/drifted"
+    assert "Object.keys(_AUTH_MODE_FALLBACK_PROFILES)" in body, (
+        "the dynamic-mode fallback must derive from the pairing map's keys"
+    )
+    # Every registry-classified dynamic mode must appear as a map key.
+    for mode in DYNAMIC_MODEL_AUTH_MODES:
+        assert f'{mode}: "' in body, f"dynamic-mode fallback missing {mode}"
+    # The scopes fallback stays its own literal array (not derivable from
+    # the pairing map): every scopes mode must appear as a quoted literal.
+    for mode in SCOPES_MODEL_AUTH_MODES:
+        assert f'"{mode}"' in body, f"scopes-mode fallback missing {mode}"
+    # Same contract for the app-identity fallback (the model list's auth
+    # badge derives per-user vs deployment from it), and the badge site
+    # must classify via the shared predicates, never a hand list.
+    from turnstone.core.model_registry import APP_IDENTITY_MODEL_AUTH_MODES
+
+    for mode in APP_IDENTITY_MODEL_AUTH_MODES:
+        assert f'"{mode}"' in body, f"app-identity fallback missing {mode}"
+    assert body.count("_isAppIdentityAuthMode") >= 2, (
+        "the model-list badge must classify via the shared app-identity predicate"
+    )
+    # And the shelf's select ships an option per registry mode, so no mode
+    # depends on the injected-option skew path on a current page.
+    index_body = _CONSOLE_INDEX.read_text(encoding="utf-8")
+    for mode in sorted(MODEL_AUTH_MODES):
+        assert f'value="{mode}"' in index_body, f"index.html option missing {mode}"

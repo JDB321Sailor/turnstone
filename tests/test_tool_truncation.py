@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests._session_helpers import make_result
 from turnstone.core.session import ChatSession
 from turnstone.core.trajectory import Role, turns_from_dicts
 
@@ -199,26 +200,30 @@ class TestRemainingTokenBudget:
 class TestContextOverflowRecovery:
     """Test that context-length errors trigger compact-and-retry."""
 
-    def test_openai_context_length_error_triggers_compact(self, session):
+    @pytest.mark.parametrize(
+        "overflow_text",
+        [
+            pytest.param("maximum context length exceeded", id="openai"),
+            pytest.param("prompt is too long: 250000 tokens > 200000 maximum", id="anthropic"),
+        ],
+    )
+    def test_context_overflow_triggers_compact(self, session, overflow_text):
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
         session._msg_tokens = [1]
 
         call_count = 0
 
-        def mock_create_stream(msgs):
+        def mock_stream_response(my_generation=0):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
-                raise Exception("maximum context length exceeded")
-            return iter([])
+                raise Exception(overflow_text)
+            return make_result(content="ok")
 
         compact_mock = MagicMock()
         with (
-            patch.object(session, "_create_stream_with_retry", side_effect=mock_create_stream),
+            patch.object(session, "_stream_response", side_effect=mock_stream_response),
             patch.object(session, "_compact_messages", compact_mock),
-            patch.object(
-                session, "_stream_response", return_value={"role": "assistant", "content": "ok"}
-            ),
             patch.object(session, "_full_messages", return_value=[]),
             patch.object(session, "_update_token_table"),
             patch.object(session, "_print_status_line"),
@@ -232,36 +237,6 @@ class TestContextOverflowRecovery:
         compact_mock.assert_called_once_with(auto=True, my_generation=session._generation)
         assert call_count == 2
 
-    def test_anthropic_prompt_too_long_triggers_compact(self, session):
-        session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
-        session._msg_tokens = [1]
-
-        call_count = 0
-
-        def mock_create_stream(msgs):
-            nonlocal call_count
-            call_count += 1
-            if call_count == 1:
-                raise Exception("prompt is too long: 250000 tokens > 200000 maximum")
-            return iter([])
-
-        compact_mock = MagicMock()
-        with (
-            patch.object(session, "_create_stream_with_retry", side_effect=mock_create_stream),
-            patch.object(session, "_compact_messages", compact_mock),
-            patch.object(
-                session, "_stream_response", return_value={"role": "assistant", "content": "ok"}
-            ),
-            patch.object(session, "_full_messages", return_value=[]),
-            patch.object(session, "_update_token_table"),
-            patch.object(session, "_print_status_line"),
-            patch.object(session, "_emit_state"),
-            patch("turnstone.core.session.save_message"),
-        ):
-            session.send("hello")
-
-        compact_mock.assert_called_once_with(auto=True, my_generation=session._generation)
-
     def test_non_context_error_propagates(self, session):
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
         session._msg_tokens = [1]
@@ -269,7 +244,7 @@ class TestContextOverflowRecovery:
         with (
             patch.object(
                 session,
-                "_create_stream_with_retry",
+                "_stream_response",
                 side_effect=Exception("authentication failed"),
             ),
             patch.object(session, "_full_messages", return_value=[]),
@@ -286,7 +261,7 @@ class TestContextOverflowRecovery:
         with (
             patch.object(
                 session,
-                "_create_stream_with_retry",
+                "_stream_response",
                 side_effect=Exception("maximum context length exceeded"),
             ),
             patch.object(session, "_compact_messages", side_effect=RuntimeError("compact failed")),
@@ -308,13 +283,13 @@ def _send_with_tool_batches(session, batches, **extra_patches):
     """Drive one ``send()`` through the tool-execution drain with canned results.
 
     *batches* is a list of ``(tool_calls, results)`` pairs, one send-loop
-    iteration each: ``_stream_response`` returns an assistant turn carrying
-    each batch's *tool_calls* in order, then a plain reply ends the loop.
-    Each *results* is what ``_execute_tools`` hands the drain — the
-    truncation/floor/compact path under test runs REAL code between the
-    mocked boundaries.  Mirrors ``tests/test_session.py::_send_with_mocks``;
-    kept local because these tests patch the budget/compaction seam
-    differently per scenario.
+    iteration each: ``_stream_response`` returns a ``ModelTurnResult`` whose
+    ``.tool_calls`` carries each batch's *tool_calls* in order, then a plain
+    reply ends the loop.  Each *results* is what ``_execute_tools`` hands the
+    drain — the truncation/floor/compact path under test runs REAL code
+    between the mocked boundaries.  Mirrors
+    ``tests/test_session.py::_send_with_mocks``; kept local because these
+    tests patch the budget/compaction seam differently per scenario.
 
     ``_estimated_prompt_tokens`` is pinned LOW so the end-of-turn/owed
     compaction paths stay quiet — every compaction observed by these tests
@@ -323,21 +298,15 @@ def _send_with_tool_batches(session, batches, **extra_patches):
     no background utility-completion thread churns against the mock client.
     """
     session._title_generated = True
-    responses = [
-        {"role": "assistant", "content": "", "tool_calls": tool_calls} for tool_calls, _ in batches
-    ] + [{"role": "assistant", "content": "done"}]
+    responses = [make_result(content="", tool_calls=tool_calls) for tool_calls, _ in batches] + [
+        make_result(content="done")
+    ]
     exec_results = [(results, []) for _, results in batches]
 
-    def mock_stream(_msgs):
-        return iter([])
-
-    def mock_response(_stream, _gen):
+    def mock_response(_gen):
         return responses.pop(0)
 
     with contextlib.ExitStack() as stack:
-        stack.enter_context(
-            patch.object(session, "_create_stream_with_retry", side_effect=mock_stream)
-        )
         stack.enter_context(patch.object(session, "_stream_response", side_effect=mock_response))
         stack.enter_context(patch.object(session, "_execute_tools", side_effect=exec_results))
         for attr, value in extra_patches.items():
@@ -435,13 +404,21 @@ class TestZeroBudgetDrain:
         """A bulky error output keeps its lead: a masked failure reads as
         success, which is the dishonesty #883 removes."""
         err = "Error: deploy failed: " + "trace line\n" * 500
-        session._tool_error_flags["tc_e"] = True
+
+        def execute_error_batch(*_args, **_kwargs):
+            # Side-map ownership begins inside the claimed generation.  A
+            # pre-send flag is predecessor state and is intentionally cleared
+            # by the claim before provider call ids may be reused.
+            session._tool_error_flags["tc_e"] = True
+            return ([("tc_e", err)], None)
+
         with _send_with_tool_batch(
             session,
             [{"id": "tc_e", "function": {"name": "bash", "arguments": "{}"}}],
             [("tc_e", err)],
             _remaining_token_budget=MagicMock(return_value=0),
             _compact_messages=MagicMock(return_value=False),
+            _execute_tools=MagicMock(side_effect=execute_error_batch),
         ):
             session.send("go")
 

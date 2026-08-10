@@ -30,6 +30,7 @@ import httpx
 import pytest
 from openai import OpenAI
 
+from tests._session_helpers import replace_session_lane
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import init_storage, reset_storage
 
@@ -75,6 +76,10 @@ class RecordingUI:
 
     def on_turn_committed(self):
         self.events.append(("turn_committed",))
+
+    def on_stream_discarded(self):
+        # A live-wire blip entering the retry arm must not crash the fake.
+        self.events.append(("stream_discarded",))
 
     def on_thinking_start(self):
         self.events.append(("thinking_start",))
@@ -170,7 +175,7 @@ def _make_session(client, model_id, tmp_db, **kwargs) -> tuple[ChatSession, Reco
     defaults.update(kwargs)
     session = ChatSession(**defaults)
     # Mock-based tests use Chat Completions format (client.chat.completions)
-    session._provider = OpenAIChatCompletionsProvider()
+    replace_session_lane(session, provider=OpenAIChatCompletionsProvider())
     session.auto_approve = True
     return session, ui
 
@@ -321,7 +326,13 @@ class TestBackendConnectivity:
             temperature=0.0,
             stream=False,
         )
-        assert resp.choices[0].message.content or resp.choices[0].message.reasoning_content
+        message = resp.choices[0].message
+        # OpenAI-compatible servers use either non-standard field for parsed
+        # reasoning (vLLM: ``reasoning``; llama.cpp: ``reasoning_content``).
+        reasoning = getattr(message, "reasoning", None) or getattr(
+            message, "reasoning_content", None
+        )
+        assert message.content or reasoning
         assert resp.usage.total_tokens > 0
 
 

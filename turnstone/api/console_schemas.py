@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any, Literal, TypeAlias
 
 from pydantic import BaseModel, Field
 
+# TC002 suppressed deliberately: pydantic resolves the stringified annotation
+# at class-build time, so SkipJsonSchema must exist at runtime — under
+# TYPE_CHECKING the import vanishes and model creation fails.
+from pydantic.json_schema import SkipJsonSchema  # noqa: TC002
+
+from turnstone.api.server_schemas import CreateWorkstreamRequest, CreateWorkstreamResponse
+from turnstone.core.model_registry import MAX_MODEL_CONCURRENCY
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
 
@@ -156,7 +163,8 @@ class ConsoleCreateWsRequest(BaseModel):
         description="Project to attach the workstream to (validated against membership, empty = none)",
     )
     resume_ws: str = Field(
-        default="", description="Workstream ID to resume (loads previous conversation)"
+        default="",
+        description=("Source workstream ID or alias to fork atomically into the new workstream"),
     )
     judge_model: str = Field(
         default="", description="Override judge model alias for this workstream"
@@ -995,6 +1003,18 @@ class RegistryInstallRequest(BaseModel):
 # Admin: Model Definitions
 # ---------------------------------------------------------------------------
 
+ModelMaxConcurrency: TypeAlias = Annotated[
+    int,
+    Field(
+        strict=True,
+        ge=0,
+        le=MAX_MODEL_CONCURRENCY,
+        description=(
+            "Maximum concurrent model generations for this alias in one process; zero means unlimited."
+        ),
+    ),
+]
+
 
 class ModelDefinitionInfo(BaseModel):
     definition_id: str
@@ -1004,6 +1024,7 @@ class ModelDefinitionInfo(BaseModel):
     base_url: str = ""
     api_key: str = ""
     context_window: int = 32768
+    max_concurrency: ModelMaxConcurrency = 0
     capabilities: str = "{}"
     enabled: bool = True
     temperature: float | None = None
@@ -1011,14 +1032,38 @@ class ModelDefinitionInfo(BaseModel):
     reasoning_effort: str | None = None
     surface_persisted_reasoning: bool = True
     replay_reasoning_to_model: bool = False
-    # "static" (send api_key), "entra_obo" (delegated-user token), or
-    # "entra_app" (shared app token) for obo_audience at call time.
+    # "static" (send api_key), "entra_obo" / "rfc8693_obo" (delegated-user
+    # token), or "entra_app" (shared app token) for obo_audience at call
+    # time; obo_scopes is the rfc8693 exchange-leg scope request.
     auth_mode: str = "static"
     obo_audience: str = ""
+    obo_scopes: str = ""
     source: str = ""
     created_by: str = ""
     created: str = ""
     updated: str = ""
+
+
+class ModelDefinitionWriteResponse(ModelDefinitionInfo):
+    """Create/update response: the stored row plus an optional caveat.
+
+    ``registry_warning`` is present only when the DB write succeeded but
+    THIS console's live coordinator registry refused to adopt it (keyless
+    host with dynamic-auth rows): the row is saved, yet running sessions
+    keep the previous config until the deployment fault is remedied.
+    Clients should surface it as a warning beside the success, never as a
+    failure. Absent on a clean save (SkipJsonSchema: the server omits the
+    key rather than sending null).
+    """
+
+    registry_warning: str | SkipJsonSchema[None] = Field(
+        default=None,
+        description=(
+            "Set when the save landed but this console's live registry refused "
+            "the swap (e.g. dynamic auth configured without the startup "
+            "encryption key); carries the operator-facing remediation text."
+        ),
+    )
 
 
 class CreateModelDefinitionRequest(BaseModel):
@@ -1028,6 +1073,7 @@ class CreateModelDefinitionRequest(BaseModel):
     base_url: str = ""
     api_key: str = ""
     context_window: int = 32768
+    max_concurrency: ModelMaxConcurrency = 0
     capabilities: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
     temperature: float | None = None
@@ -1037,6 +1083,7 @@ class CreateModelDefinitionRequest(BaseModel):
     replay_reasoning_to_model: bool = False
     auth_mode: str = "static"
     obo_audience: str = ""
+    obo_scopes: str = ""
 
 
 class UpdateModelDefinitionRequest(BaseModel):
@@ -1046,7 +1093,23 @@ class UpdateModelDefinitionRequest(BaseModel):
     base_url: str | None = None
     api_key: str | None = None
     context_window: int | None = None
-    capabilities: dict[str, Any] | None = None
+    # The runtime update handler is presence-keyed.  Keep null out of the
+    # advertised union because explicit JSON null is refused; clients clear a
+    # limit by sending the canonical unlimited value, zero.
+    max_concurrency: ModelMaxConcurrency | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None
+    )
+    # SkipJsonSchema drops the null member from the ADVERTISED union while the
+    # Python type still tolerates None: the presence-keyed update handler
+    # refuses an explicit JSON null, so advertising null would let generated
+    # clients legally produce a request the server rejects.
+    capabilities: dict[str, Any] | SkipJsonSchema[None] = Field(
+        default=None,
+        description=(
+            "Full replacement capabilities object. Omit to leave the stored "
+            "value unchanged; JSON null is refused (400)."
+        ),
+    )
     enabled: bool | None = None
     temperature: float | None = None
     max_tokens: int | None = None
@@ -1055,10 +1118,76 @@ class UpdateModelDefinitionRequest(BaseModel):
     replay_reasoning_to_model: bool | None = None
     auth_mode: str | None = None
     obo_audience: str | None = None
+    obo_scopes: str | None = None
 
 
 class ListModelDefinitionsResponse(BaseModel):
     models: list[ModelDefinitionInfo]
+    # No default: the server always sends it, and a default would make the key
+    # optional in the generated OpenAPI, forcing every consumer to write a
+    # ``?? ""`` branch the server never produces.
+    default_alias: str = Field(
+        description="Effective default alias after the config/enabled-list fallbacks",
+    )
+
+
+class ModelAuthConstraintsResponse(BaseModel):
+    """Affordance data for the model shelf's Backend-auth section.
+
+    Suggestions and labels only — never a gate. The write validator is the
+    authority; a client that fails to fetch this must degrade to free-text
+    input with server-side validation, not to a refusal.
+    """
+
+    # No defaults: both keys are always present, so absence is a protocol
+    # error rather than an empty answer.
+    auth_audience_allowlist: list[str] = Field(
+        description=(
+            "Exact gateway audiences a definition may use with entra_obo / "
+            "entra_app, rendered as input suggestions. Empty means none are "
+            "registered yet; writes are refused until an operator populates "
+            "model.auth_audience_allowlist."
+        ),
+    )
+    auth_grant_profile: str = Field(
+        description=(
+            "Deployment [oidc] obo_grant_profile, or empty when single sign-on "
+            "is not configured. Each dynamic auth_mode pairs with exactly one "
+            "profile (see auth_mode_profiles); the write validator refuses a "
+            "new pairing that contradicts it. A transient discovery outage "
+            "reports the configured profile, not empty."
+        ),
+    )
+    dynamic_auth_modes: list[str] = Field(
+        description=(
+            "auth_mode values that mint per-call backend credentials, derived "
+            "server-side from the registry's mode classification so the "
+            "shelf's affordances (audience enable/require, section "
+            "visibility) track it by data. Clients keep a hand-listed "
+            "fallback only for a missing or failed constraints fetch."
+        ),
+    )
+    scopes_auth_modes: list[str] = Field(
+        description=(
+            "auth_mode values whose mint reads obo_scopes (the token-exchange "
+            "scope request), same server-derived contract as "
+            "dynamic_auth_modes; drives the scopes input's visibility."
+        ),
+    )
+    app_identity_auth_modes: list[str] = Field(
+        description=(
+            "auth_mode values that mint a shared app/deployment identity "
+            "rather than a per-user one, same server-derived contract as "
+            "dynamic_auth_modes; drives the model list's auth badge wording."
+        ),
+    )
+    auth_mode_profiles: dict[str, str] = Field(
+        description=(
+            "Required [oidc] obo_grant_profile per dynamic auth_mode. "
+            "Affordance for greying options that cannot validate under this "
+            "deployment's profile; the write validator remains the authority."
+        ),
+    )
 
 
 class PersonaInfo(BaseModel):
@@ -1153,6 +1282,38 @@ class ListPersonasResponse(BaseModel):
 class ModelReloadResponse(BaseModel):
     status: str = "ok"
     results: dict[str, Any] = Field(default_factory=dict)
+    # Same refused-swap caveat as ModelDefinitionWriteResponse; this route's
+    # purpose is DB→live sync, so a refused swap must not read as success.
+    registry_warning: str | SkipJsonSchema[None] = Field(
+        default=None,
+        description=(
+            "Set when the node fan-out ran but THIS console's live registry "
+            "refused the swap (e.g. dynamic auth configured without the "
+            "startup encryption key); carries the operator-facing "
+            "remediation text."
+        ),
+    )
+
+
+class DeleteModelDefinitionResponse(BaseModel):
+    """Delete response: the removed row id plus an optional caveat.
+
+    ``registry_warning`` mirrors ModelDefinitionWriteResponse: the DB row
+    is gone, but a keyless console's live registry refused the swap and
+    keeps SERVING the deleted alias to running and new coordinator
+    sessions until the deployment fault is remedied.
+    """
+
+    status: str = "ok"
+    definition_id: str
+    registry_warning: str | SkipJsonSchema[None] = Field(
+        default=None,
+        description=(
+            "Set when the delete landed but this console's live registry "
+            "refused the swap and keeps serving the deleted alias; carries "
+            "the operator-facing remediation text."
+        ),
+    )
 
 
 class DetectModelRequest(BaseModel):
@@ -1189,6 +1350,16 @@ class CalibrateModelResponse(BaseModel):
     irrelevant: list[float] = Field(default_factory=list)
     applied: bool = False
     error: str = ""
+    # Same refused-swap caveat as ModelDefinitionWriteResponse, for the
+    # calibrate persist (a capabilities write like the twins').
+    registry_warning: str | SkipJsonSchema[None] = Field(
+        default=None,
+        description=(
+            "Set when the calibration was stored but this console's live "
+            "registry refused the swap; carries the operator-facing "
+            "remediation text."
+        ),
+    )
 
 
 class ModelCapabilitiesResponse(BaseModel):
@@ -1229,12 +1400,37 @@ class RouteResponse(BaseModel):
     node_id: str
 
 
-class RouteCreateResponse(BaseModel):
+class RouteLiveResponse(BaseModel):
+    """Non-mutating live-session probe for one routed workstream."""
+
+    ws_id: str
+    live: bool
+
+
+class RouteCreateRequest(CreateWorkstreamRequest):
+    """JSON workstream creation through the routing proxy."""
+
+    target_node: str = Field(
+        default="",
+        description=(
+            "Optional node id to pin placement to. The console generates a "
+            "workstream id whose rendezvous owner is that node."
+        ),
+    )
+
+
+class RouteCreateResponse(CreateWorkstreamResponse):
     """Workstream creation via the routing proxy."""
 
-    ws_id: str = ""
-    node_url: str = ""
-    node_id: str = ""
+    node_url: str
+    node_id: str
+    routing_strategy: Literal["rendezvous", "target_node", "resume"] = Field(
+        description=(
+            "Placement reason: rendezvous for a destination id, target_node for "
+            "a generated pinned id, or resume when an atomic fork is routed by "
+            "its canonical source id"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1370,6 +1566,14 @@ class CoordinatorApproveRequest(BaseModel):
             "When approved=True, also adds the pending tool name(s) to the session's "
             "auto-approve set so subsequent calls of the same tool skip the prompt."
         ),
+    )
+    cycle_id: str | None = Field(
+        default=None,
+        description="Resolve this exact approval cycle",
+    )
+    call_id: str | None = Field(
+        default=None,
+        description="Resolve the approval cycle containing this tool call",
     )
 
 

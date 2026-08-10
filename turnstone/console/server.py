@@ -27,6 +27,7 @@ import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -57,11 +58,24 @@ from turnstone.core.auth import (
     require_permission,
 )
 from turnstone.core.deadline import DeadlineExceededError, run_with_deadline
-from turnstone.core.mcp_crypto import is_user_scoped_auth
+from turnstone.core.mcp_crypto import STARTUP_KEY_REQUIRED_HINT, is_user_scoped_auth
 from turnstone.core.memory import get_workstream_display_names
 from turnstone.core.metacognition import field_str, sanitize_display
+from turnstone.core.model_registry import (
+    APP_IDENTITY_MODEL_AUTH_MODES,
+    DYNAMIC_MODEL_AUTH_MODES,
+    MAX_MODEL_CONCURRENCY,
+    MODEL_AUTH_MODE_PROFILES,
+    MODEL_AUTH_TEXT_MAX_LEN,
+    SCOPES_MODEL_AUTH_MODES,
+    DynamicAuthKeyError,
+    dynamic_auth_key_error,
+    sanitize_backend_auth_scopes,
+    strip_control_characters,
+)
 from turnstone.core.model_registry import MODEL_AUTH_MODES as _MODEL_AUTH_MODES
-from turnstone.core.rendezvous import NoAvailableNodeError
+from turnstone.core.rendezvous import NoAvailableNodeError, NodeRef
+from turnstone.core.rerank_calibrate import canonical_caps_value
 from turnstone.core.session_replay import session_replay_preamble
 from turnstone.core.session_routes import (
     AttachmentUploadHelpers,
@@ -108,6 +122,12 @@ if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
 log = logging.getLogger("turnstone.console.server")
+
+# A model-definition write and its follow-up refresh are separate operations.
+# Serialize the whole strict snapshot load + in-place install so a slow reader
+# that captured an older DB snapshot cannot land after a newer CRUD request's
+# refresh and roll the live coordinator registry backward.
+_COORD_REGISTRY_REFRESH_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Static assets — loaded once at startup
@@ -217,6 +237,8 @@ _JS_PROXY_SHIM = """\
 
 _VALID_NODE_ID = re.compile(r"^[a-zA-Z0-9._-]+$")
 _VALID_WS_ID_RE = re.compile(r"^[a-f0-9]{1,64}$")
+_VALID_CREATE_WS_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+_MAX_ROUTE_RESUME_LEN = 256
 
 # Client timeout for the REST proxy pool (BOTH constructions: startup and
 # the mTLS re-create).  Node endpoints that answer degraded-but-in-time
@@ -297,11 +319,12 @@ def _proxy_auth_headers(request: Request) -> dict[str, str]:
     scope narrowing.  Falls back to the ServiceTokenManager when no user
     context is available.
 
-    When the inbound request authenticated with a coordinator-minted JWT
-    (``auth_result.token_source == "coordinator"``), the re-mint
-    preserves that source AND the ``coord_ws_id`` custom claim so
-    upstream audit rows retain coordinator-origin visibility.  For all
-    other inbound sources the re-mint uses ``"console-proxy"`` as before.
+    Coordinator-minted JWTs preserve their source and ``coord_ws_id`` custom
+    claim.  The console service identity also preserves ``source="console"``,
+    but only when the inbound token carries the unassignable ``service``
+    scope; that is the node create handler's signal that a body ``user_id``
+    override is trusted.  Every ordinary principal is re-minted as
+    ``"console-proxy"`` even if its untrusted ``src`` claim says ``console``.
     """
     auth_result = getattr(getattr(request, "state", None), "auth_result", None)
     jwt_secret: str = getattr(request.app.state, "jwt_secret", "")
@@ -311,7 +334,10 @@ def _proxy_auth_headers(request: Request) -> dict[str, str]:
         # every upstream call from a coordinator session would be
         # indistinguishable from a human-originated console proxy call.
         is_coord = auth_result.token_source == "coordinator"
-        source = "coordinator" if is_coord else "console-proxy"
+        is_console_service = (
+            auth_result.token_source == "console" and "service" in auth_result.scopes
+        )
+        source = "coordinator" if is_coord else "console" if is_console_service else "console-proxy"
         extra: dict[str, Any] = {}
         if is_coord:
             coord_ws_id = auth_result.extra_claims.get("coord_ws_id")
@@ -1939,8 +1965,9 @@ async def route_create(request: Request) -> Response:
 
     Accepts both `application/json` and `multipart/form-data`. Multipart
     callers must include ``?ws_id=<hex>`` in the URL query string so the
-    console can hash to the owning node before the multipart body lands —
-    we do not parse the body just to peek at the metadata.
+    console can hash to the owning node. The console parses only the cached
+    ``meta`` field to require the same destination id, then forwards the
+    original body and boundary unchanged.
     """
     from turnstone.core.auth import require_any_permission
 
@@ -1981,25 +2008,57 @@ async def route_create(request: Request) -> Response:
     headers = _proxy_auth_headers(request)
     pin = False
     body: dict[str, Any] = {}
-    raw_body: bytes = b""
     # Routing strategy is surfaced on the response so callers (the
     # coordinator's spawn_workstream tool especially) can explain why a
     # given node was chosen.  Set on every branch below.
     routing_strategy = "rendezvous"
 
     if is_multipart:
-        # Multipart: caller must pass ws_id as a query param so we can
-        # route without parsing the body.  Stream the raw bytes through
-        # to the upstream so we don't lose the multipart framing.
-        ws_id = request.query_params.get("ws_id", "").strip()
-        if not ws_id:
+        # Multipart: caller must pass ws_id as a query param. Parse only the
+        # cached metadata to verify identity, then stream the original bytes
+        # through so we do not lose the multipart framing.
+        ws_id = request.query_params.get("ws_id", "")
+        if not _VALID_CREATE_WS_ID_RE.fullmatch(ws_id):
             return _record_route(
                 request,
                 "create",
                 400,
                 t0,
                 JSONResponse(
-                    {"error": "ws_id query parameter required for multipart create"},
+                    {
+                        "error": (
+                            "ws_id query parameter must be a 32-character "
+                            "lowercase hexadecimal string for multipart create"
+                        )
+                    },
+                    status_code=400,
+                ),
+            )
+        # Placement and durable identity must be the same value.  The node
+        # reads ``meta.ws_id`` from the multipart body, while the console uses
+        # the query value for rendezvous; forwarding a mismatch would create
+        # the row on a node that follow-up requests do not select.  Buffering
+        # is already part of this proxy path, so parse only the metadata here
+        # and still forward the original bytes and boundary verbatim.
+        raw_body = await request.body()
+        form = None
+        try:
+            form = await request.form()
+            meta_raw = form.get("meta")
+            meta = json.loads(meta_raw) if isinstance(meta_raw, str) else None
+        except Exception:
+            meta = None
+        finally:
+            if form is not None:
+                await form.close()
+        if not isinstance(meta, dict) or meta.get("ws_id") != ws_id:
+            return _record_route(
+                request,
+                "create",
+                400,
+                t0,
+                JSONResponse(
+                    {"error": "multipart meta.ws_id must match the ws_id query parameter"},
                     status_code=400,
                 ),
             )
@@ -2016,11 +2075,10 @@ async def route_create(request: Request) -> Response:
                     status_code=503,
                 ),
             )
-        # Multipart callers pre-allocate ws_id (typically an attachment
-        # follow-up against an existing workstream) — same hash-of-known-id
-        # path resume_ws takes on the JSON branch.
-        routing_strategy = "resume"
-        raw_body = await request.body()
+        # Multipart callers pre-allocate a fresh destination id. Placement is
+        # ordinary rendezvous over that id; ``resume`` is reserved for the JSON
+        # atomic-fork path keyed by its source workstream.
+        routing_strategy = "rendezvous"
         # Forward the raw header verbatim — the multipart `boundary=` parameter
         # is case-sensitive and must match the bytes in the body exactly.
         upstream_headers = {**headers, "Content-Type": raw_content_type}
@@ -2042,27 +2100,122 @@ async def route_create(request: Request) -> Response:
                 ),
             )
     else:
-        try:
-            body = await request.json()
-        except Exception:
+        parsed_body = await read_json_or_400(request)
+        if isinstance(parsed_body, JSONResponse):
+            return _record_route(request, "create", parsed_body.status_code, t0, parsed_body)
+        body = parsed_body
+
+        for field in ("resume_ws", "target_node", "ws_id"):
+            if field in body and not isinstance(body[field], str):
+                return _record_route(
+                    request,
+                    "create",
+                    400,
+                    t0,
+                    JSONResponse({"error": f"{field} must be a string"}, status_code=400),
+                )
+
+        resume_ws = body.get("resume_ws", "")
+        target_node = body.get("target_node", "")
+        requested_ws_id = body.get("ws_id", "")
+        if resume_ws and len(resume_ws) > _MAX_ROUTE_RESUME_LEN:
             return _record_route(
                 request,
                 "create",
                 400,
                 t0,
                 JSONResponse(
-                    {"error": "Invalid JSON body"},
+                    {"error": f"resume_ws must be at most {_MAX_ROUTE_RESUME_LEN} characters"},
                     status_code=400,
                 ),
             )
+        if target_node and (
+            len(target_node) > 256 or _VALID_NODE_ID.fullmatch(target_node) is None
+        ):
+            return _record_route(
+                request,
+                "create",
+                400,
+                t0,
+                JSONResponse({"error": "invalid target_node format"}, status_code=400),
+            )
+        if requested_ws_id and _VALID_CREATE_WS_ID_RE.fullmatch(requested_ws_id) is None:
+            return _record_route(
+                request,
+                "create",
+                400,
+                t0,
+                JSONResponse({"error": "invalid ws_id format"}, status_code=400),
+            )
+
+        # ``resume_ws`` supports saved aliases, but rendezvous placement needs
+        # the canonical source id. Resolve before choosing a node and forward
+        # the canonical value so the router and node operate on one identity.
+        if resume_ws:
+            storage, storage_err = require_storage_or_503(request)
+            if storage_err is not None:
+                return _record_route(
+                    request,
+                    "create",
+                    storage_err.status_code,
+                    t0,
+                    storage_err,
+                )
+            try:
+                # Keep the node and console on one precedence rule. A full
+                # workstream id is already canonical when that exact row
+                # exists; only fall back to alias-first resolution when it
+                # does not. Otherwise an alias equal to another row's 32-hex
+                # id can redirect the routed fork before it reaches the node.
+                exact_row = (
+                    await asyncio.to_thread(storage.get_workstream, resume_ws)
+                    if _VALID_CREATE_WS_ID_RE.fullmatch(resume_ws)
+                    else None
+                )
+                canonical_resume = (
+                    resume_ws
+                    if exact_row is not None
+                    else await asyncio.to_thread(storage.resolve_workstream, resume_ws)
+                )
+            except Exception:
+                log.warning(
+                    "route_create.resume_lookup_failed source=%s",
+                    resume_ws[:32],
+                    exc_info=True,
+                )
+                return _record_route(
+                    request,
+                    "create",
+                    503,
+                    t0,
+                    JSONResponse({"error": "Storage not available"}, status_code=503),
+                )
+            if not canonical_resume:
+                return _record_route(
+                    request,
+                    "create",
+                    404,
+                    t0,
+                    JSONResponse({"error": "Workstream not found"}, status_code=404),
+                )
+            body["resume_ws"] = canonical_resume
+            resume_ws = canonical_resume
+
+        fixed_ws_id = bool(requested_ws_id)
         try:
-            if body.get("resume_ws"):
-                ref = router.route(body["resume_ws"])
+            if requested_ws_id:
+                # A caller-selected destination is authoritative. Do not
+                # overwrite it for a target hint or a fork; place it through
+                # the same rendezvous path used for generated destinations.
+                ref = router.route(requested_ws_id)
+                routing_strategy = "rendezvous"
+            elif resume_ws:
+                ref = router.route(resume_ws)
                 routing_strategy = "resume"
-            elif body.get("target_node"):
+            elif target_node:
                 # Brute-force HRW search can take up to _GENERATE_ATTEMPT_CAP
                 # iterations for skewed weights; off the event loop.
-                ws_id = await asyncio.to_thread(router.generate_ws_id_for_node, body["target_node"])
+                ws_id = await asyncio.to_thread(router.generate_ws_id_for_node, target_node)
                 body["ws_id"] = ws_id
                 ref = router.route(ws_id)
                 pin = True
@@ -2102,7 +2255,7 @@ async def route_create(request: Request) -> Response:
         # 503 retry with a new ws_id that hashes to a different node.
         # Multipart variant skips this branch — the body is bound to the
         # ws_id the caller chose, so re-routing would mean re-uploading.
-        if resp.status_code == 503 and not pin and not body.get("resume_ws"):
+        if resp.status_code == 503 and not pin and not resume_ws and not fixed_ws_id:
             failed_node = ref.node_id
             found_alt = False
             for _ in range(10):
@@ -2144,16 +2297,34 @@ async def route_create(request: Request) -> Response:
                 )
 
     if resp.status_code == 200:
-        data = resp.json()
+        try:
+            raw_data = resp.json()
+        except Exception:
+            raw_data = None
+        if not isinstance(raw_data, dict):
+            log.warning(
+                "route_create.invalid_success_body node=%s body=%s",
+                ref.node_id,
+                _bounded_body_preview(resp.content),
+            )
+            return _record_route(request, "create", 502, t0, _dispatch_failed(ref.node_id))
+        destination_ws_id = raw_data.get("ws_id")
+        destination_name = raw_data.get("name")
+        if (
+            not isinstance(destination_ws_id, str)
+            or _VALID_CREATE_WS_ID_RE.fullmatch(destination_ws_id) is None
+            or not isinstance(destination_name, str)
+        ):
+            log.warning(
+                "route_create.invalid_success_shape node=%s ws_id_type=%s name_type=%s",
+                ref.node_id,
+                type(destination_ws_id).__name__,
+                type(destination_name).__name__,
+            )
+            return _record_route(request, "create", 502, t0, _dispatch_failed(ref.node_id))
+
+        data = dict(raw_data)
         data["node_url"] = ref.url
-        # Audit attribution — multipart sets ``ws_id`` from the query
-        # string; JSON sets it on the body (or carries ``resume_ws``
-        # for a rehydrate).  Either way, this is the workstream the
-        # caller actually landed on.
-        if is_multipart:
-            audit_ws_id = ws_id
-        else:
-            audit_ws_id = body.get("ws_id") or body.get("resume_ws", "") or ""
         # Return the storage-authoritative node_id so subsequent
         # inspect / list calls agree on the binding.  ``ref.node_id`` is
         # the rendezvous target AT SPAWN TIME — stale once membership
@@ -2164,21 +2335,32 @@ async def route_create(request: Request) -> Response:
         # additive.
         bound_node_id = ref.node_id
         storage = getattr(request.app.state, "auth_storage", None)
-        if storage is not None and audit_ws_id:
+        if storage is not None:
             try:
-                row = storage.get_workstream(audit_ws_id)
+                row = storage.get_workstream(destination_ws_id)
                 stored_node = row.get("node_id") if isinstance(row, dict) else None
                 if isinstance(stored_node, str) and stored_node:
                     bound_node_id = stored_node
             except Exception:
                 log.debug(
                     "route_create.node_id_lookup_failed ws=%s",
-                    audit_ws_id[:8] if audit_ws_id else "",
+                    destination_ws_id[:8],
                     exc_info=True,
                 )
         data["node_id"] = bound_node_id
         data["routing_strategy"] = routing_strategy
-        _emit_route_audit(request, "route.workstream.create", audit_ws_id, bound_node_id)
+        # The node transaction has already persisted destination -> serving
+        # node as a durable override.  Publish the same confirmed placement to
+        # this console's cache before returning so an immediate follow-up does
+        # not rendezvous the fresh id to another node while the collector is
+        # still between refresh ticks.
+        await asyncio.to_thread(router.remember_override, destination_ws_id, ref)
+        _emit_route_audit(
+            request,
+            "route.workstream.create",
+            destination_ws_id,
+            bound_node_id,
+        )
         return _record_route(request, "create", 200, t0, JSONResponse(data))
     return _record_route(
         request,
@@ -2375,16 +2557,35 @@ async def route_proxy(request: Request) -> Response:
     try:
         body = await request.json()
     except Exception:
-        return _record_route(
-            request,
-            verb,
-            400,
-            t0,
-            JSONResponse(
-                {"error": "Invalid JSON body"},
-                status_code=400,
-            ),
-        )
+        if verb == "cancel":
+            # Match the node endpoint: cancel is a recovery verb, so an
+            # absent or malformed body remains cooperative ``force=false``.
+            body = {}
+        else:
+            return _record_route(
+                request,
+                verb,
+                400,
+                t0,
+                JSONResponse(
+                    {"error": "Invalid JSON body"},
+                    status_code=400,
+                ),
+            )
+    if not isinstance(body, dict):
+        if verb == "cancel":
+            body = {}
+        else:
+            return _record_route(
+                request,
+                verb,
+                400,
+                t0,
+                JSONResponse(
+                    {"error": "Request body must be a JSON object"},
+                    status_code=400,
+                ),
+            )
 
     # Path-keyed shape (post-1.5) carries ws_id in the URL; the
     # legacy command route still mounts at a body-keyed URL and
@@ -2642,6 +2843,137 @@ async def route_lookup(request: Request) -> JSONResponse:
             {"node_url": ref.url, "node_id": ref.node_id},
         ),
     )  # type: ignore[return-value]
+
+
+async def route_workstream_live(request: Request) -> Response:
+    """Read-only probe for live membership on a workstream's routed node.
+
+    The console deliberately asks the rendezvous owner instead of its
+    eventually-consistent collector. The upstream active-list handler is
+    manager-authoritative, excludes deferred ``creating`` rows, and applies
+    the caller's normal project visibility rules. Only a boolean returns, so
+    an unloaded, missing, or caller-invisible workstream has the same shape.
+    """
+    t0 = time.monotonic()
+    router: ConsoleRouter | None = request.app.state.router
+    ring_ready = router is not None and router.is_ready()
+    if not ring_ready:
+        if router is not None:
+            await asyncio.to_thread(router.refresh_cache)
+            ring_ready = router.is_ready()
+        if not ring_ready:
+            return _record_route(
+                request,
+                "live",
+                503,
+                t0,
+                JSONResponse(
+                    {"error": "Cluster routing not initialized"},
+                    status_code=503,
+                ),
+            )
+    assert router is not None
+
+    ws_id = request.path_params.get("ws_id", "").strip()
+    if not ws_id:
+        return _record_route(
+            request,
+            "live",
+            400,
+            t0,
+            JSONResponse({"error": "ws_id required"}, status_code=400),
+        )
+
+    try:
+        ref = router.route(ws_id)
+    except (NoAvailableNodeError, ValueError):
+        return _record_route(
+            request,
+            "live",
+            503,
+            t0,
+            JSONResponse({"error": "routing failed"}, status_code=503),
+        )
+
+    client: httpx.AsyncClient = request.app.state.proxy_client
+    headers = _proxy_auth_headers(request)
+
+    async def _active_rows(route_ref: NodeRef) -> tuple[list[Any] | None, Response | None]:
+        try:
+            resp = await client.get(
+                f"{route_ref.url}/v1/api/workstreams",
+                headers=headers,
+            )
+        except httpx.HTTPError:
+            return None, JSONResponse(
+                {"error": f"upstream node {route_ref.node_id} unreachable"},
+                status_code=502,
+            )
+
+        if not 200 <= resp.status_code < 300:
+            return None, Response(
+                content=resp.content,
+                status_code=resp.status_code,
+                headers={"Content-Type": resp.headers.get("content-type", "application/json")},
+            )
+
+        try:
+            payload = resp.json()
+        except (ValueError, httpx.HTTPError):
+            payload = None
+        rows = payload.get("workstreams") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            return None, JSONResponse(
+                {"error": f"upstream node {route_ref.node_id} returned an invalid active list"},
+                status_code=502,
+            )
+        return rows, None
+
+    rows, probe_error = await _active_rows(ref)
+    if probe_error is not None:
+        return _record_route(request, "live", probe_error.status_code, t0, probe_error)
+    assert rows is not None
+
+    live = any(
+        isinstance(row, dict) and row.get("ws_id") == ws_id and row.get("state") != "creating"
+        for row in rows
+    )
+    if not live:
+        # A clean miss is ambiguous while the collector cache may predate a
+        # freshly committed destination override.  Refresh the shared-storage
+        # view and re-probe exactly once only when placement changed.  ACL and
+        # upstream errors remain fail-closed; a stable owner can safely report
+        # the original miss without another round trip.
+        try:
+            await asyncio.to_thread(router.force_refresh)
+            refreshed_ref = router.route(ws_id)
+        except Exception:
+            log.warning("route_workstream_live.refresh_failed ws=%s", ws_id[:8], exc_info=True)
+            return _record_route(
+                request,
+                "live",
+                503,
+                t0,
+                JSONResponse({"error": "routing refresh failed"}, status_code=503),
+            )
+        if (refreshed_ref.node_id, refreshed_ref.url) != (ref.node_id, ref.url):
+            rows, probe_error = await _active_rows(refreshed_ref)
+            if probe_error is not None:
+                return _record_route(request, "live", probe_error.status_code, t0, probe_error)
+            assert rows is not None
+            live = any(
+                isinstance(row, dict)
+                and row.get("ws_id") == ws_id
+                and row.get("state") != "creating"
+                for row in rows
+            )
+    return _record_route(
+        request,
+        "live",
+        200,
+        t0,
+        JSONResponse({"ws_id": ws_id, "live": live}),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3154,7 +3486,11 @@ async def _resolve_coordinator_or_404(
         except Exception:
             log.debug("resolve_coordinator.storage_failed ws=%s", ws_id[:8], exc_info=True)
             return None, miss
-        if row is None or row.get("kind") != WorkstreamKind.COORDINATOR:
+        if (
+            row is None
+            or row.get("state") == "creating"
+            or row.get("kind") != WorkstreamKind.COORDINATOR
+        ):
             return None, miss
         # Project tenancy — the predicate may resolve a project row +
         # membership, so judge it off the event loop.
@@ -3207,7 +3543,11 @@ def _coordinator_tenant_check(request: Request, ws_id: str, mgr: Any) -> JSONRes
         owner = ws.user_id or ""
     else:
         row = storage.get_workstream(ws_id)
-        if row is None or row.get("kind") != WorkstreamKind.COORDINATOR:
+        if (
+            row is None
+            or row.get("state") == "creating"
+            or row.get("kind") != WorkstreamKind.COORDINATOR
+        ):
             return miss
         project_id = row.get("project_id") or ""
         owner = row.get("user_id") or ""
@@ -4018,21 +4358,6 @@ async def _fanout_on_children(
     return ok, failed, skipped
 
 
-async def _require_json_object(request: Request) -> dict[str, Any] | JSONResponse:
-    """Parse the request body and require a JSON object.
-
-    ``read_json_or_400`` only validates that the body parses as JSON,
-    not that it's an object.  A ``null``/list/scalar body otherwise
-    reaches ``body.get(...)`` and raises ``AttributeError`` → 500.
-    """
-    body = await read_json_or_400(request)
-    if isinstance(body, JSONResponse):
-        return body
-    if not isinstance(body, dict):
-        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
-    return body
-
-
 async def _resolve_coord_session(
     request: Request,
     *,
@@ -4135,7 +4460,7 @@ async def coordinator_trust(request: Request) -> JSONResponse:
         return resolved
     session, storage, user_id, ws_id = resolved
 
-    body = await _require_json_object(request)
+    body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
     raw_send = body.get("send")
@@ -4162,7 +4487,7 @@ async def coordinator_restrict(request: Request) -> JSONResponse:
         return resolved
     session, storage, user_id, ws_id = resolved
 
-    body = await _require_json_object(request)
+    body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
     raw_revoke = body.get("revoke")
@@ -4297,7 +4622,7 @@ async def coordinator_close_all_children(request: Request) -> JSONResponse:
     del coord_mgr  # children_snapshot moved to the adapter
     coord_adapter = getattr(request.app.state, "coord_adapter", None)
 
-    body = await _require_json_object(request)
+    body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
     raw_reason = body.get("reason", "")
@@ -4612,8 +4937,9 @@ def _coord_idle_cleanup_thread(
     timeout_sec: float,
     stop_event: threading.Event | None = None,
     min_sweep_interval: float = 5.0,
+    wake_event: threading.Event | None = None,
 ) -> None:
-    """Periodically reap idle + DB-orphan coordinator workstreams.
+    """Run coordinator idle eviction plus hidden-create recovery.
 
     Mirrors the regular server's ``_idle_cleanup_thread`` (turnstone/server.py)
     but skips the rate-limiter / global-queue arms — the console doesn't have
@@ -4623,19 +4949,14 @@ def _coord_idle_cleanup_thread(
     behind by prior console process incarnations.
 
     Runs an initial sweep BEFORE the first wait so cold-start orphans are
-    reaped immediately rather than waiting one ``check_every`` interval (~30
-    min on default 2h timeout).  This intentionally diverges from the regular
-    server pattern, which has no initial sweep — the regular server runs
-    inside a normal request-handling lifecycle, the console-side coord pool
-    is a small fixed-size cache where orphans dominate the row count after
-    a cold boot.
+    reaped immediately. ``timeout_sec == 0`` disables ordinary idle eviction,
+    but the independent provisional-create recovery still runs with its fixed
+    conservative grace and cadence.
 
-    Wait shape: subscribes a callback to ``mgr._state_subscribers`` that
-    sets a ``tick_now`` event; the loop blocks on ``tick_now.wait(check_every)``
-    so any workstream state-change wakes the sweeper without waiting a
-    full check interval, AND the timeout still fires the periodic sweep
-    even when no activity happens (catching the DB-orphan-only case).
-    Net: blocked most of the time instead of repeating storage scans.
+    When idle eviction is enabled, the wait subscribes to manager state and a
+    transition can wake the next sweep early. With idle eviction disabled, the
+    thread uses only the fixed provisional-create cadence so ordinary turn
+    transitions do not cause redundant storage scans.
 
     ``min_sweep_interval`` is the hard floor between successive
     ``close_idle`` calls (default 5 s) — without it, sustained
@@ -4656,12 +4977,22 @@ def _coord_idle_cleanup_thread(
     feels prompt to a human watching the sidebar.  Tunable post-merge
     if profiling shows close_idle latency dominates the cadence.
 
-    ``stop_event`` is for tests — when set, the thread exits cleanly after
-    the next loop check.  Production callers pass ``None`` (the daemon is
-    process-lifetime).
+    ``stop_event`` is the lifecycle shutdown signal and ``wake_event`` is the
+    shared state-change/shutdown wake path. Lifecycle owners set both so an
+    idle-enabled thread cannot remain blocked in its long heartbeat wait.
     """
-    check_every = min(300.0, timeout_sec / 4)
-    tick_now = threading.Event()
+    from turnstone.core.session_manager import (
+        STALE_CREATE_GRACE_SECONDS,
+        STALE_CREATE_SWEEP_INTERVAL_SECONDS,
+    )
+
+    idle_enabled = timeout_sec > 0
+    check_every = (
+        min(STALE_CREATE_SWEEP_INTERVAL_SECONDS, timeout_sec / 4)
+        if idle_enabled
+        else float(STALE_CREATE_SWEEP_INTERVAL_SECONDS)
+    )
+    tick_now = wake_event if wake_event is not None else threading.Event()
 
     def _on_state_change(_ws_id: str, _state: Any) -> None:
         # Any workstream state-change resets the idle clock for that
@@ -4670,22 +5001,49 @@ def _coord_idle_cleanup_thread(
         # re-evaluation deferred to the next loop iteration.
         tick_now.set()
 
-    mgr.subscribe_to_state(_on_state_change)
+    if idle_enabled:
+        mgr.subscribe_to_state(_on_state_change)
+
+    last_create_sweep_at: float | None = None
+
+    def _sweep(*, initial: bool = False) -> None:
+        nonlocal last_create_sweep_at
+        if idle_enabled:
+            try:
+                mgr.close_idle(timeout_sec)
+            except Exception:
+                log.debug("console.coord_idle_cleanup_failed", exc_info=True)
+        now = time.monotonic()
+        if (
+            initial
+            or last_create_sweep_at is None
+            or now - last_create_sweep_at >= STALE_CREATE_SWEEP_INTERVAL_SECONDS
+        ):
+            # State changes may wake ordinary idle eviction every few seconds;
+            # hidden-create GC retains its independent five-minute cadence.
+            last_create_sweep_at = now
+            try:
+                mgr.reap_stale_creating_reservations(STALE_CREATE_GRACE_SECONDS)
+            except Exception:
+                log.debug("console.coord_stale_create_cleanup_failed", exc_info=True)
+
     try:
         # Initial sweep — runs once before entering the wait loop.
         # ``tick_now`` is intentionally not cleared here: any
         # state-change event that arrives between subscribe and the
         # first ``wait`` should fire close_idle immediately, not be
         # discarded.
-        try:
-            mgr.close_idle(timeout_sec)
-        except Exception:
-            log.debug("console.coord_idle_cleanup_initial_failed", exc_info=True)
+        _sweep(initial=True)
         last_sweep_at = time.monotonic()
         while True:
             if stop_event is not None and stop_event.is_set():
                 return
-            tick_now.wait(check_every)
+            if idle_enabled:
+                tick_now.wait(check_every)
+            elif stop_event is not None:
+                stop_event.wait(check_every)
+            else:
+                time.sleep(check_every)
             if stop_event is not None and stop_event.is_set():
                 return
             # Clear BEFORE the cadence floor so any state-change event
@@ -4707,13 +5065,11 @@ def _coord_idle_cleanup_thread(
                         return
                 else:
                     time.sleep(gap)
-            try:
-                mgr.close_idle(timeout_sec)
-            except Exception:
-                log.debug("console.coord_idle_cleanup_failed", exc_info=True)
+            _sweep()
             last_sweep_at = time.monotonic()
     finally:
-        mgr.unsubscribe_from_state(_on_state_change)
+        if idle_enabled:
+            mgr.unsubscribe_from_state(_on_state_change)
 
 
 # Guards concurrent attempts to bootstrap the coord subsystem from the
@@ -4852,6 +5208,8 @@ def _bootstrap_coord_subsystem(
     coord_adapter.attach(coord_mgr)
     coord_idle_observer = CoordinatorIdleObserver(coord_mgr, storage)
     cleanup_thread: threading.Thread | None = None
+    cleanup_stop = threading.Event()
+    cleanup_wake = threading.Event()
 
     # Side-effect phase: start threads + register subscriptions.  Any
     # failure here rolls back via locally-held handles BEFORE the
@@ -4890,15 +5248,15 @@ def _bootstrap_coord_subsystem(
         # ``server.workstream_idle_timeout`` setting — same cadence
         # makes sense for both kinds and avoids a redundant config
         # knob.
-        if idle_minutes > 0:
-            timeout_sec = float(idle_minutes * 60)
-            cleanup_thread = threading.Thread(
-                target=_coord_idle_cleanup_thread,
-                args=(coord_mgr, timeout_sec),
-                name="coord-idle-cleanup",
-                daemon=True,
-            )
-            cleanup_thread.start()
+        timeout_sec = float(idle_minutes * 60) if idle_minutes > 0 else 0.0
+        cleanup_thread = threading.Thread(
+            target=_coord_idle_cleanup_thread,
+            args=(coord_mgr, timeout_sec, cleanup_stop),
+            kwargs={"wake_event": cleanup_wake},
+            name="coord-idle-cleanup",
+            daemon=True,
+        )
+        cleanup_thread.start()
     except Exception:
         # Roll back partial side-effects from locals (no app.state
         # writes have happened yet, so the cleanup is local-ref-driven).
@@ -4906,6 +5264,10 @@ def _bootstrap_coord_subsystem(
         # doesn't block the next; the whole rollback is best-effort.
         from turnstone.core.idle_nudge_watcher import shutdown_idle_nudge_watchers
 
+        cleanup_stop.set()
+        cleanup_wake.set()
+        if cleanup_thread is not None and cleanup_thread.ident is not None:
+            cleanup_thread.join(timeout=2.0)
         try:
             coord_state_writer.shutdown(timeout=2.0)
         except Exception:
@@ -4922,10 +5284,6 @@ def _bootstrap_coord_subsystem(
             shutdown_idle_nudge_watchers(app)
         except Exception:
             log.warning("console.coord_bootstrap_rollback_idle_nudge_failed", exc_info=True)
-        # cleanup_thread is the last side-effect started; if it ran
-        # successfully, the surrounding try block had already exited
-        # successfully — so a partial-failure path will not have a
-        # cleanup_thread to roll back.  No-op for symmetry.
         raise
 
     # Atomic commit phase: stamp ``app.state`` and class attrs.  Order
@@ -4940,6 +5298,8 @@ def _bootstrap_coord_subsystem(
     app.state.coord_idle_observer = coord_idle_observer
     if cleanup_thread is not None:
         app.state.coord_idle_cleanup_thread = cleanup_thread
+        app.state.coord_idle_cleanup_stop = cleanup_stop
+        app.state.coord_idle_cleanup_wake = cleanup_wake
     # Shared refs so ConsoleCoordinatorUI.on_state_change flows state
     # transitions through the unified manager, on_rename fans out to
     # the cluster dashboard, and _record_judge_metric /
@@ -4957,6 +5317,40 @@ def _bootstrap_coord_subsystem(
         "console.coordinator_mgr_ready max_active=%s",
         max_active,
     )
+
+
+def _record_coord_key_refusal(app_state: Any, key_err: str) -> None:
+    """Record a dynamic-auth key refusal from a coordinator install/swap path.
+
+    Shared by the lifespan bootstrap, the CRUD-triggered runtime bootstrap
+    and :func:`_refresh_coord_registry` so the three cannot drift: an ERROR
+    log (the observable while the coordinator is live) plus the
+    ``coord_registry_error`` banner (rendered by the 503 path while down).
+    """
+    log.error("console.model_auth_key_missing: %s", key_err)
+    app_state.coord_registry_error = key_err
+
+
+def _refuse_keyless_registry(app_state: Any, registry: Any) -> bool:
+    """Refuse a freshly-loaded registry whose dynamic aliases lack the key.
+
+    The shared refusal step of both bootstrap twins. Derives the error
+    against the REGISTRY, not raw rows — config.toml overrides DB.
+    Returns True when the registry was refused (the caller must not
+    install it).
+    """
+    key_err = dynamic_auth_key_error(registry.models, app_state)
+    if not key_err:
+        return False
+    _record_coord_key_refusal(app_state, key_err)
+    # Defensive teardown of the throwaway, mirroring
+    # _refresh_coord_registry's finally: iterates empty dicts today, kept
+    # against the day the loader grows eager client init.
+    try:
+        registry.shutdown()
+    except Exception:
+        log.warning("console.coord_bootstrap_shutdown_failed", exc_info=True)
+    return True
 
 
 def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_store: Any) -> None:
@@ -4983,6 +5377,12 @@ def _load_and_bootstrap_coord_subsystem(app: Starlette, storage: Any, config_sto
             # operator can recover at runtime by adding a model in the
             # admin panel (see :func:`_maybe_bootstrap_coord_subsystem`).
             app.state.coord_registry_error = str(exc)
+            return
+        # Console-side twin of initialize_mcp_crypto_state's dynamic-auth key
+        # requirement: that guard runs before this registry exists and can
+        # only see the MCP half. Non-fatal by design — the subsystem reports
+        # through coord_registry_error rather than killing the admin surface.
+        if _refuse_keyless_registry(app.state, coord_registry):
             return
         _bootstrap_coord_subsystem(app, storage, config_store, coord_registry)
     except Exception:
@@ -5014,6 +5414,21 @@ def _teardown_partial_coord_subsystem(app: Any) -> None:
     from turnstone.core.idle_nudge_watcher import shutdown_idle_nudge_watchers
 
     state = app.state
+    cleanup_stop = getattr(state, "coord_idle_cleanup_stop", None)
+    cleanup_wake = getattr(state, "coord_idle_cleanup_wake", None)
+    cleanup_thread = getattr(state, "coord_idle_cleanup_thread", None)
+    if cleanup_stop is not None:
+        cleanup_stop.set()
+    if cleanup_wake is not None:
+        cleanup_wake.set()
+    if cleanup_thread is not None and cleanup_thread is not threading.current_thread():
+        cleanup_thread.join(timeout=2.0)
+        if cleanup_thread.is_alive():
+            log.warning("console.coord_partial_idle_cleanup_join_timed_out")
+    state.coord_idle_cleanup_stop = None
+    state.coord_idle_cleanup_wake = None
+    state.coord_idle_cleanup_thread = None
+
     sw = getattr(state, "coord_state_writer", None)
     if sw is not None:
         try:
@@ -5051,10 +5466,6 @@ def _teardown_partial_coord_subsystem(app: Any) -> None:
     state.coord_mgr = None
     state.coord_adapter = None
     state.coord_registry = None
-    # The cleanup thread is the LAST step of a successful bootstrap, so
-    # a partial failure can't have started one.  Clear the attr defensively
-    # against future code-shape drift.
-    state.coord_idle_cleanup_thread = None
     # Match the lifespan shutdown's cleanup of these class-level refs
     # (server.py ~line 4629) so a failed bootstrap doesn't leave stale
     # process-global pointers at a half-built coord_mgr / collector /
@@ -5276,6 +5687,9 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     app.state.coord_adapter = None
     app.state.coord_registry = None
     app.state.coord_registry_error = ""
+    app.state.coord_idle_cleanup_stop = None
+    app.state.coord_idle_cleanup_wake = None
+    app.state.coord_idle_cleanup_thread = None
     if storage and config_store:
         # Run the whole load-and-bootstrap synchronously on a worker
         # thread so a slow ``StateWriter.shutdown(timeout=2.0)`` on the
@@ -5333,6 +5747,20 @@ async def _lifespan(app: Starlette) -> AsyncGenerator[None, None]:
     from turnstone.core.idle_nudge_watcher import shutdown_idle_nudge_watchers
 
     shutdown_idle_nudge_watchers(app)
+    coord_cleanup_stop = getattr(app.state, "coord_idle_cleanup_stop", None)
+    coord_cleanup_wake = getattr(app.state, "coord_idle_cleanup_wake", None)
+    coord_cleanup_thread = getattr(app.state, "coord_idle_cleanup_thread", None)
+    if coord_cleanup_stop is not None:
+        coord_cleanup_stop.set()
+    if coord_cleanup_wake is not None:
+        coord_cleanup_wake.set()
+    if coord_cleanup_thread is not None:
+        await asyncio.to_thread(coord_cleanup_thread.join, 2.0)
+        if coord_cleanup_thread.is_alive():
+            log.warning("console.coord_idle_cleanup_join_timed_out")
+    app.state.coord_idle_cleanup_stop = None
+    app.state.coord_idle_cleanup_wake = None
+    app.state.coord_idle_cleanup_thread = None
     coord_idle_observer_shutdown = getattr(app.state, "coord_idle_observer", None)
     if coord_idle_observer_shutdown is not None:
         try:
@@ -9658,17 +10086,85 @@ def _clean_oauth_text(value: Any, *, max_length: int = 512) -> str | None:
 
     Caps the input to ``max_length`` characters to bound DB row size on
     the admin.mcp write path.  Pass a larger ``max_length`` (e.g. 2048)
-    for URL fields where the default would otherwise truncate valid
-    long URLs.
+    for URL fields where the default would otherwise truncate valid long
+    URLs; model backend-auth sites (``obo_audience``/``obo_scopes``) pass
+    the REGISTRY's bound, :data:`MODEL_AUTH_TEXT_MAX_LEN`, so the console
+    never stores a length the registry load then refuses and the gate's
+    stored-side normalization truncates identically to the twins' input
+    cleaning.
     """
     if value is None:
         return None
     # OAuth identifiers/URLs have no valid C0 controls. Removing them here
-    # prevents log/header ambiguity and benefits both MCP and model auth.
-    text = re.sub(r"[\x00-\x1f\x7f]", "", str(value)).strip()
+    # (via the one shared spelling of the control class) prevents log/header
+    # ambiguity and benefits both MCP and model auth.
+    text = strip_control_characters(str(value)).strip()
     if not text:
         return None
     return text[:max_length]
+
+
+def _parse_obo_scopes_field(raw: Any, stored: Any = None) -> tuple[str | None, JSONResponse | None]:
+    """Parse a submitted ``obo_scopes`` field against the length policy.
+
+    The ONE parser both write twins use. Returns ``(value, None)`` to store
+    ``value``, ``(None, error)`` for a refused over-length submission, or
+    ``(None, None)`` — over-length but IDENTICAL to *stored* under the same
+    uncapped transform — which the update twin maps to "omit the column so
+    the server preserves the stored value". That omit-unchanged arm is what
+    keeps a DB-direct over-length row disarmable and full-form-resavable:
+    the echo of the row's own residue is not a change, and refusing it would
+    wedge the row (in particular, the pure-disable carve-out must never be
+    blocked by residue the operator is not touching).
+
+    The bound measures the CLEANED value: length policy bounds what is
+    STORED, and the stored form is the sanitized spelling — measuring the
+    raw paste would refuse input whose stored form fits (control bytes a
+    terminal paste smuggles in are stripped, never counted). ``stored=None``
+    (the create twin) has no residue to echo, so over-length always refuses.
+    """
+    full = sanitize_backend_auth_scopes(raw)
+    if len(full) <= MODEL_AUTH_TEXT_MAX_LEN:
+        return full, None
+    if stored is not None and full == sanitize_backend_auth_scopes(stored):
+        return None, None
+    return None, JSONResponse({"error": _SCOPES_TOO_LONG_ERROR}, status_code=400)
+
+
+def _purge_model_mint_cache(storage: Any, definition_id: str, alias: str) -> None:
+    """Best-effort purge of a model definition's mint-cache rows.
+
+    Deletes the definition's rows under BOTH synthetic prefixes — the
+    per-user OBO rows and the shared app-identity row — for the *alias* that
+    owned them. Sound because the keys are IDENTITY-keyed on the unique
+    alias, exactly as the MCP-server purges above key on the unique server
+    name: one owning definition per key, so a sibling definition's rows are
+    untouchable by construction. Purging a prefix the row's mode never
+    minted under is a no-op, so the helper needs no mode dispatch. The ONE
+    spelling both write twins call — update (rename / re-aim / scope
+    change) and delete — so the key build and the failure posture cannot
+    drift between them. Best-effort: the definition write is already
+    committed, and the mint-side freshness gate refuses a superseded row
+    regardless — this purge is at-rest hygiene, the gate is the serving
+    guarantee.
+    """
+    from turnstone.core.mcp_oauth import model_app_cache_server, model_obo_cache_server
+
+    if not alias:
+        return
+    # Per-prefix isolation: a failure deleting one prefix's rows must not
+    # abort the other's — the both-prefixes contract holds under partial
+    # storage failure, each miss logged on its own.
+    for server_key in (model_obo_cache_server(alias), model_app_cache_server(alias)):
+        try:
+            storage.delete_mcp_oauth_rows_by_server_name(server_key)
+        except Exception:
+            log.warning(
+                "admin.models.purge_mint_cache_failed definition_id=%s server=%s",
+                definition_id,
+                server_key,
+                exc_info=True,
+            )
 
 
 def _parse_auth_type(body: dict[str, Any]) -> tuple[str | None, JSONResponse | None]:
@@ -11447,15 +11943,366 @@ def _model_auth_audience_allowlist(request: Request) -> frozenset[str]:
     return frozenset(item.strip() for item in re.split(r"[,\n]", str(raw or "")) if item.strip())
 
 
+def _oidc_configured_for_model_auth(request: Request) -> bool:
+    """Whether ``[oidc]`` is configured, counting the healing state as yes.
+
+    Mirrors the MCP ``oauth_obo`` validator's disjunction: a host that booted
+    during a transient IdP outage is ``discovery_retryable`` and heals on the
+    next token validation, so it must not be refused config work meanwhile.
+    """
+    oidc_config = getattr(request.app.state, "oidc_config", None)
+    return bool(
+        getattr(oidc_config, "enabled", False) or getattr(oidc_config, "discovery_retryable", False)
+    )
+
+
+# Provably auth-NEUTRAL model-definition columns. The update gate below is
+# built by EXCLUSION — fail-safe defaults + complete mediation: any OTHER
+# column whose VALUE changes on a row that is or becomes dynamic is an
+# auth-relevant change requiring admin.mcp plus row validation, so a new
+# column fails CLOSED until classified here (pinned by
+# test_model_definition_schema_auth_classification). Every entry claims
+# "changing this column can neither redirect where a minted credential is
+# sent nor re-arm minting that a disable or revocation stopped": the four
+# sampling/shaping knobs hit the same endpoint with the same credential,
+# the admission knob only limits callers of that alias, and the two reasoning
+# toggles only select what history surfaces.
+MODEL_AUTH_NEUTRAL_FIELDS = frozenset(
+    {
+        "context_window",
+        "max_concurrency",
+        "temperature",
+        "max_tokens",
+        "reasoning_effort",
+        "surface_persisted_reasoning",
+        "replay_reasoning_to_model",
+    }
+)
+
+
+def _parse_model_max_concurrency(raw: Any) -> tuple[int, JSONResponse | None]:
+    """Parse the strict model-definition concurrency scalar.
+
+    JSON booleans are integer subclasses in Python, so exact type equality is
+    load-bearing.  Strings and integral floats are also refused rather than
+    silently normalized into a materially different admission policy.
+    """
+    if type(raw) is not int or raw < 0 or raw > MAX_MODEL_CONCURRENCY:
+        return 0, JSONResponse(
+            {
+                "error": (
+                    f"max_concurrency must be an integer between 0 and {MAX_MODEL_CONCURRENCY}"
+                )
+            },
+            status_code=400,
+        )
+    return raw, None
+
+
+# The two cross-field refusal messages, shared verbatim by the create and
+# update twins (their guard CONDITIONS differ — raw body vs post-merge pair —
+# but the text must not drift). Mode lists come from the frozenset so a
+# fourth dynamic mode cannot make either message lie.
+_AUDIENCE_REQUIRED_ERROR = (
+    "obo_audience is required when auth_mode is dynamic "
+    f"({'/'.join(sorted(DYNAMIC_MODEL_AUTH_MODES))})"
+)
+_AUDIENCE_FORBIDS_STATIC_ERROR = (
+    "obo_audience requires a dynamic auth_mode "
+    f"({'/'.join(sorted(DYNAMIC_MODEL_AUTH_MODES))}); "
+    "omit it when auth_mode is 'static'"
+)
+# The scopes staging guard's refusal, shared by both twins like its audience
+# siblings above. Mode list derived, same rationale.
+_SCOPES_REQUIRE_EXCHANGE_MODE_ERROR = (
+    "obo_scopes is only used by auth_mode "
+    f"({'/'.join(sorted(SCOPES_MODEL_AUTH_MODES))}); "
+    "omit it for other modes"
+)
+# Over-length scopes are refused, not truncated: a silently shortened scope
+# list changes what the exchange leg requests. Shared by both twins.
+_SCOPES_TOO_LONG_ERROR = f"obo_scopes exceeds {MODEL_AUTH_TEXT_MAX_LEN} characters"
+
+
+def _canonical_capabilities(raw: Any) -> str | None:
+    """Canonical form of a ``capabilities`` blob, or ``None`` when unparseable.
+
+    Canonicalized through ``canonical_caps_value`` — the ONE normalization
+    this column's two comparators share, so this guard and the calibrate
+    confinement guard cannot disagree on an edge. Equality on the result
+    ignores exactly the serialization noise the shelf introduces (key order,
+    whitespace, integral-float spelling) while preserving every value-level
+    difference, including bool-vs-int.
+    """
+    try:
+        parsed = json.loads(str(raw or "") or "{}")
+    except ValueError:
+        return None
+    return canonical_caps_value(parsed)
+
+
+def _capabilities_value_changed(stored: Any, submitted: Any) -> bool:
+    """Whether a submitted ``capabilities`` blob VALUE-differs from the row's.
+
+    Canonicalized compare, so serialization noise on a full-form shelf save
+    does not gate while value-level changes still do; pinned by
+    test_reserialized_capabilities_do_not_defeat_pure_disable and
+    test_capabilities_value_change_still_gates_dynamic_row.
+
+    An unparseable STORED blob compares as CHANGED (fail closed). The ONE
+    exception is the update twin's pure-disable derivation, which treats it
+    as not-blocking (see :func:`_derive_auth_gate`).
+    """
+    stored_canonical = _canonical_capabilities(stored)
+    return stored_canonical is None or stored_canonical != _canonical_capabilities(submitted)
+
+
+@dataclass(frozen=True)
+class ModelAuthGateDecision:
+    """The update twin's auth-gate facts, derived purely from (row, updates).
+
+    Produced only by :func:`_derive_auth_gate`; the handler maps fields to
+    responses and never re-derives. Exclusivity invariants, each directly
+    unit-pinned:
+
+    - ``pure_disable`` implies ``not pair_changed`` and
+      ``not auth_config_changed`` — the carve-out never coexists with a
+      gated change.
+    - ``pure_disable`` implies ``not audience_required_violation`` — the
+      audience-required refusal yields to de-escalation.
+    - ``enabled_armed`` implies ``not pure_disable`` — arming and
+      disarming are directional opposites.
+    - ``posture_event`` is exactly ``pair_changed or enabled_armed``.
+
+    ``scopes_value_changed`` is the gate's scopes comparator — exposed
+    because it is also a mint-cache purge trigger (a scope change re-shapes
+    the bearer the alias's rows hold), and the handler must fire the purge
+    on exactly the comparison the gate made, never a re-derivation that
+    could drift.
+    """
+
+    eff_auth_mode: str
+    eff_audience: str
+    audience_required_violation: bool
+    static_new_audience_violation: bool
+    scopes_staging_violation: bool
+    scopes_value_changed: bool
+    pair_changed: bool
+    dynamic_involved: bool
+    enabled_armed: bool
+    pure_disable: bool
+    auth_config_changed: bool
+    posture_event: bool
+
+
+def _derive_auth_gate(existing: dict[str, Any], updates: dict[str, Any]) -> ModelAuthGateDecision:
+    """Derive every auth-gate fact the update twin consumes, purely.
+
+    ``existing`` is the stored row, ``updates`` the validated + normalized
+    presence-keyed column ladder the handler built from the body. No
+    request, no I/O, so the gate semantics are testable without endpoint
+    scaffolding.
+
+    The effective pair merges updates over the row, with both existing-side
+    values normalized the same way a submission is — auth_mode ""-residue
+    reads as static, and the stored audience passes through
+    ``_clean_oauth_text`` — or every full-form save on such a row reads as
+    a pair change. Two-arg ``.get`` on the updates side, not ``or``: a
+    deliberate ""-clear of obo_audience must still win over the stored
+    value.
+
+    Default-deny (fail-safe defaults): enumerate the provably NEUTRAL
+    columns and treat every other VALUE change as auth-relevant whenever
+    the row is or becomes dynamic. Value-diff, not key-presence — the admin
+    UI always submits the full form (pinned:
+    test_unchanged_dynamic_auth_fields_do_not_require_admin_mcp).
+    ``enabled`` compares bool-normalized, ``capabilities`` compares
+    canonical forms, and the pair is EXCLUDED from the value-diff loop
+    because ``pair_changed`` is its dedicated normalization-correct
+    comparator; the remaining gated columns are TEXT and compare
+    None-as-"".
+
+    PURE DISABLE: the only non-neutral change is ``enabled`` true→false.
+    De-escalation is the one monotone exception to default-deny — a
+    de-listed audience must never block its own disarm, so admin.models
+    suffices and the validator is skipped entirely. Re-enabling re-arms
+    minting and stays gated + posture-validated (``enabled_armed`` feeds
+    ``posture_event``); a disable BUNDLED with any other gated change still
+    gates. For THIS derivation only, an unparseable STORED capabilities
+    blob does not block the disarm — the row is leaving every registry
+    (pinned: test_corrupt_stored_capabilities_does_not_block_pure_disable).
+    ``not pair_changed`` is implied but stated, so the predicate cannot
+    silently widen.  The audience-required refusal yields to the disarm for
+    the same reason: a row already STORED dynamic with an empty audience
+    (DB-direct writes) fails the post-merge check on every submission, so
+    without the exemption it could never be disabled (pinned:
+    test_empty_audience_dynamic_row_disarms_under_admin_models).
+    """
+    old_auth_mode = str(existing.get("auth_mode") or "static")
+    old_audience = (
+        _clean_oauth_text(existing.get("obo_audience"), max_length=MODEL_AUTH_TEXT_MAX_LEN) or ""
+    )
+    eff_auth_mode = str(updates.get("auth_mode", old_auth_mode))
+    eff_audience = str(updates.get("obo_audience", old_audience))
+    # The staging guard, mirrored on the create twin: a row whose effective
+    # mode is static must not store a NEW non-empty audience, or an
+    # unvalidated value (the validator returns at static, never reaching the
+    # allow-list) is staged for a later flip to inherit. VALUE CHANGE only,
+    # so a legacy row carrying stale residue keeps saving.
+    static_new_audience_violation = (
+        eff_auth_mode == "static"
+        and "obo_audience" in updates
+        and bool(updates["obo_audience"])
+        and str(updates["obo_audience"]) != old_audience
+    )
+    # The scopes twin of the staging guard: a mode that never reads scopes
+    # must not store a NEW value for a later mode flip to inherit. VALUE
+    # CHANGE only, so residue re-saves keep working — and a pure disable can
+    # never trip this (an unchanged or omitted scopes field is no violation,
+    # and a changed one already forecloses the carve-out via the gated-change
+    # loop below; pinned:
+    # test_pure_disable_with_stored_scopes_stays_carved_out).
+    # The stored-side baseline is the UNCAPPED shared sanitize: a DB-direct
+    # raw stored value must compare equal to its own collapsed re-save (the
+    # update ladder normalizes the incoming side), or every full-form
+    # submit — including the disarm — misreads residue as a change. The cap
+    # deliberately does NOT apply here: a capped baseline would let the
+    # capped SPELLING of over-cap residue compare as "no change", so an
+    # admin.models-only caller could rewrite a registry-refused value into
+    # a loadable, mintable one under the escalation gate's radar. Over-cap
+    # residue can never equal a storable submission, so any write to it is
+    # auth-gated; the wedge protection for untouched residue lives in the
+    # parser's omit-unchanged arm, not in this compare.
+    old_scopes = sanitize_backend_auth_scopes(existing.get("obo_scopes"))
+    # THE scopes comparator — the staging guard and the gated-change loop
+    # below both consume it, so the two predicates cannot drift on what
+    # counts as a value change.
+    scopes_value_changed = "obo_scopes" in updates and str(updates["obo_scopes"]) != old_scopes
+    scopes_staging_violation = (
+        eff_auth_mode not in SCOPES_MODEL_AUTH_MODES
+        and scopes_value_changed
+        and bool(updates["obo_scopes"])
+    )
+    # One derivation, two consumers: the outer gate and the validator's
+    # posture tier.
+    pair_changed = eff_auth_mode != old_auth_mode or eff_audience != old_audience
+    dynamic_involved = (
+        old_auth_mode in DYNAMIC_MODEL_AUTH_MODES or eff_auth_mode in DYNAMIC_MODEL_AUTH_MODES
+    )
+    # Named booleans, not a set: the consumers need direction and
+    # exclusivity, facts a collapsed any() cannot carry.
+    enabled_flip = "enabled" in updates and bool(existing.get("enabled")) != bool(
+        updates["enabled"]
+    )
+    enabled_armed = enabled_flip and bool(updates["enabled"])
+    caps_changed = "capabilities" in updates and _capabilities_value_changed(
+        existing.get("capabilities"), updates["capabilities"]
+    )
+    # obo_scopes joins the pair and capabilities in the loop's exclusion
+    # list: each excluded column has a dedicated normalization-correct
+    # comparator (scopes_value_changed above), and the raw-string loop
+    # would misread a DB-direct stored value's collapsed re-save as a
+    # change.
+    non_caps_gated_changed = (
+        any(
+            key not in ("enabled", "capabilities", "auth_mode", "obo_audience", "obo_scopes")
+            and key not in MODEL_AUTH_NEUTRAL_FIELDS
+            and str(existing.get(key) or "") != str(value or "")
+            for key, value in updates.items()
+        )
+        or scopes_value_changed
+    )
+    other_gated_changed = non_caps_gated_changed or caps_changed
+    caps_blocks_disarm = (
+        caps_changed and _canonical_capabilities(existing.get("capabilities")) is not None
+    )
+    pure_disable = (
+        enabled_flip
+        and not bool(updates["enabled"])
+        and not non_caps_gated_changed
+        and not caps_blocks_disarm
+        and not pair_changed
+    )
+    # A dynamic effective pair without an audience is unmintable and refused
+    # — except for the pure disable, whose de-escalation must never be
+    # blocked (the row is leaving the registry; nothing is armed).
+    audience_required_violation = (
+        eff_auth_mode in DYNAMIC_MODEL_AUTH_MODES and not eff_audience and not pure_disable
+    )
+    auth_config_changed = pair_changed or (
+        dynamic_involved and (other_gated_changed or enabled_flip) and not pure_disable
+    )
+    return ModelAuthGateDecision(
+        eff_auth_mode=eff_auth_mode,
+        eff_audience=eff_audience,
+        audience_required_violation=audience_required_violation,
+        static_new_audience_violation=static_new_audience_violation,
+        scopes_staging_violation=scopes_staging_violation,
+        scopes_value_changed=scopes_value_changed,
+        pair_changed=pair_changed,
+        dynamic_involved=dynamic_involved,
+        enabled_armed=enabled_armed,
+        pure_disable=pure_disable,
+        auth_config_changed=auth_config_changed,
+        posture_event=pair_changed or enabled_armed,
+    )
+
+
 def _validate_dynamic_model_auth(
     request: Request,
     *,
     auth_mode: str,
     audience: str,
+    posture_event: bool = True,
+    pair_changed: bool = True,
 ) -> JSONResponse | None:
-    """Validate allow-list/profile constraints for a changed dynamic config."""
+    """Validate a dynamic model-auth config at the write choke point.
+
+    A structural sibling of the MCP ``oauth_obo`` validator, in two tiers:
+
+    **Row validity — always runs when the mode is dynamic.** Exactly one
+    check: the audience must be operator-approved. Value-based, so a revoked
+    audience blocks even a base-URL-only edit (pinned:
+    test_delisted_audience_blocks_base_url_edit). One exception, on the
+    caller's side: a PURE DISABLE never calls this validator at all, so
+    de-escalation is not blocked by an audience that has left the allow-list
+    (pinned: test_pure_disable_with_admin_mcp_skips_validator_on_delisted_audience).
+
+    **Deployment posture — runs only on a ``posture_event``**: when this
+    request CHOOSES the ``(auth_mode, obo_audience)`` pair rather than
+    inheriting it, or RE-ARMS a disabled dynamic row (pinned:
+    test_keyless_reenable_of_dynamic_row_returns_503). Checks, in sibling
+    order: token store present, OIDC configured, grant profile valid. A
+    same-pair edit is never posture-blocked — an existing row must not be
+    held hostage to posture that changed after it was saved; the mint warns
+    at runtime instead, exactly as the MCP contract documents (pinned:
+    test_base_url_edit_allowed_despite_typod_profile).
+
+    The mode/profile PAIRING is narrower still — a pair-CHOOSE rule, gated
+    on ``pair_changed``: re-arming an untouched pair keeps the row's
+    standing, whatever profile the deployment now runs (its mint refuses at
+    runtime with ``grant_profile_mismatch``, fallback-eligible by ruling),
+    while any request that picks the pair must pick one this deployment can
+    mint.
+
+    Every refusal names its actual cause and echoes what the operator
+    configured. A missing token store is 503 (deployment fault,
+    remedy-and-retry), matching the MCP sibling; config choices are 400.
+
+    DELIBERATELY a mirror of :func:`_enforce_oauth_obo_requirements`, not an
+    extraction from it. One accepted divergence: the sibling additionally
+    gates on ``capture_user_credential``, which the model mint never reads
+    (pinned: test_entra_obo_allowed_without_user_credential_capture). Any
+    rule change here must be weighed against the sibling, and vice versa.
+    """
     if auth_mode == "static":
         return None
+
+    # --- Row validity: every write that touches a dynamic config -----------
+    # ONLY the allow-list lives here: a revoked audience must never be
+    # re-aimable at a new base_url, whichever field the operator edited. The
+    # profile checks are deployment config, not row facts, so they sit in the
+    # posture tier below — matching the MCP sibling.
     if audience not in _model_auth_audience_allowlist(request):
         return JSONResponse(
             {
@@ -11465,19 +12312,104 @@ def _validate_dynamic_model_auth(
             },
             status_code=400,
         )
-    profile = str(
-        getattr(getattr(request.app.state, "oidc_config", None), "obo_grant_profile", "") or ""
-    )
-    if auth_mode == "entra_app" and profile != "entra":
+
+    # --- Deployment posture: pair chosen by this request, or re-arming -----
+    if not posture_event:
+        return None
+    # Function-local import, same as the MCP validator above: oidc and
+    # mcp_oauth reference each other lazily, so this stays off the module
+    # import graph.
+    from turnstone.core.mcp_oauth import OBO_GRANT_PROFILES
+
+    # Check ORDER mirrors the MCP sibling: token store first, then
+    # OIDC-configured, then profile semantics — so a no-SSO host is told
+    # "single sign-on is not set up" rather than being steered at a profile
+    # knob whose emptiness is a symptom (pinned by
+    # test_no_sso_posture_refusal_names_sso_not_profile).
+    if getattr(request.app.state, "mcp_token_store", None) is None:
+        # 503, not 400: a missing encryption key is a deployment fault the
+        # operator remedies and retries — the MCP sibling's classification
+        # for the identical state (_OAUTH_TOKEN_STORE_503_MSG).
         return JSONResponse(
             {
                 "error": (
-                    "auth_mode 'entra_app' requires [oidc] obo_grant_profile='entra'; "
-                    "RFC 8693 client-credentials is not supported"
+                    f"auth_mode {auth_mode!r} mints and caches encrypted tokens, but "
+                    f"{STARTUP_KEY_REQUIRED_HINT}"
+                )
+            },
+            status_code=503,
+        )
+    if not _oidc_configured_for_model_auth(request):
+        return JSONResponse(
+            {
+                "error": (
+                    f"auth_mode {auth_mode!r} requires a configured [oidc] deployment; "
+                    "single sign-on is not set up"
                 )
             },
             status_code=400,
         )
+    profile = _obo_profile(request)
+    if profile not in OBO_GRANT_PROFILES:
+        # Echo the configured value — the typo is the diagnosis. Mirrors the
+        # MCP validator's unknown-profile reject rather than coercing at load.
+        return JSONResponse(
+            {
+                "error": (
+                    f"[oidc] obo_grant_profile={profile!r} is not a valid grant profile "
+                    f"({', '.join(sorted(OBO_GRANT_PROFILES))}); dynamic model auth "
+                    "cannot mint until it is fixed"
+                )
+            },
+            status_code=400,
+        )
+    if pair_changed:
+        # Type-pairing: every dynamic mode names its grant dialect, so
+        # "mode matches deployment profile" is one derived rule instead of a
+        # per-mode special case. Only a pair CHOICE reaches this, so legacy
+        # rows persisted under the pre-pairing overload keep accepting
+        # same-pair edits and re-arms (pinned:
+        # test_base_url_edit_allowed_on_legacy_entra_obo_rfc8693_row,
+        # test_legacy_cross_profile_row_reenables_unchanged).
+        required = MODEL_AUTH_MODE_PROFILES.get(auth_mode)
+        if required is None:
+            # Fail-closed IN code, not by map absence: a dynamic mode nobody
+            # paired must be refused here with its remedy named — the
+            # registry drift test stays as the belt.
+            return JSONResponse(
+                {
+                    "error": (
+                        f"auth_mode {auth_mode!r} has no registered grant-profile "
+                        "pairing; add it to MODEL_AUTH_MODE_PROFILES before use"
+                    )
+                },
+                status_code=400,
+            )
+        elif profile != required:
+            if auth_mode in APP_IDENTITY_MODEL_AUTH_MODES:
+                remedy = "; RFC 8693 client-credentials is not supported"
+            else:
+                alternates = "/".join(
+                    sorted(
+                        mode
+                        for mode, mode_profile in MODEL_AUTH_MODE_PROFILES.items()
+                        if mode_profile == profile and mode not in APP_IDENTITY_MODEL_AUTH_MODES
+                    )
+                )
+                remedy = (
+                    f"; delegated tokens under this profile use auth_mode {alternates!r}"
+                    if alternates
+                    else ""
+                )
+            return JSONResponse(
+                {
+                    "error": (
+                        f"auth_mode {auth_mode!r} requires [oidc] obo_grant_profile="
+                        f"{required!r} (configured: {profile!r}){remedy}"
+                    )
+                },
+                status_code=400,
+            )
     return None
 
 
@@ -11553,7 +12485,18 @@ async def _collect_model_status(
 
 
 def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
+    """Serialize one strict DB snapshot load and live-registry install."""
+    with _COORD_REGISTRY_REFRESH_LOCK:
+        _refresh_coord_registry_locked(app_state, storage)
+
+
+def _refresh_coord_registry_locked(app_state: Any, storage: Any) -> None:
     """Rebuild ``app_state.coord_registry`` in place from DB model definitions.
+
+    Caller holds :data:`_COORD_REGISTRY_REFRESH_LOCK` across both the strict
+    snapshot load and ``ModelRegistry.reload``.  Keeping the lock outside the
+    registry's own client lock is intentional: that lock protects one reload's
+    mutation, but cannot order the database snapshots feeding two reloads.
 
     The console-side coordinator session factory closes over the
     ``coord_registry`` instance built at lifespan startup
@@ -11564,9 +12507,10 @@ def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
 
     - new coordinator sessions see the new state at create-time;
     - active coordinator sessions auto-pick up the swap at next ``send()``
-      via ``ChatSession._refresh_model_from_registry`` (the per-send
-      check compares ``cfg.model`` against ``self.model`` and re-resolves
-      on mismatch).
+      via ``ChatSession._refresh_model_from_registry``: the per-send check
+      compares the registry's reload generation as well as ``cfg.model``
+      against ``self.model``, so the swap propagates even when an alias
+      keeps its backend model id (base-URL or auth redirects included).
 
     Errors are logged + swallowed.  The DB write that triggered this
     refresh has already succeeded, and the explicit reload button
@@ -11574,6 +12518,12 @@ def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
     (e.g. admin deleted the alias that ``registry.default`` points at)
     leave the existing registry intact rather than tearing down a
     working coordinator.
+
+    The swap runs through the chokepoint in ``ModelRegistry.reload``: a
+    keyless console must not acquire dynamic aliases through a peer
+    console's DB write or a reload click, so that refusal keeps the
+    last-good registry and is recorded via
+    :func:`_record_coord_key_refusal`.
     """
     from turnstone.core.model_registry import load_model_registry
 
@@ -11606,11 +12556,24 @@ def _refresh_coord_registry(app_state: Any, storage: Any) -> None:
             new_registry.default,
             new_registry.fallback,
             new_registry.agent_model,
+            app_state=app_state,
             task_model=new_registry.task_model,
             task_effort=new_registry.task_effort,
         )
+    except DynamicAuthKeyError as exc:
+        # The swap chokepoint refused (dynamic aliases, no key): the live
+        # coordinator keeps its last-good registry. The ERROR log is the
+        # observable here, but the string is still set so a later subsystem
+        # outage names the real blocker instead of a stale cause.
+        _record_coord_key_refusal(app_state, str(exc))
     except Exception:
         log.warning("console.coord_registry_refresh_reload_failed", exc_info=True)
+    else:
+        # A completed swap is the registry passing its own admission check,
+        # so any earlier refusal no longer describes it. Same staleness rule
+        # as the refusal arm, in the recovery direction (pinned:
+        # test_refresh_clears_key_refusal_after_recovery).
+        app_state.coord_registry_error = ""
     finally:
         # Defensive — load_model_registry doesn't eagerly create clients
         # (ModelRegistry.__init__ leaves _clients/_providers empty; they
@@ -11681,6 +12644,10 @@ def _maybe_bootstrap_coord_subsystem(app: Any, storage: Any) -> None:
         except Exception:
             log.warning("console.coord_bootstrap_load_failed", exc_info=True)
             return
+        # Same refusal as the lifespan twin: a CRUD write must not revive
+        # a keyless coordinator and erase the remediation banner.
+        if _refuse_keyless_registry(app.state, coord_registry):
+            return
         try:
             # ``_bootstrap_coord_subsystem`` stamps ``coord_registry``
             # and clears ``coord_registry_error`` itself as the final
@@ -11739,6 +12706,10 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
     storage, err = require_storage_or_503(request)
     if err:
         return err
+    # NOT allow_service_bypass=False: every sibling model-definition endpoint
+    # keeps the bypass, so refusing it here alone would break read-modify-write
+    # automation while leaving the writes wide open. Tightening this is a
+    # decision for the whole endpoint family, not one read.
     err = require_permission(request, "admin.models")
     if err:
         return err
@@ -11755,50 +12726,40 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
         m["source"] = "db"
         result.append(_mask_model_secrets(m))
 
-    # Merge config-sourced models visible on nodes but not in DB
+    # Merge config-sourced models visible on nodes but not in DB. One flat
+    # pass first (first node reporting an alias wins, matching node_statuses
+    # order) so the synthetic-entry loop below does not rescan every node's
+    # payload per alias.
     config_aliases: set[str] = set()
+    node_alias_info: dict[str, dict[str, Any]] = {}
     for node_models in node_statuses.values():
-        for alias in node_models:
-            if alias not in db_aliases:
-                config_aliases.add(alias)
+        for alias, nm in node_models.items():
+            if alias in db_aliases:
+                continue
+            config_aliases.add(alias)
+            if nm and alias not in node_alias_info:
+                node_alias_info[alias] = nm
     for alias in sorted(config_aliases):
         # Build a synthetic read-only entry from node-reported data
-        model_name = ""
-        provider = "openai"
-        context_window = 0
-        cfg_temperature = None
-        cfg_max_tokens = None
-        cfg_reasoning_effort = None
-        cfg_auth_mode = "static"
-        cfg_obo_audience = ""
-        for node_models in node_statuses.values():
-            nm = node_models.get(alias)
-            if nm:
-                model_name = nm.get("model", "")
-                provider = nm.get("provider", "openai")
-                context_window = nm.get("context_window", 0)
-                cfg_temperature = nm.get("temperature")
-                cfg_max_tokens = nm.get("max_tokens")
-                cfg_reasoning_effort = nm.get("reasoning_effort")
-                cfg_auth_mode = nm.get("auth_mode", "static")
-                cfg_obo_audience = nm.get("obo_audience", "")
-                break
+        nm = node_alias_info.get(alias) or {}
         result.append(
             {
                 "definition_id": "",
                 "alias": alias,
-                "model": model_name,
-                "provider": provider,
+                "model": nm.get("model", ""),
+                "provider": nm.get("provider", "openai"),
                 "base_url": "",
                 "api_key": "",
-                "context_window": context_window,
+                "context_window": nm.get("context_window", 0),
+                "max_concurrency": nm.get("max_concurrency", 0),
                 "capabilities": "{}",
                 "enabled": True,
-                "temperature": cfg_temperature,
-                "max_tokens": cfg_max_tokens,
-                "reasoning_effort": cfg_reasoning_effort,
-                "auth_mode": cfg_auth_mode,
-                "obo_audience": cfg_obo_audience,
+                "temperature": nm.get("temperature"),
+                "max_tokens": nm.get("max_tokens"),
+                "reasoning_effort": nm.get("reasoning_effort"),
+                "auth_mode": nm.get("auth_mode", "static"),
+                "obo_audience": nm.get("obo_audience", ""),
+                "obo_scopes": nm.get("obo_scopes", ""),
                 "source": "config",
                 "created_by": "",
                 "created": "",
@@ -11830,7 +12791,57 @@ async def admin_list_model_definitions(request: Request) -> JSONResponse:
     else:
         default_alias = ""
 
+    # Deliberately NO auth constraints here: serving the allow-list and grant
+    # profile under admin.models (or to a service token via the bypass) hands
+    # out the enumeration the write siblings were reordered to prevent. The
+    # shelf fetches them from the admin.mcp-gated auth-constraints route.
     return JSONResponse({"models": result, "default_alias": default_alias})
+
+
+async def admin_model_auth_constraints(request: Request) -> JSONResponse:
+    """GET /v1/api/admin/model-definitions/auth-constraints.
+
+    The shelf's affordance data: the operator-approved audiences (rendered as
+    datalist suggestions) and the deployment grant profile (labels the
+    ``entra_app`` option and decides whether the Backend-auth section shows
+    at all on a no-SSO deployment).
+
+    Gated on ``admin.mcp`` as DEFENSE IN DEPTH, not confidentiality — each
+    row's CHOSEN audience is already readable under ``admin.models`` on the
+    list/get siblings. What the gate covers is the DEPLOYMENT-WIDE
+    enumeration: the full approved audience set, including audiences no row
+    has chosen, is not served to a cheaper scope than the write that uses it.
+
+    Affordance, not gate: the shelf must fail OPEN on any failure to fetch
+    this (free-text audience input, no modes disabled). The write validator
+    is the authority; this exists so the common path never meets its 400s.
+    """
+    from turnstone.core.auth import require_permission
+
+    err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+    if err:
+        return err
+    return JSONResponse(
+        {
+            "auth_audience_allowlist": sorted(_model_auth_audience_allowlist(request)),
+            "auth_grant_profile": (
+                _obo_profile(request) if _oidc_configured_for_model_auth(request) else ""
+            ),
+            # Server-derived, so the shelf's dynamic-mode affordances track
+            # the server's classification by data rather than a hand-kept
+            # mirror across the language seam; the client's hand-list is only
+            # the fail-open fallback for a missing/failed fetch.
+            "dynamic_auth_modes": sorted(DYNAMIC_MODEL_AUTH_MODES),
+            # Same contract for the scopes input's visibility and the mode
+            # options' profile pairing (which options grey out for THIS
+            # deployment's grant profile).
+            "scopes_auth_modes": sorted(SCOPES_MODEL_AUTH_MODES),
+            # And for the model list's auth badge: app-identity modes render
+            # as a deployment identity, every other dynamic mode as per-user.
+            "app_identity_auth_modes": sorted(APP_IDENTITY_MODEL_AUTH_MODES),
+            "auth_mode_profiles": dict(sorted(MODEL_AUTH_MODE_PROFILES.items())),
+        }
+    )
 
 
 async def admin_create_model_definition(request: Request) -> JSONResponse:
@@ -11883,12 +12894,29 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     base_url = str(body.get("base_url", "")).strip()
     api_key = str(body.get("api_key", "")).strip()
     ctx_raw = body.get("context_window", 32768)
+    # json admits NaN/Infinity literals, which pass the isinstance check but
+    # crash int(); refuse non-finite floats as invalid values instead.
+    if isinstance(ctx_raw, float) and not math.isfinite(ctx_raw):
+        return JSONResponse({"error": "context_window must be a finite number"}, status_code=400)
     context_window = max(0, int(ctx_raw)) if isinstance(ctx_raw, (int, float)) else 0
+    max_concurrency, concurrency_err = _parse_model_max_concurrency(body.get("max_concurrency", 0))
+    if concurrency_err is not None:
+        return concurrency_err
     caps = body.get("capabilities", {})
+    if not isinstance(caps, dict):
+        # Mirror of the update twin's refusal: coercing a null or the STRING
+        # shape GET returns to "{}" silently drops server_compat, thinking
+        # keys and reranker calibration on a clone-via-GET script. Only a
+        # PRESENT non-object is refused (twin parity pinned:
+        # test_create_and_update_twins_agree_on_non_dict_capabilities).
+        return JSONResponse(
+            {"error": "capabilities must be an object; omit for defaults"},
+            status_code=400,
+        )
     err_msg = _validate_api_surface(caps)
     if err_msg:
         return JSONResponse({"error": err_msg}, status_code=400)
-    capabilities = json.dumps(caps) if isinstance(caps, dict) else "{}"
+    capabilities = json.dumps(caps)
     enabled = bool(body.get("enabled", True))
 
     # Per-model sampling overrides (None = use global default)
@@ -11927,12 +12955,39 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     auth_mode = str(body.get("auth_mode", "static")).strip() or "static"
     if auth_mode not in _MODEL_AUTH_MODES:
         return JSONResponse({"error": f"Invalid auth_mode: {auth_mode!r}"}, status_code=400)
-    obo_audience = _clean_oauth_text(body.get("obo_audience"), max_length=2048) or ""
-    if auth_mode in ("entra_obo", "entra_app") and not obo_audience:
-        return JSONResponse(
-            {"error": "obo_audience is required when auth_mode is 'entra_obo' or 'entra_app'"},
-            status_code=400,
-        )
+    obo_audience = (
+        _clean_oauth_text(body.get("obo_audience"), max_length=MODEL_AUTH_TEXT_MAX_LEN) or ""
+    )
+    if auth_mode in DYNAMIC_MODEL_AUTH_MODES and not obo_audience:
+        return JSONResponse({"error": _AUDIENCE_REQUIRED_ERROR}, status_code=400)
+    # The staging guard, mirrored on the update twin: a static row must not
+    # STORE an audience, or an admin.models-only caller (the escalation gate
+    # below is skipped entirely for static) parks an unvalidated one for a
+    # later flip to inherit. A request-shape 400, so it may precede the
+    # permission gate — it discriminates only on the request's own fields.
+    if auth_mode == "static" and obo_audience:
+        return JSONResponse({"error": _AUDIENCE_FORBIDS_STATIC_ERROR}, status_code=400)
+    # Scopes twin of the staging guard, same request-shape rationale: only a
+    # scope-reading mode may store scopes. Over-length input is REFUSED
+    # (audience keeps its truncate posture — the allow-list membership check
+    # backstops whatever a truncation produces; scopes have no such list).
+    # No stored row exists yet, so the parser's omit-unchanged arm never
+    # applies here: over-length always refuses.
+    obo_scopes_value, scopes_err = _parse_obo_scopes_field(body.get("obo_scopes"))
+    if scopes_err is not None:
+        return scopes_err
+    obo_scopes = obo_scopes_value or ""
+    if obo_scopes and auth_mode not in SCOPES_MODEL_AUTH_MODES:
+        return JSONResponse({"error": _SCOPES_REQUIRE_EXCHANGE_MODE_ERROR}, status_code=400)
+    if auth_mode != "static":
+        # Redeeming an operator-chosen audience is the same capability as
+        # configuring oauth_audience on MCP; service credentials do not bypass
+        # it. Runs BEFORE the config validation below, whose 400s describe
+        # deployment posture and allow-list contents this caller must not
+        # enumerate one guess at a time.
+        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
+        if err:
+            return err
     dynamic_auth_error = _validate_dynamic_model_auth(
         request,
         auth_mode=auth_mode,
@@ -11940,13 +12995,6 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     )
     if dynamic_auth_error is not None:
         return dynamic_auth_error
-    if auth_mode != "static":
-        # Redeeming an operator-chosen audience is the same capability as
-        # configuring oauth_audience on MCP. Service credentials do not bypass
-        # this capability-escalation gate.
-        err = require_permission(request, "admin.mcp", allow_service_bypass=False)
-        if err:
-            return err
 
     storage.create_model_definition(
         definition_id=definition_id,
@@ -11956,6 +13004,7 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         base_url=base_url,
         api_key=api_key,
         context_window=context_window,
+        max_concurrency=max_concurrency,
         capabilities=capabilities,
         enabled=enabled,
         created_by=audit_uid,
@@ -11966,15 +13015,25 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
         replay_reasoning_to_model=replay_reasoning_to_model,
         auth_mode=auth_mode,
         obo_audience=obo_audience,
+        obo_scopes=obo_scopes,
     )
 
+    # Record the auth pair, as the update path already does: it is a
+    # capability-escalating choice, so the audit trail must cover the request
+    # that INTRODUCES it, not only later edits.
+    audit_detail: dict[str, Any] = {"alias": alias}
+    if auth_mode != "static":
+        audit_detail["auth_mode"] = auth_mode
+        audit_detail["obo_audience"] = obo_audience
+        if obo_scopes:
+            audit_detail["obo_scopes"] = obo_scopes
     record_audit(
         storage,
         audit_uid,
         "model_definition.create",
         "model_definition",
         definition_id,
-        {"alias": alias},
+        audit_detail,
         ip,
     )
 
@@ -11985,6 +13044,10 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
     await asyncio.to_thread(_ensure_console_mcp_client, request.app)
     _emit_models_changed(request)
+    # Same refused-swap surfacing as the update twin (see its comment): the
+    # row is stored, but a keyless console's live registry may have refused
+    # to adopt it, so the shelf warns instead of toasting success.
+    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
 
     created = storage.get_model_definition(definition_id)
     if created is None:
@@ -11992,7 +13055,10 @@ async def admin_create_model_definition(request: Request) -> JSONResponse:
             {"error": f"Model alias '{alias}' already exists (concurrent insert)"},
             status_code=409,
         )
-    return JSONResponse(_mask_model_secrets(created))
+    payload = _mask_model_secrets(created)
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 async def admin_get_model_definition(request: Request) -> JSONResponse:
@@ -12075,13 +13141,33 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
             updates["api_key"] = api_key
     if "context_window" in body:
         ctx_raw = body["context_window"]
+        # Twin of the create guard: a NaN/Infinity literal passes the
+        # isinstance check but crashes int(); refuse it as invalid.
+        if isinstance(ctx_raw, float) and not math.isfinite(ctx_raw):
+            return JSONResponse(
+                {"error": "context_window must be a finite number"}, status_code=400
+            )
         updates["context_window"] = max(0, int(ctx_raw)) if isinstance(ctx_raw, (int, float)) else 0
+    if "max_concurrency" in body:
+        max_concurrency, concurrency_err = _parse_model_max_concurrency(body["max_concurrency"])
+        if concurrency_err is not None:
+            return concurrency_err
+        updates["max_concurrency"] = max_concurrency
     if "capabilities" in body:
         caps = body["capabilities"]
+        if not isinstance(caps, dict):
+            # Coercing a null or the STRING shape GET returns to "{}"
+            # silently erases server_compat, thinking_mode and reranker
+            # calibration on a read-modify-write; an absent key already
+            # means "leave unchanged" (this ladder is presence-keyed).
+            return JSONResponse(
+                {"error": "capabilities must be an object; omit to leave unchanged"},
+                status_code=400,
+            )
         err_msg = _validate_api_surface(caps)
         if err_msg:
             return JSONResponse({"error": err_msg}, status_code=400)
-        updates["capabilities"] = json.dumps(caps) if isinstance(caps, dict) else "{}"
+        updates["capabilities"] = json.dumps(caps)
     if "enabled" in body:
         updates["enabled"] = bool(body["enabled"])
 
@@ -12139,52 +13225,84 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
             return JSONResponse({"error": f"Invalid auth_mode: {am!r}"}, status_code=400)
         updates["auth_mode"] = am
     if "obo_audience" in body:
-        updates["obo_audience"] = _clean_oauth_text(body["obo_audience"], max_length=2048) or ""
-    # Cross-field: entra_obo needs an audience. Validate the POST-merge state so
-    # a request that touches only one of the pair still checks against the other.
-    eff_auth_mode = updates.get("auth_mode", existing.get("auth_mode", "static"))
-    eff_audience = updates.get("obo_audience", existing.get("obo_audience", ""))
-    if eff_auth_mode in ("entra_obo", "entra_app") and not eff_audience:
-        return JSONResponse(
-            {"error": "obo_audience is required when auth_mode is 'entra_obo' or 'entra_app'"},
-            status_code=400,
+        updates["obo_audience"] = (
+            _clean_oauth_text(body["obo_audience"], max_length=MODEL_AUTH_TEXT_MAX_LEN) or ""
         )
-    old_auth_mode = str(existing.get("auth_mode") or "static")
-    old_audience = str(existing.get("obo_audience") or "")
-    old_base_url = str(existing.get("base_url") or "")
-    eff_base_url = str(updates.get("base_url", old_base_url))
-    auth_config_changed = (
-        str(eff_auth_mode) != old_auth_mode
-        or str(eff_audience) != old_audience
-        # A base-URL change on either side of a dynamic configuration can
-        # redirect a valid bearer even when the auth fields are unchanged.
-        or (
-            eff_base_url != old_base_url
-            and (
-                old_auth_mode in ("entra_obo", "entra_app")
-                or eff_auth_mode in ("entra_obo", "entra_app")
-            )
+    if "obo_scopes" in body:
+        # Same refusal as the create twin — over-length scope lists never
+        # truncate into the store (see the audience-asymmetry note there) —
+        # via the shared parser, whose omit-unchanged arm drops the key when
+        # the submission merely echoes over-length DB-direct residue: the
+        # gate below then sees no scopes change and the stored value
+        # survives verbatim, so the residue row stays disarmable and
+        # full-form-resavable.
+        scopes_value, scopes_err = _parse_obo_scopes_field(
+            body["obo_scopes"], stored=existing.get("obo_scopes")
         )
-    )
-    if auth_config_changed:
-        dynamic_auth_error = _validate_dynamic_model_auth(
-            request,
-            auth_mode=str(eff_auth_mode),
-            audience=str(eff_audience),
-        )
-        if dynamic_auth_error is not None:
-            return dynamic_auth_error
+        if scopes_err is not None:
+            return scopes_err
+        if scopes_value is not None:
+            updates["obo_scopes"] = scopes_value
+    # Every gate fact derives purely in _derive_auth_gate, whose docstring
+    # carries the rulings; this handler only maps fields to responses.
+    gate = _derive_auth_gate(existing, updates)
+    # Cross-field: a dynamic mode needs an audience, validated on the
+    # POST-merge state so a request touching only one of the pair still
+    # checks against the other.
+    if gate.audience_required_violation:
+        return JSONResponse({"error": _AUDIENCE_REQUIRED_ERROR}, status_code=400)
+    if gate.static_new_audience_violation:
+        return JSONResponse({"error": _AUDIENCE_FORBIDS_STATIC_ERROR}, status_code=400)
+    if gate.scopes_staging_violation:
+        return JSONResponse({"error": _SCOPES_REQUIRE_EXCHANGE_MODE_ERROR}, status_code=400)
+    if gate.auth_config_changed:
+        # Permission first: the validation 400s below describe deployment OIDC
+        # posture and allow-list membership, which a caller lacking this scope
+        # must not be able to probe.
         err = require_permission(request, "admin.mcp", allow_service_bypass=False)
         if err:
             return err
+        # An edit leaving the pair untouched still needs the scope above — it
+        # can redirect or re-arm a live bearer — but is not held to deployment
+        # posture it did not choose.
+        dynamic_auth_error = _validate_dynamic_model_auth(
+            request,
+            auth_mode=gate.eff_auth_mode,
+            audience=gate.eff_audience,
+            posture_event=gate.posture_event,
+            pair_changed=gate.pair_changed,
+        )
+        if dynamic_auth_error is not None:
+            return dynamic_auth_error
 
     if updates:
         storage.update_model_definition(definition_id, **updates)
+        old_alias = str(existing.get("alias") or "")
+        alias_changed = "alias" in updates and updates["alias"] != old_alias
+        if alias_changed or gate.pair_changed or gate.scopes_value_changed:
+            # A rename orphans the OLD alias's identity keys outright; a
+            # re-aim or scope change leaves rows whose bearer was minted for
+            # the superseded shape. Either way the rows purge under the old
+            # alias — the mint-side freshness gate refuses stale rows
+            # regardless, so this is at-rest hygiene, not the serving
+            # guarantee.
+            _purge_model_mint_cache(storage, definition_id, old_alias)
 
     audit_uid, ip = _audit_context(request)
     audit_detail = dict(updates)
     if "api_key" in audit_detail:
         audit_detail["api_key"] = "(updated)"
+    if gate.auth_config_changed:
+        # Make the gate decision reconstructable from the audit row alone.
+        # Inserted FIRST: the audit tab renders only a detail's first three
+        # keys, past which a full-form save buries an appended marker
+        # (pinned: test_auth_markers_render_in_audit_detail_first_keys).
+        audit_detail = {"auth_gated": True, **audit_detail}
+    elif gate.dynamic_involved and gate.pure_disable:
+        # The carve-out's own marker — auth_gated would claim a gate that
+        # deliberately did not run, but a disarm is still an auth-relevant
+        # event the trail must reconstruct. Same first-position insert.
+        audit_detail = {"auth_disarmed": True, **audit_detail}
     record_audit(
         storage,
         audit_uid,
@@ -12195,14 +13313,26 @@ async def admin_update_model_definition(request: Request) -> JSONResponse:
         ip,
     )
 
+    registry_warning = ""
     if updates:
         await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
         await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
         await asyncio.to_thread(_ensure_console_mcp_client, request.app)
         _emit_models_changed(request)
+        # The DB write is committed either way, but THIS console's live
+        # registry swap may have been refused (keyless host + dynamic rows).
+        # The refresh's refusal arm records ``coord_registry_error`` and its
+        # success arm clears it, so a non-empty value here means the running
+        # coordinator did NOT adopt this write. With the subsystem UP the 503
+        # remediation path never renders, so surfacing it on the response is
+        # the only evidence the shelf can show.
+        registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
 
     model_def = storage.get_model_definition(definition_id)
-    return JSONResponse(_mask_model_secrets(model_def or {}))
+    payload = _mask_model_secrets(model_def or {})
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 async def admin_delete_model_definition(request: Request) -> JSONResponse:
@@ -12223,6 +13353,12 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
     if existing is None:
         return JSONResponse({"error": "Model definition not found"}, status_code=404)
 
+    # Purge the definition's mint-cache rows before the row goes away —
+    # after the delete, nothing owns the alias's identity keys and their
+    # encrypted bearers would persist at rest until another definition
+    # claimed the alias.
+    _purge_model_mint_cache(storage, definition_id, str(existing.get("alias") or ""))
+
     storage.delete_model_definition(definition_id)
 
     audit_uid, ip = _audit_context(request)
@@ -12240,7 +13376,14 @@ async def admin_delete_model_definition(request: Request) -> JSONResponse:
     await asyncio.to_thread(_maybe_bootstrap_coord_subsystem, request.app, storage)
     _emit_models_changed(request)
 
-    return JSONResponse({"status": "ok", "definition_id": definition_id})
+    # Same refused-swap surfacing as the create/update twins: the row is gone
+    # from the DB, but a keyless console's refused swap keeps SERVING the
+    # deleted alias to running and new coordinator sessions.
+    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    payload: dict[str, Any] = {"status": "ok", "definition_id": definition_id}
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 async def admin_model_reload(request: Request) -> JSONResponse:
@@ -12269,7 +13412,14 @@ async def admin_model_reload(request: Request) -> JSONResponse:
     _emit_models_changed(request)
 
     results = await _notify_nodes_model_reload(request)
-    return JSONResponse({"status": "ok", "results": results})
+    # This route's whole purpose is "make the live registry match the DB", so
+    # a refused console swap is the one outcome it must not report as
+    # unqualified success. Same surfacing as the create/update twins.
+    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    payload: dict[str, Any] = {"status": "ok", "results": results}
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 def _global_rerank_instruction(app_state: Any) -> str:
@@ -12428,10 +13578,15 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
     Probe a saved reranker model's /rerank endpoint with the labelled set,
     persist the three calibration fields onto its capabilities, and return a
     verdict. A calibration failure is graceful (``error`` set, ``separated``
-    False, nothing persisted) — never a 500.
+    False, nothing persisted) — never a 500. The one 500 this route returns
+    is the confinement refusal below, where the merge wrote outside its
+    calibration-keys contract: an internal fault, not a calibration outcome.
     """
     from turnstone.core.auth import require_permission
-    from turnstone.core.rerank_calibrate import merge_calibration_into_caps
+    from turnstone.core.rerank_calibrate import (
+        calibration_confinement_violations,
+        merge_calibration_into_caps,
+    )
     from turnstone.core.web_helpers import require_storage_or_503
 
     storage, err = require_storage_or_503(request)
@@ -12489,10 +13644,73 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
         )
 
     # Merge the calibration fields into the stored capabilities JSON.
-    storage.update_model_definition(
-        definition_id,
-        capabilities=merge_calibration_into_caps(existing.get("capabilities"), cal),
-    )
+    #
+    # ``capabilities`` is a GATED column on the model-definition write path
+    # (its server_compat half selects the provider factory), yet this write
+    # runs under admin.models: safe because merge_calibration_into_caps is
+    # structurally confined to the probe-derived calibration keys and cannot
+    # reach server_compat or carry request-controlled JSON (pinned:
+    # test_calibrate_merge_confined_to_calibration_fields). ENFORCED, not
+    # merely pinned (complete mediation on the column's second producer):
+    # the merge is verified to have changed nothing outside its contract and
+    # the write refused otherwise, so a future merge edit cannot smuggle a
+    # gated change past the admin.mcp gate this endpoint deliberately lacks
+    # (pinned: test_calibrate_refuses_merge_that_writes_out_of_band_keys).
+    #
+    # RE-READ the row at persist time, then write CONDITIONALLY: the probe
+    # above holds no lock and can run for up to 90 seconds, so a capabilities
+    # write landing in that window (an admin.mcp-gated PUT — the very writes
+    # the gate protects) must survive this merge. The fresh read only NARROWS
+    # the window; what closes it is the conditional persist
+    # (``expected_capabilities``), where a write landing between read and
+    # update misses the compare and the loop re-merges onto the newer value.
+    # Bounded retries, so under sustained write pressure the calibration
+    # yields with a 409 rather than last-writer-winning over a gated edit
+    # (pinned: test_concurrent_capabilities_put_survives_calibrate and
+    # test_calibrate_cas_retries_when_write_lands_between_reread_and_persist).
+    persisted = False
+    for _ in range(3):
+        current = storage.get_model_definition(definition_id)
+        if current is None:
+            # The row was deleted while the probe ran; same not-found
+            # classification as the head-of-handler check.
+            return JSONResponse({"error": "Model definition not found"}, status_code=404)
+        merged_caps = merge_calibration_into_caps(current.get("capabilities"), cal)
+        violations = calibration_confinement_violations(
+            current.get("capabilities"), merged_caps, cal
+        )
+        if violations:
+            log.error(
+                "model_calibrate.confinement_violation definition_id=%s keys=%s",
+                definition_id,
+                ",".join(violations),
+            )
+            return JSONResponse(
+                {
+                    "error": (
+                        "calibration merge changed capabilities keys outside its "
+                        f"contract ({', '.join(violations)}); write refused"
+                    )
+                },
+                status_code=500,
+            )
+        if storage.update_model_definition(
+            definition_id,
+            capabilities=merged_caps,
+            expected_capabilities=current.get("capabilities"),
+        ):
+            persisted = True
+            break
+    if not persisted:
+        return JSONResponse(
+            {
+                "error": (
+                    "capabilities changed concurrently on every persist attempt; "
+                    "calibration not saved — retry once the edits settle"
+                )
+            },
+            status_code=409,
+        )
 
     audit_uid, ip = _audit_context(request)
     record_audit(
@@ -12512,17 +13730,22 @@ async def admin_calibrate_model_definition(request: Request) -> JSONResponse:
     await asyncio.to_thread(_refresh_coord_registry, request.app.state, storage)
     _emit_models_changed(request)
 
-    return JSONResponse(
-        {
-            "separated": cal.separated,
-            "suggested_threshold": cal.suggested_threshold,
-            "raw_scale": cal.raw_scale,
-            "relevant": [cal.relevant_min, cal.relevant_max],
-            "irrelevant": [cal.irrelevant_min, cal.irrelevant_max],
-            "applied": True,
-            "error": "",
-        }
-    )
+    # Same refused-swap surfacing as the create/update twins: the
+    # calibration is stored, but a keyless console's live registry may
+    # have refused to adopt it.
+    registry_warning = str(getattr(request.app.state, "coord_registry_error", "") or "")
+    payload = {
+        "separated": cal.separated,
+        "suggested_threshold": cal.suggested_threshold,
+        "raw_scale": cal.raw_scale,
+        "relevant": [cal.relevant_min, cal.relevant_max],
+        "irrelevant": [cal.irrelevant_min, cal.irrelevant_max],
+        "applied": True,
+        "error": "",
+    }
+    if registry_warning:
+        payload["registry_warning"] = registry_warning
+    return JSONResponse(payload)
 
 
 async def admin_model_capabilities(request: Request) -> JSONResponse:
@@ -14650,6 +15873,11 @@ def create_app(
                     # Workstream routing (rendezvous proxy to server nodes)
                     Route("/api/route/workstreams/new", route_create, methods=["POST"]),
                     Route(
+                        "/api/route/workstreams/{ws_id}/live",
+                        route_workstream_live,
+                        methods=["GET"],
+                    ),
+                    Route(
                         "/api/route/workstreams/{ws_id}/send",
                         route_proxy,
                         methods=["POST", "DELETE"],
@@ -14987,6 +16215,12 @@ def create_app(
                     ),
                     # System: Model Definitions
                     Route("/api/admin/model-definitions", admin_list_model_definitions),
+                    # Static path — must precede the {definition_id} routes or
+                    # Starlette matches it as definition_id="auth-constraints".
+                    Route(
+                        "/api/admin/model-definitions/auth-constraints",
+                        admin_model_auth_constraints,
+                    ),
                     Route(
                         "/api/admin/model-definitions",
                         admin_create_model_definition,

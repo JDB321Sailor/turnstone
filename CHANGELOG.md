@@ -18,6 +18,17 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Added
 
+- **`server_parses_reasoning` model capability.** Declare it on a model
+  definition whose backend segregates reasoning into its own channel (a
+  vLLM launched with a reasoning parser, a commercial provider): the
+  inline think-tag scan turns off on every lane — interactive and
+  drained alike — so content is trusted verbatim and prose that merely
+  quotes a tag can no longer be misrouted into the reasoning lane, and
+  the utility lanes stop suppressing reasoning they'd otherwise pin off.
+  Default off for local lanes, preserving the passthrough-server
+  behavior; the built-in capability tables declare it for every real
+  commercial endpoint (known models and table-miss defaults alike),
+  which also removes the quoted-tag false positive from those lanes.
 - **Per-model Entra gateway authentication.** Model definitions can bind either
   a caller-delegated OBO token (`entra_obo`) or a shared app-identity token
   (`entra_app`) through the provider SDK credential surface. Mints reuse the
@@ -141,6 +152,15 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
 ### Changed
 
+- **Log event rename: `drain_stream.post_finish_blip` is now
+  `stream.post_finish_blip`; its `usage_captured` field is retained.** The
+  single-shot drain normalizes mid-body transport deaths through the same
+  `transport_guarded` wrapper the interactive loop uses, so its
+  post-finish-blip tolerance logs under the wrapper's event name. Update
+  any external log filters pinned to the old name; the drained result's
+  possible `usage=None` on a post-finish blip is unchanged and documented
+  on `drain_stream`.
+
 - **Breaking (1.8): compaction feedback moved from `info` events to the
   typed `compaction` SSE event.** Pre-1.8 SSE/SDK clients that ignore
   unknown event types no longer see compaction lines (they are
@@ -196,6 +216,100 @@ Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
   current model.
 
 ### Fixed
+
+- **A cancelled judge, guard, or compaction call can now stop before its
+  request goes out (#972).** Previously it could not: `model_turn` refused
+  to *re-issue* an abandoned call after a mid-stream death, but nothing
+  checked before a first dispatch, so a call whose caller had already gone
+  away still sent — and the reply was discarded unread after the endpoint
+  had accepted the work. It now checks immediately before sending, so a
+  Stop observed by that point costs no request, and again on entry, so a
+  call already cancelled when it arrives also skips credential resolution.
+  Cancellation is cooperative, which bounds what that buys: a Stop only
+  saves the request if it lands before dispatch — sending is a moment, the
+  response streaming back is the rest of the call, and an abort arriving
+  then still meets a request in flight, closed in place exactly as before.
+  The window that did widen usefully is a delegated-auth alias whose token
+  mint blocks; a Stop during that mint now costs no request (though a mint
+  already under way still completes). What a stopped call saves is the
+  request, its prompt-side billing, and — on a capacity-bounded
+  self-hosted endpoint — a slot a live request wanted. Unchanged: the
+  interactive turn, which has its own pre-send cancellation check on a
+  different path, and the lanes that thread no cancellation handle
+  (attachment perception, title generation, web-fetch extraction,
+  sub-agents, optimizer, eval) — and web-fetch extraction deliberately
+  never will, since it runs on parallel tool threads where registering one
+  would clobber the main stream's.
+- **Unmarked chain-of-thought no longer leaks into titles, summaries, or
+  web-fetch tool results (#940).** Some serving setups emit reasoning
+  inline with no tags and no `reasoning_content` at all — nothing any
+  parser can segregate. The bounded-artifact lanes (title, compaction,
+  web-fetch extraction) now ask the model for no reasoning instead:
+  the model definition's declared thinking toggle is pinned off for that
+  call — the same suppression transcription already used — and the
+  reasoning-effort channels (the relayed session knob, the definition's
+  default, the graded template key) are withheld with it, since an
+  effort value beside a pinned-off toggle re-requests the reasoning the
+  pin declined. A no-op on backends that segregate reasoning
+  server-side. Title generation additionally stopped trusting line
+  position: it takes the last line that reads as a title (within the
+  word cap and ending in a word character, so explanation sentences,
+  sign-offs, and reasoning headings lose in any script) rather than the
+  first non-empty line, which unmarked reasoning turned into titles
+  like "Thinking Process:".
+- **A think tag split across a reasoning delta now reassembles.** The
+  non-streaming drain closes content runs at interleaving signals; a
+  partial-tag tail is carried across reasoning-delta boundaries (a
+  reasoning delta cannot terminate a tag) so the tag is consumed instead
+  of its halves passing through as visible content. Tool-call boundaries
+  still flush — no tag spans a tool call.
+- **Streaming consumers follow the ACTIVE model's capabilities.** The
+  interactive tag-scan posture and the drain's scan gate now read the
+  capabilities of the lane that owns the stream being consumed (fallback
+  walks included) instead of the session's primary alias.
+- **Notification bodies no longer fuse multi-block answers.** `Turn.text`
+  joins text blocks with a newline; a final assistant turn stored as
+  multiple text blocks previously concatenated the last word of one
+  block to the first word of the next in completion notifications and
+  every other flattened read.
+- **String-typed boolean capability overrides coerce instead of
+  truthiness-flipping.** A hand-edited `"false"`/`"0"` in a model
+  definition's capabilities JSON now means false; unrecognized values
+  drop the key and keep the field's default.
+- **Inline `<think>`/`<reasoning>` blocks no longer leak into drained
+  results (#965, #940).** On servers without a reasoning parser
+  (parserless vLLM/llama.cpp, LM Studio, bare gateways), reasoning
+  arrives as literal tags inside content; segregation now happens once
+  at the drain seam, so web-fetch tool results, sub-agent syntheses,
+  judge verdicts, titles, summaries, and optimizer prompts receive
+  tag-free content and the extracted reasoning rides the native lane.
+  Two behavior notes: a web-fetch extraction whose whole response was
+  reasoning now returns an explicit `Error: extraction returned no
+  answer` tool result (previously the raw reasoning text persisted as a
+  successful result and was replayed every following turn), and a
+  mismatched-vocabulary close tag (`<think>…</reasoning>`) now closes
+  the block — matching the interactive lane's long-standing rule —
+  where the old per-lane strips treated it as unterminated.
+
+- **A transport failure mid-generation no longer kills the interactive
+  turn (#937).** A wire death during body streaming (TLS record failure,
+  connection reset — `httpx.ReadError` and kin) surfaces after the
+  request has already returned its stream handle, so neither the SDK's
+  request retries nor the creation-time retry ladder ever saw it: the
+  turn died with a bare `ReadError: …`, the partial output was
+  discarded, and nothing was logged. The interactive loop now normalizes
+  mid-body transport deaths exactly like the single-shot lanes and
+  re-issues the turn (bounded, cancel-aware, exponential backoff),
+  finalizing the dead attempt across every UI surface first so retried
+  text never double-renders (web transcript, CLI markdown fences,
+  Slack/Discord streamed messages). Before re-creating the stream the
+  session re-resolves its registry binding, so a concurrent model-registry
+  reload that closed the old client cannot turn the retry into a
+  misleading closed-client error. On exhaustion the surfaced error names
+  the provider, endpoint, and model with a stream-death message instead
+  of a bare exception string, and every fatal turn now leaves a
+  `session.fatal.recorded` log line (INFO for a user Ctrl-C, ERROR
+  otherwise).
 
 - **A failed worker-thread spawn no longer wedges the workstream — at
   either spawn site — and never masquerades as success.** If

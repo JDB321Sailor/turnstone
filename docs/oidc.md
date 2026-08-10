@@ -137,20 +137,61 @@ always held to the strict public-address rule.
 ### Model gateway credentials
 
 The same OIDC registration can authenticate model gateways. A model definition
-with `auth_mode = "entra_obo"` redeems the driving user's captured credential
-for its exact `obo_audience`; `auth_mode = "entra_app"` uses the registration's
-client ID and secret with Entra client credentials. Both bind the result through
-the provider SDK's native credential option rather than injecting an override
-header. The grant mode is never inferred: missing user context or a failed OBO
-mint cannot switch an `entra_obo` definition to client credentials.
+with `auth_mode = "entra_obo"` (Entra grant profile) or `auth_mode =
+"rfc8693_obo"` (RFC 8693 token-exchange profile) redeems the driving user's
+captured credential for its exact `obo_audience`; `auth_mode = "entra_app"`
+uses the registration's client ID and secret with Entra client credentials.
+All three bind the result through the provider SDK's native credential option
+rather than injecting an override header. The grant mode is never inferred:
+missing user context or a failed OBO mint cannot switch a delegated definition
+to client credentials.
 
-`entra_obo` requires `capture_user_credential = true`, the MCP encryption key,
-and delegated/admin-consented permission to the audience. `entra_app` requires
-`obo_grant_profile = "entra"` and a confidential-client secret; RFC 8693
-client-credentials is not implemented. Configure the permitted resource IDs in
-the runtime setting `model.auth_audience_allowlist` before saving dynamic model
-definitions. See [Settings](settings.md#model-backend-authentication) for
-permissions, failure policy, and lane identity rules.
+Each dynamic mode pairs with the grant profile whose dialect it names:
+`entra_obo` and `entra_app` require `obo_grant_profile = "entra"`;
+`rfc8693_obo` requires `obo_grant_profile = "rfc8693"`. The pairing is
+enforced when a write chooses a `(auth_mode, obo_audience)` pair — a same-pair
+edit of a row saved before the pairing rule keeps working — and at runtime a
+mismatched legacy row refuses to mint with `cause=grant_profile_mismatch` and
+no IdP traffic. RFC 8693 client-credentials is not implemented.
+
+The delegated modes need the MCP encryption key, a credential captured for the
+driving user, and delegated/admin-consented permission to the audience.
+`rfc8693_obo` additionally carries `obo_scopes`, the space-separated scope
+list its exchange leg requests: exchange-capable IdPs that gate audiences
+behind optional scopes refuse the exchange without it ("Requested audience not
+available"), which is why the scope-less Entra-named mode could never mint on
+that profile (issue #955). Scopes are stored shape-checked only — whether a
+value satisfies the IdP stays the IdP's call at mint time. Turning
+`capture_user_credential` off later stops *new* captures but does not
+invalidate credentials already stored, so existing users keep minting.
+`entra_app` requires a confidential-client secret. Configure the permitted
+resource IDs in the runtime setting `model.auth_audience_allowlist` before
+saving dynamic model definitions. De-listing an audience later blocks every
+write that would arm or re-aim a definition at it, but does not stop aliases
+already configured from minting — disabling the row (the `admin.models` disarm
+lever) is what stops minting. See
+[Settings](settings.md#model-backend-authentication) for permissions, failure
+policy, and lane identity rules.
+
+An unrecognised `obo_grant_profile` is warned about at startup and **rejected
+at the write choke points**: configuring an `oauth_obo` MCP server or a dynamic
+model alias returns a 400 that echoes the configured value, so the typo is the
+diagnosis. At runtime an unknown profile never mints — the mint legs resolve by
+exact name; the full cause detail is logged once per audience, and every
+affected call still logs its per-turn fallback or refusal naming the alias,
+the target audience, and the last recorded cause (`cause=` — for example
+`unsupported_grant_profile` or `oidc_not_enabled`) — so a pre-existing row
+degrades loudly, with the reason visible mid-incident even after the
+once-per-process line has rotated out of retained logs, rather than silently
+swapping per-user attribution for the shared static key.
+
+The `[security]` token encryption key is deployment-wide, not per-host: rows are
+encrypted with `MultiFernet` and carry no key id, so every host that reads them
+needs the same keyring. That includes the console, which mints for
+coordinator-hosted sessions. A node that needs the key and lacks it refuses to
+start; the console starts but withholds its coordinator subsystem and shows
+the key requirement as the remediation error instead of failing silently at
+call time.
 
 ### config.toml alternative
 

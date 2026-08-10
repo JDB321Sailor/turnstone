@@ -32,12 +32,12 @@ from typing import Any
 
 from openai import OpenAI
 
-from turnstone.core.model_turn import cap_tool_calls, model_turn, resolve_lane
+from turnstone.core.model_turn import cap_tool_calls, model_turn, require_lane_capabilities
 from turnstone.core.providers import LLMProvider, create_client, create_provider
 from turnstone.core.session import ChatSession
 from turnstone.core.storage import get_storage, init_storage, reset_storage
 from turnstone.core.tools import INTERACTIVE_TOOLS, PRIMARY_KEY_MAP
-from turnstone.core.trajectory import Role, Turn, turn_from_dict, turns_from_dicts
+from turnstone.core.trajectory import Turn, final_assistant_text, turn_from_dict, turns_from_dicts
 
 # Eval evaluates interactive-session agent behaviour — coordinator tools
 # require a console-hosted session and aren't exercised by the harness.
@@ -88,6 +88,9 @@ class NullUI:
         pass
 
     def on_turn_committed(self) -> None:
+        pass
+
+    def on_stream_discarded(self) -> None:
         pass
 
     def on_thinking_start(self) -> None:
@@ -331,17 +334,15 @@ class HeadlessSession(ChatSession):
         """
         self.tool_call_log = []
 
-        # The eval lane — resolved once per run, like the sub-agent seam.
-        # ``temperature`` relays the harness's operator-resolved knob per
-        # call below (house rule: relay, never pin).
-        lane = resolve_lane(
-            self._provider,
-            self.client,
-            self.model,
-            alias=self._model_alias or "",
-            registry=self._registry,
-            capabilities=self._get_capabilities(),
-        )
+        # Pin one immutable semantic primary-lane snapshot for the whole eval
+        # run, like the sub-agent seam.  A concurrent session rebind must not
+        # splice a different provider/model/config into one measured tool loop;
+        # retirement of the old registry client may abort the run instead.  The
+        # same lane's capabilities drive every full-history wire fold below.
+        # ``temperature`` relays the harness's operator-resolved knob per call
+        # (house rule: relay, never pin).
+        lane = self._primary_lane()
+        lane_caps = require_lane_capabilities(lane)
 
         for turn in range(max_turns):
             if self._cancelled.is_set():
@@ -364,7 +365,9 @@ class HeadlessSession(ChatSession):
             # ("System message must be at the beginning") by another,
             # and either way the nudge eval was measuring the wrong
             # stimulus.
-            turns = turns_from_dicts(self._prepare_wire_messages(self._full_messages()))
+            turns = turns_from_dicts(
+                self._prepare_wire_messages(self._full_messages(), caps=lane_caps)
+            )
 
             if self._cancelled.is_set():
                 break
@@ -776,12 +779,9 @@ def _run_single_test(
         return session, _drive
 
     def _finish(session: Any, tool_log: list[dict[str, Any]]) -> dict[str, Any]:
-        # Extract results before releasing session
-        final_content = ""
-        for msg in reversed(session.messages):
-            if msg.role is Role.ASSISTANT and msg.text:
-                final_content = msg.text
-                break
+        # The run's final content is the final-say read — no walk-back: an
+        # earlier turn's narration must never be scored as the final answer.
+        final_content = final_assistant_text(session.messages)
         return {
             "tool_log": tool_log,
             "final_content": final_content,

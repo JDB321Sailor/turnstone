@@ -9,12 +9,14 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.attachments import safe_attachment_label
 from turnstone.core.providers._protocol import (
     EFFORT_TEMPLATE_FALLBACK_PARAM,
     ModelCapabilities,
+    ProviderRequestMetrics,
     StreamChunk,
     ToolCallDelta,
     UsageInfo,
@@ -22,6 +24,8 @@ from turnstone.core.providers._protocol import (
     _lookup_capabilities,
     finish_shim_due,
     merge_reasoning_template_kwargs,
+    refuse_aborted_request,
+    serialized_tool_chars,
     snap_reasoning_effort,
 )
 from turnstone.core.trajectory import materialize_attachments
@@ -303,6 +307,19 @@ _ANTHROPIC_CAPABILITIES: dict[str, ModelCapabilities] = {
     ),
 }
 
+# The commercial endpoint segregates reasoning natively (``thinking`` /
+# ``redacted_thinking`` blocks) — content never carries inline think
+# tags, so the inline tag scan is off for every entry, known or
+# defaulted, as ONE rule applied to the whole table (a per-entry flag
+# would be forgotten on the next model row).  ``_ANTHROPIC_COMPAT_DEFAULT``
+# is deliberately NOT covered: local /v1/messages checkpoints are exactly
+# the passthrough dialect the scan exists for.
+_ANTHROPIC_DEFAULT = replace(_ANTHROPIC_DEFAULT, server_parses_reasoning=True)
+_ANTHROPIC_CAPABILITIES = {
+    name: replace(caps, server_parses_reasoning=True)
+    for name, caps in _ANTHROPIC_CAPABILITIES.items()
+}
+
 
 def _map_reasoning_to_effort(
     reasoning_effort: str | None,
@@ -540,8 +557,8 @@ class AnthropicProvider:
         intentionally preserved.  The kwarg defaults to ``True`` here
         purely for back-compat with any direct caller that hasn't been
         updated to thread the resolver — production call sites
-        (``ChatSession._try_stream`` / ``_utility_completion``) always
-        pass the resolved flag explicitly.
+        (``model_turn`` — every lane, the interactive loop included)
+        always pass the resolved flag explicitly.
 
         ``supports_mid_conversation_system`` (claude-opus-4-8,
         claude-fable-5) makes the
@@ -903,6 +920,7 @@ class AnthropicProvider:
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
         resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
+        request_metrics_ref: list[ProviderRequestMetrics] | None = None,
     ) -> Iterator[StreamChunk]:
         messages = materialize_attachments(messages, resolve_attachments)
         caps = capabilities or self.get_capabilities(model)
@@ -926,7 +944,16 @@ class AnthropicProvider:
         if extra_headers:
             kwargs["extra_headers"] = extra_headers
 
+        refuse_aborted_request(cancel_ref)
+        if request_metrics_ref is not None:
+            request_metrics_ref.append(
+                ProviderRequestMetrics(
+                    serialized_tool_chars=serialized_tool_chars(kwargs.get("tools"))
+                )
+            )
+
         manager = client.messages.stream(**kwargs)
+        refuse_aborted_request(cancel_ref)
         try:
             stream = manager.__enter__()
         except BaseException:
@@ -1287,15 +1314,15 @@ def _normalize_finish_reason(reason: str) -> str:
         return "stop"
     if reason == "refusal":
         # A safety classifier declined the request.  This arrives as a
-        # SUCCESSFUL HTTP 200 with content empty (declined before any output)
-        # or partial (declined mid-stream), so nothing upstream raises — the
-        # drain gate only errors on an ABSENT finish reason.  "content_filter"
-        # is the
-        # OpenAI-vocabulary equivalent this function normalizes onto, and both
-        # consumers already handle it: ChatSession._stream_response warns the
-        # user, and the sub-agent loop stops early instead of flailing on an
-        # empty turn.  Falling through to the raw "refusal" string instead
-        # would land a truncated answer as a complete result.
+        # SUCCESSFUL HTTP 200 with content empty (declined before any
+        # output) or partial (declined mid-stream), so nothing upstream
+        # raises — the drain gate only errors on an ABSENT finish reason.
+        # "content_filter" is the OpenAI-vocabulary equivalent this
+        # function normalizes onto, and both consumers already handle it:
+        # the interactive wrapper's _finalize_stream_result warns the
+        # user, and the sub-agent loop stops early instead of flailing on
+        # an empty turn.  Falling through to the raw "refusal" string
+        # instead would land a truncated answer as a complete result.
         return "content_filter"
     return reason
 

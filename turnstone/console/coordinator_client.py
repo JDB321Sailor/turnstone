@@ -662,7 +662,7 @@ class CoordinatorClient:
         except Exception:
             log.debug("coord_client.is_own_subtree.lookup_failed ws=%s", ws_id, exc_info=True)
             return False
-        if row is None:
+        if row is None or row.get("state") == "creating":
             return False
         if row.get("parent_ws_id") != self._coord_ws_id:
             return False
@@ -681,6 +681,8 @@ class CoordinatorClient:
         path.  Returns False on a missing / None row so callers can
         safely pass ``rows.get(wid)``.
         """
+        if row is not None and row.get("state") == "creating":
+            return False
         if ws_id == self._coord_ws_id:
             return True
         if row is None:
@@ -2485,6 +2487,14 @@ def _truncate_wait_message(text: str, max_bytes: int) -> tuple[str, bool]:
 def _last_assistant_text(storage: Any, ws_id: str) -> str | None:
     """Walk the conversation tail backward and return the most recent
     assistant message's text content.
+
+    A same-named Turn-based walk with DIFFERENT deliberate semantics
+    lives in ``core/trajectory.last_assistant_text`` (flattens
+    multi-block content via ``Turn.text``, skips whitespace-only says,
+    two-state return); this dict-row walk deliberately skips
+    list-content rows and keeps its tri-state contract for the storage
+    try/except.  A substantiveness-rule change there does not reach
+    here, and vice versa; keep both docstrings pointing at each other.
 
     Returns:
     - The content string when the tail contains an assistant message

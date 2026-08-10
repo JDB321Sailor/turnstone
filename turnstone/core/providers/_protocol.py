@@ -7,8 +7,16 @@ knowing provider-specific details.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+from turnstone.core.deadline import DeadlineCancelledError
+from turnstone.core.streaming_text import (
+    partial_tag_tail,
+    split_inline_reasoning,
+    strip_blank_edge_lines,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -34,6 +42,30 @@ class UsageInfo:
     # Prompt caching metrics (provider-specific; 0 when not available)
     cache_creation_tokens: int = 0
     cache_read_tokens: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRequestMetrics:
+    """Non-sensitive prompt-shape metrics from one prepared provider request.
+
+    Adapters record these only after their provider-native tool conversion is
+    complete.  Payloads, headers, and credentials never leave the adapter.
+    """
+
+    serialized_tool_chars: int = 0
+
+
+def serialized_tool_chars(tools: Any) -> int:
+    """Deterministic semantic character count for provider-native tools."""
+    if not isinstance(tools, list):
+        return 0
+    return sum(len(json.dumps(tool, ensure_ascii=False, separators=(",", ":"))) for tool in tools)
+
+
+def refuse_aborted_request(cancel_ref: Any) -> None:
+    """Re-check cancellation after provider-side request preparation."""
+    if getattr(cancel_ref, "aborted", False):
+        raise DeadlineCancelledError("cancel_ref aborted before dispatch")
 
 
 @dataclass
@@ -92,9 +124,10 @@ def merge_usage(acc: UsageInfo | None, new: UsageInfo) -> UsageInfo:
     recomputed from the merged parts.  Returns a fresh ``UsageInfo`` and
     never mutates ``new`` (the provider's object).
 
-    ``ChatSession``'s inline chunk consumer implements the same rule over
-    its dict-shaped accumulator; it adopts this helper when the main loop
-    moves onto ``model_turn`` (#832).
+    Serves :func:`drain_stream` (the one assembler) and the interactive
+    ``on_chunk`` consumer, which re-projects the merged accumulator into
+    the session's ``_last_usage`` dict (read mid-stream) on every usage
+    chunk — so the display lane cannot drift from the assembly.
     """
     if acc is None:
         return replace(new)
@@ -138,10 +171,10 @@ def accumulate_tool_call_delta(
     fragment), ``arguments_delta`` concatenates.  Returns the (possibly
     fresh) accumulator entry so callers can hang provider extras off it.
 
-    Serves :func:`drain_stream`, ``GoogleProvider``'s raw-fidelity
-    capture, and ``ChatSession``'s inline chunk consumer — every
-    accumulator in the tree, so the chat loop and the drained lanes
-    cannot assemble different calls from the same wire stream.
+    Serves :func:`drain_stream` — the one assembler since #832 folded the
+    interactive loop into it — and ``GoogleProvider``'s raw-fidelity
+    capture: every accumulator in the tree, so no two lanes can assemble
+    different calls from the same wire stream.
     """
     tc = acc.setdefault(
         tcd.index,
@@ -156,8 +189,114 @@ def accumulate_tool_call_delta(
     return tc
 
 
-def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
+def _logger() -> Any:
+    """Module logger behind ONE deferred import — structlog stays off the
+    type-module import path (this module is imported for its dataclasses
+    by code that must not pay the logging stack's import cost)."""
+    import structlog  # noqa: PLC0415 — deferred off the type-module import path
+
+    return structlog.get_logger(__name__)
+
+
+# Block types that carry model reasoning natively.  Anthropic emits
+# ``thinking``/``redacted_thinking`` blocks, OpenAI Responses emits
+# ``reasoning`` items, and ``reasoning_text`` is the harness's own
+# synthetic block (``model_turn.synth_reasoning_block``).  Defined here —
+# beside the drain that needs it for the double-reasoning observability
+# check — and imported by ``model_turn`` (which layers above this module).
+REASONING_BEARING_BLOCK_TYPES: frozenset[str] = frozenset(
+    {"thinking", "redacted_thinking", "reasoning", "reasoning_text"}
+)
+
+
+def has_reasoning_bearing_block(blocks: list[dict[str, Any]]) -> bool:
+    """True when any block carries model reasoning natively.
+
+    THE membership predicate for :data:`REASONING_BEARING_BLOCK_TYPES` —
+    shared by the drain's double-reasoning check and
+    ``model_turn.synth_reasoning_block``'s bail, so the two can never
+    disagree about what counts as native reasoning.
+    """
+    return any(
+        isinstance(b, dict) and b.get("type") in REASONING_BEARING_BLOCK_TYPES for b in blocks
+    )
+
+
+def transport_guarded(chunks: Iterator[StreamChunk]) -> Iterator[StreamChunk]:
+    """Normalize mid-body transport deaths on a ``create_streaming`` iterator.
+
+    Streaming moves the body read out of the SDK's
+    ``APIConnectionError``-wrapped request into raw iteration, so a
+    mid-body wire death (connection drop, TLS record failure, read
+    timeout) surfaces as a bare ``httpx.TransportError`` no retry
+    predicate recognizes.  This wrapper is that conversion rule made
+    reusable for consumers that keep streaming semantics (the
+    interactive loop); :func:`drain_stream` applies the same rule for
+    the single-shot lanes.
+
+    - A ``TransportError`` BEFORE any finish reason re-raises (chained)
+      as the retryable :class:`IncompleteStreamError`.
+    - A ``TransportError`` AFTER a finish reason passed through ends the
+      stream cleanly: the generation already completed, and the blip
+      only cost trailing metadata (a usage-only chunk or the citation
+      footer) — logged as ``stream.post_finish_blip``.
+    - Everything else — chunks, exhaustion, non-transport exceptions —
+      passes through untouched.
+    """
+    import httpx  # noqa: PLC0415 — heavyweight; deferred off the type-module import path
+
+    finish_seen = False
+    usage_seen = False
+    iterator = iter(chunks)
+    while True:
+        try:
+            sc = next(iterator)
+        except StopIteration:
+            return
+        except httpx.TransportError as exc:
+            if finish_seen:
+                # usage_captured distinguishes "completed result kept but
+                # its spend went missing from usage accounting" (the chat
+                # lane's usage chunk trails the finish) from a harmless
+                # citation-footer loss — the one log signal that lets a
+                # missing-spend incident be attributed afterward.
+                _logger().warning(
+                    "stream.post_finish_blip",
+                    error_type=type(exc).__name__,
+                    usage_captured=usage_seen,
+                )
+                return
+            raise IncompleteStreamError(
+                f"stream transport failed mid-response ({type(exc).__name__}: {exc})"
+            ) from exc
+        if sc.finish_reason:
+            finish_seen = True
+        if sc.usage is not None:
+            usage_seen = True
+        yield sc
+
+
+# The trailing-citations fold rule in one place: post-finish info
+# (web-search source footers) folds onto a non-blank answer only, joined
+# by this separator.  The interactive display consumer and the drain
+# share both pieces, so a footer cannot render two ways.
+TRAILING_INFO_SEPARATOR = "\n\n"
+
+
+def folds_trailing_info(content: str) -> bool:
+    """Whether a trailing info footer folds onto *content* (non-blank)."""
+    return bool(content.strip())
+
+
+def drain_stream(
+    chunks: Iterator[StreamChunk], *, scan_inline_reasoning: bool = True
+) -> CompletionResult:
     """Drain a ``create_streaming`` iterator into a ``CompletionResult``.
+
+    *scan_inline_reasoning* ``False`` (``capabilities.server_parses_reasoning``
+    — the backend puts reasoning in its own channel) skips the inline
+    split: there is none to find, and the scan could only misroute prose
+    that quotes a tag.
 
     The ONE non-streaming transport: single-shot callers (``model_turn``)
     sample through the provider's streaming entry and accumulate here, so
@@ -174,7 +313,19 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
       never be handed to a caller that stores it as a complete result (a
       compaction summary, a title).  A transport blip AFTER the finish
       reason keeps the completed result and forfeits only trailing
-      metadata.
+      metadata — on the chat lane the usage chunk trails the finish
+      reason, so that result may report usage=None and the call's spend
+      goes missing from usage accounting.
+    - Content accumulates in RUNS bounded by interleaving signals
+      (reasoning_delta, tool-call deltas), each run split independently by
+      :func:`split_inline_reasoning` — the one-shot form of the interactive
+      lane's tag splitter, with the run boundaries mirroring that
+      consumer's flush-and-reset at the same signals — so ``content`` is
+      inline-think-tag-free by construction for EVERY drained consumer, and
+      non-blank extracted text is APPENDED to ``reasoning`` after any
+      server-parsed ``reasoning_delta`` (segregated, never discarded).
+      The split runs BEFORE the citations footer folds back: the footer is
+      web-controlled text and is never scanned for tags.
     - ``usage`` merges via :func:`merge_usage` — Anthropic splits prompt
       and completion tokens across separate events.
     - Tool calls accumulate by ``ToolCallDelta.index`` via
@@ -188,59 +339,71 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
     - ``info_delta`` before the finish reason is transient status (server-
       side search pings) that the non-streaming lane never surfaced —
       dropped.  ``info_delta`` after the finish reason is the citations
-      footer (``format_citations("", annotations).strip()``); folding it
-      back as ``content + "\\n\\n" + info`` byte-matches the non-streaming
-      lane's ``format_citations(content, annotations)`` append.
+      footer (``format_citations("", annotations).strip()``), folded back
+      as ``content + "\\n\\n" + info`` ONLY when the post-split content is
+      non-blank — sourcing for an answer that does not exist is dropped,
+      never handed to downstream emptiness checks as a footer-only
+      "answer".  (This deliberately replaced the retired non-streaming
+      lane's unconditional byte-match append.)
 
     Raises whatever the underlying stream raises — retry/deadline/fallback
     policy stays with the caller, exactly as with the old non-streaming
-    transport — EXCEPT httpx transport failures: streaming moves the body
-    read out of the SDK's ``APIConnectionError``-wrapped request into raw
-    iteration, so a mid-body connection drop or read timeout surfaces as a
-    bare ``httpx.TransportError`` no retry predicate recognizes.  Those
-    are re-raised (chained) as :class:`IncompleteStreamError`, restoring
-    the wire-blip retryability the non-streaming transport had.
+    transport — EXCEPT httpx transport failures, normalized by
+    :func:`transport_guarded` (the one conversion rule, shared with the
+    interactive loop): a mid-body death before the finish reason is
+    re-raised (chained) as :class:`IncompleteStreamError`, restoring the
+    wire-blip retryability the non-streaming transport had, and a
+    post-finish blip ends the stream cleanly so the completed result is
+    kept.
     """
-    import httpx  # noqa: PLC0415 — heavyweight; deferred off the type-module import path
-
-    content_parts: list[str] = []
+    content_segments: list[str] = []
+    segment_parts: list[str] = []
     reasoning_parts: list[str] = []
     trailing_info_parts: list[str] = []
     tool_calls_acc: dict[int, dict[str, Any]] = {}
     usage: UsageInfo | None = None
     finish_reason: str | None = None
     provider_blocks: list[dict[str, Any]] = []
+    tag_carry = ""
 
-    iterator = iter(chunks)
-    while True:
-        try:
-            sc = next(iterator)
-        except StopIteration:
-            break
-        except httpx.TransportError as exc:
-            if finish_reason is not None:
-                # The generation already completed (finish reason in hand);
-                # the blip only cost trailing metadata — a usage-only chunk
-                # or the citation footer.  Keep the complete result rather
-                # than discarding it for a retry that re-pays the tokens —
-                # but say so: on the chat lane the usage chunk trails the
-                # finish reason, so this result may report usage=None and
-                # the call's spend goes missing from usage accounting.
-                import structlog  # noqa: PLC0415 — deferred with httpx off the type-module path
+    def _close_segment(*, carry_tail: bool = False) -> None:
+        # *carry_tail* (the reasoning_delta boundary): hold back a
+        # possible partial tag for the NEXT run — a reasoning delta
+        # cannot terminate a tag, so a tag the server split across it
+        # must reassemble ('…<thi' + delta + 'nk>…'), or the halves
+        # would pass through as visible content.  Tool boundaries close
+        # WITHOUT carry: no tag spans a tool call (the interactive
+        # consumer's flush-at-tool-boundary rule).
+        nonlocal tag_carry
+        seg = tag_carry + "".join(segment_parts)
+        segment_parts.clear()
+        tag_carry = partial_tag_tail(seg) if carry_tail else ""
+        if tag_carry:
+            seg = seg[: -len(tag_carry)]
+        if seg:
+            content_segments.append(seg)
 
-                structlog.get_logger(__name__).warning(
-                    "drain_stream.post_finish_blip",
-                    error_type=type(exc).__name__,
-                    usage_captured=usage is not None,
-                )
-                break
-            raise IncompleteStreamError(
-                f"stream transport failed mid-response ({type(exc).__name__}: {exc})"
-            ) from exc
-        if sc.content_delta:
-            content_parts.append(sc.content_delta)
+    for sc in transport_guarded(chunks):
+        # Content accumulates in RUNS bounded by interleaving signals
+        # (reasoning_delta, tool-call deltas), and each run is split
+        # independently below — mirroring the interactive consumer's
+        # boundary resets (pending flushed and in_think cleared when tool
+        # calls begin; in_think cleared when content resumes after
+        # provider-parsed reasoning).  Without the boundaries, an
+        # unterminated ``<think>`` opened before a tool call would swallow
+        # the post-tool-call answer the interactive lane renders as
+        # content.  Within a chunk the interactive ordering holds:
+        # reasoning (Path 1), then content (Path 2), then tool calls —
+        # a combined content+tools chunk feeds its content BEFORE the
+        # tool-call close, so that content belongs to the pre-boundary
+        # run exactly as the interactive consumer emits it.
         if sc.reasoning_delta:
             reasoning_parts.append(sc.reasoning_delta)
+            _close_segment(carry_tail=True)
+        if sc.content_delta:
+            segment_parts.append(sc.content_delta)
+        if sc.tool_call_deltas:
+            _close_segment()
         for tcd in sc.tool_call_deltas:
             accumulate_tool_call_delta(tool_calls_acc, tcd)
         if sc.usage is not None:
@@ -253,6 +416,7 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
         # only the trailing (post-finish) citations footer folds back.
         if sc.info_delta and finish_reason is not None:
             trailing_info_parts.append(sc.info_delta)
+    _close_segment()
 
     if finish_reason is None:
         raise IncompleteStreamError(
@@ -261,9 +425,43 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
             "declared in its model capabilities)"
         )
 
-    content = "".join(content_parts)
-    for info in trailing_info_parts:
-        content += "\n\n" + info
+    # THE one trim: runs split raw, then a single edge trim over the
+    # joined whole when any run consumed a tag.  Per-run trimming cannot
+    # distinguish tag residue from a genuine paragraph separator the
+    # model emitted just before an interleaving signal — trimming each
+    # run's edges fused sentences across the separator-less join.
+    split_segments = [
+        split_inline_reasoning(seg, scan_tags=scan_inline_reasoning) for seg in content_segments
+    ]
+    content = "".join(c for c, _ in split_segments)
+    extracted = "".join(r for _, r in split_segments)
+    # The splitter can only REMOVE characters, so a shrunken total is the
+    # consumed-a-tag signal.
+    if len(content) != sum(map(len, content_segments)):
+        content = strip_blank_edge_lines(content)
+    reasoning = "".join(reasoning_parts)
+    if extracted.strip():
+        if reasoning:
+            # Server-parsed and inline-extracted are distinct passes — keep
+            # a boundary so they never read as one run-together sentence.
+            reasoning += "\n\n"
+        reasoning += extracted
+        if has_reasoning_bearing_block(provider_blocks):
+            # True double-reasoning shape (inline tags AND a native
+            # reasoning block): the extracted text has no native lane to
+            # land in downstream.  Observable here — where extraction is
+            # distinguishable from the routine reasoning_delta mirror —
+            # and chars-only: reasoning text is barred from log payloads.
+            _logger().debug("drain.inline_reasoning_alongside_native", chars=len(extracted))
+    # A turn with no visible answer — content empty OR whitespace-only —
+    # must not gain a citations footer: sourcing for an answer that does
+    # not exist, folded on, would hand every downstream emptiness check a
+    # truthy footer-only "answer".  Blankness, not truthiness; checked
+    # only when a footer exists (footers ride web-search turns only, and
+    # the strip scan shouldn't tax every drained completion).
+    if trailing_info_parts and folds_trailing_info(content):
+        for info in trailing_info_parts:
+            content += TRAILING_INFO_SEPARATOR + info
 
     tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
     return CompletionResult(
@@ -272,7 +470,7 @@ def drain_stream(chunks: Iterator[StreamChunk]) -> CompletionResult:
         finish_reason=finish_reason,
         usage=usage,
         provider_blocks=provider_blocks,
-        reasoning="".join(reasoning_parts),
+        reasoning=reasoning,
     )
 
 
@@ -294,6 +492,16 @@ class ModelCapabilities:
     # Ignored when thinking_mode is "none" or by providers that handle
     # thinking natively (real Anthropic).
     thinking_param: str = "enable_thinking"
+    # The backend segregates model reasoning into its OWN channel
+    # (``reasoning_content`` deltas, native reasoning blocks) instead of
+    # leaving it in the content stream — a vLLM launched with a reasoning
+    # parser, a commercial provider.  True turns the inline tag scan OFF
+    # everywhere (drain seam and interactive consumer alike): content is
+    # trusted verbatim, so prose that merely QUOTES a tag can no longer be
+    # misrouted, and the lanes that need no reasoning stop suppressing it
+    # (segregated reasoning costs the caller nothing).  Default False is
+    # the passthrough-server fallback this whole dialect exists for.
+    server_parses_reasoning: bool = False
     # For local-server lanes (openai-compatible, anthropic-compatible):
     # the chat_template_kwargs key that carries a graded reasoning-effort
     # value, for templates that have one (e.g. "reasoning_effort" for
@@ -555,6 +763,32 @@ def reasoning_template_kwargs(
     return updates
 
 
+def thinking_off_template_kwargs(thinking_mode: str, thinking_param: str) -> dict[str, Any]:
+    """``chat_template_kwargs`` that turn the template's thinking toggle OFF.
+
+    THE spelling of "this lane needs no reasoning", shared by every lane
+    that asks the model for a bounded artifact rather than a considered
+    answer: omni transcription (:func:`audio._omni_chat_extra_body`) and
+    the drained utility completions (title, compaction, web-fetch
+    extraction).  Those lanes pay for reasoning twice — latency, and a
+    chain-of-thought that lands in the artifact whenever the server does
+    not segregate it (#940: the leaked reasoning then rides every
+    following turn as tool-result context).
+
+    Only the DECLARED toggle is sent — the alias's own
+    ``thinking_param``, and only at a ``thinking_mode`` that has a toggle
+    at all.  A model that declares none keeps its template default: this
+    is not a licence to guess a key.  Note ``adaptive`` deliberately
+    always sends ``true`` through :func:`reasoning_template_kwargs` (the
+    knob may not force-disable a self-regulating model), so a lane that
+    genuinely needs silence must pin the key itself — that pin wins,
+    since the merge only ``setdefault``s.
+    """
+    if thinking_param and thinking_mode in ("manual", "adaptive"):
+        return {thinking_param: False}
+    return {}
+
+
 def merge_reasoning_template_kwargs(
     caps: ModelCapabilities,
     reasoning_effort: str | None,
@@ -667,6 +901,7 @@ class LLMProvider(Protocol):
         replay_reasoning_to_model: bool = True,
         extra_headers: dict[str, str] | None = None,
         resolve_attachments: Callable[[list[str]], dict[str, Any]] | None = None,
+        request_metrics_ref: list[ProviderRequestMetrics] | None = None,
     ) -> Iterator[StreamChunk]:
         """Create a streaming request, yielding normalized StreamChunks.
 
@@ -676,10 +911,15 @@ class LLMProvider(Protocol):
         the model registry (e.g. ``thinking_mode``, ``token_param``)
         are respected.
 
-        If *cancel_ref* is provided the provider appends the underlying SDK
-        stream object (which has a ``.close()`` method) before yielding the
-        first chunk.  The caller can then close it from another thread to
-        abort a blocked HTTP read immediately.
+        If *cancel_ref* is provided the provider appends the underlying
+        SDK stream object (which has a ``.close()`` method) EAGERLY:
+        inside this call's body, at HTTP-response time, before the
+        iterator is returned — not merely before the first chunk (a
+        lazily-issued generator adapter would violate this).  The
+        caller's creation-vs-midstream classifier and health recording
+        key on that instant (#832); ``test_sdk_stream_boundary`` pins it
+        per adapter.  The caller can then close the stream from another
+        thread to abort a blocked HTTP read immediately.
 
         This is the ONLY transport — single-shot callers drain it through
         :func:`drain_stream` instead of a separate non-streaming entry

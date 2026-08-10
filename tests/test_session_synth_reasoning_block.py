@@ -8,9 +8,8 @@ provider_blocks shape on the wire, so the captured reasoning text is
 stamped onto ``_provider_content`` as a synthetic
 ``{type: "reasoning_text"}`` block at the end of the turn by
 ``model_turn.synth_reasoning_block`` — the one synthesizer every lane
-runs (the main loop reaches it through ``ChatSession._stream_response``
-→ ``_finalize_provider_blocks``; agents and judges through
-``model_turn``).
+runs (every lane — main loop, agents, judges — reaches it through
+``model_turn.model_turn``'s ``finalize_provider_blocks`` call).
 
 These tests pin:
 1. The synthesizer fires only when no native blocks were emitted AND
@@ -26,16 +25,25 @@ These tests pin:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
 from tests._session_helpers import make_session as _make_session
-from turnstone.core.model_turn import _server_type_of, synth_reasoning_block
+from tests._session_helpers import replace_session_lane, scripted_provider
+from turnstone.core.model_turn import (
+    _server_type_of,
+    finalize_provider_blocks,
+    resolve_lane,
+    synth_reasoning_block,
+)
 from turnstone.core.providers._anthropic import (
     ANTHROPIC_VALID_BLOCK_TYPES,
     AnthropicProvider,
 )
 from turnstone.core.providers._openai_chat import OpenAIChatCompletionsProvider
+from turnstone.core.providers._protocol import StreamChunk, UsageInfo
+from turnstone.core.trajectory import Turn
 
 
 class TestSynthReasoningBlock:
@@ -212,23 +220,22 @@ class TestOpenAIChatExtractReasoningText:
 
 class TestStreamResponseSynthBlockIntegration:
     """Integration test: drives a fake reasoning-emitting stream
-    through ``ChatSession._stream_response`` and asserts the
-    synthesizer wires up correctly.  Pins the call site at
-    ``session.py`` (where ``model_turn.synth_reasoning_block`` is
-    invoked — via ``_finalize_provider_blocks`` — on the assembled
-    provider_blocks before stamping ``_provider_content``) — without
+    through ``session._stream_response`` (the real drain seam —
+    ``_stream_attempt`` no longer exists post-#832) and asserts the
+    synthesizer wires up correctly.  Pins the call site inside
+    ``model_turn.model_turn`` (where ``model_turn.synth_reasoning_block``
+    is invoked — via ``finalize_provider_blocks`` — on the assembled
+    provider_blocks before the result's native lane is built) — without
     this, a future refactor that drops the synthesizer call would
     silently break path-3 capture (vLLM/llama.cpp/Gemini-compat
     reasoning would be visible live but invisible on history reload).
     """
 
-    def _make_stream(self, content: str, reasoning: str) -> Any:
-        """Build an iterator of StreamChunks that mimic a path-3
-        capture (reasoning_delta chunks, content chunks, no
-        provider_blocks emitted).
+    def _make_chunks(self, content: str, reasoning: str) -> list[StreamChunk]:
+        """Build a chunk script that mimics a path-3 capture
+        (reasoning_delta chunks, content chunks, no provider_blocks
+        emitted).
         """
-        from turnstone.core.providers._protocol import StreamChunk, UsageInfo
-
         chunks = []
         # Reasoning first (matches live SSE order).
         if reasoning:
@@ -248,37 +255,46 @@ class TestStreamResponseSynthBlockIntegration:
                 usage=UsageInfo(prompt_tokens=10, completion_tokens=20, total_tokens=30),
             )
         )
-        return iter(chunks)
+        return chunks
 
     def test_stream_response_stamps_synth_block_when_path3_reasoning_captured(
         self,
     ) -> None:
         """Drive a fake stream emitting reasoning_delta chunks (no
         native provider_blocks) through ``_stream_response``; assert
-        the resulting assistant_msg carries a synthetic reasoning_text
-        block stamped onto ``_provider_content``."""
+        the resulting turn carries a synthetic reasoning_text block on
+        its native lane."""
         session = _make_session()
         # No registry → source field omitted from synth block.
-        stream = self._make_stream(content="Final answer.", reasoning="path-3 reasoning")
-        msg = session._stream_response(stream)
-        assert msg["role"] == "assistant"
-        assert msg["content"] == "Final answer."
-        # Synthetic block should be stamped onto _provider_content.
-        provider_content = msg.get("_provider_content")
-        assert isinstance(provider_content, list)
-        assert len(provider_content) == 1
-        assert provider_content[0]["type"] == "reasoning_text"
-        assert provider_content[0]["text"] == "path-3 reasoning"
+        replace_session_lane(
+            session,
+            provider=scripted_provider(
+                self._make_chunks(content="Final answer.", reasoning="path-3 reasoning")
+            ),
+        )
+        session.messages.append(Turn.user("hi"))
+        result = session._stream_response(0)
+        assert result.content == "Final answer."
+        # Synthetic block should be stamped onto the native lane.
+        assert result.turn.native is not None
+        blocks = list(result.turn.native.blocks)
+        assert len(blocks) == 1
+        assert blocks[0]["type"] == "reasoning_text"
+        assert blocks[0]["text"] == "path-3 reasoning"
 
     def test_stream_response_no_synth_when_no_reasoning_captured(self) -> None:
         """Stream emits only content (no reasoning_delta).  No synth
-        block stamped — _provider_content key absent on assistant_msg."""
+        block stamped — the result's native lane is absent."""
         session = _make_session()
-        stream = self._make_stream(content="just content", reasoning="")
-        msg = session._stream_response(stream)
-        assert msg["content"] == "just content"
-        # No synth block (and no native blocks either) → key absent.
-        assert "_provider_content" not in msg
+        replace_session_lane(
+            session,
+            provider=scripted_provider(self._make_chunks(content="just content", reasoning="")),
+        )
+        session.messages.append(Turn.user("hi"))
+        result = session._stream_response(0)
+        assert result.content == "just content"
+        # No synth block (and no native blocks either) → native absent.
+        assert result.turn.native is None
 
     def test_stream_response_synth_block_carries_source_when_server_type_resolvable(
         self,
@@ -286,18 +302,30 @@ class TestStreamResponseSynthBlockIntegration:
         """When the active model has server_compat.server_type set,
         the synth block carries it as the ``source`` field."""
         session = _make_session()
-        session._registry = SimpleNamespace(
+        registry = SimpleNamespace(
             get_config=lambda alias: SimpleNamespace(
                 capabilities={},
                 server_compat={"server_type": "vllm"},
             )
         )
-        session._model_alias = "qwen3-32b"
-        stream = self._make_stream(content="answer", reasoning="reasoning text")
-        msg = session._stream_response(stream)
-        provider_content = msg.get("_provider_content")
-        assert isinstance(provider_content, list)
-        assert provider_content[0]["source"] == "vllm"
+        session._registry = registry
+        provider = scripted_provider(
+            self._make_chunks(content="answer", reasoning="reasoning text")
+        )
+        current_lane = session._model_binding.lane
+        lane = resolve_lane(
+            provider,
+            current_lane.client,
+            current_lane.model,
+            alias="qwen3-32b",
+            registry=registry,
+        )
+        session._model_binding = replace(session._model_binding, lane=lane)
+        session.messages.append(Turn.user("hi"))
+        result = session._stream_response(0)
+        assert result.turn.native is not None
+        blocks = list(result.turn.native.blocks)
+        assert blocks[0]["source"] == "vllm"
 
 
 class TestServerTypeOf:
@@ -330,7 +358,9 @@ class TestServerTypeOf:
 
 class TestFinalizeProviderBlocks:
     """Direct unit tests for the shared native-lane builder
-    ``ChatSession._finalize_provider_blocks`` — in particular the
+    ``model_turn.finalize_provider_blocks`` (the session's streaming
+    wrapper calls it with the session registry/alias, which these tests
+    pass explicitly) — in particular the
     ``had_blank_ids`` gate (a uuid back-fill reaches only the tool_calls
     mirror, so blocks that would replay the blank id must be dropped while
     the reasoning lane survives)."""
@@ -341,7 +371,13 @@ class TestFinalizeProviderBlocks:
             {"type": "thinking", "thinking": "x", "signature": "s"},
             {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}},
         ]
-        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=True)
+        out = finalize_provider_blocks(
+            blocks,
+            [],
+            has_tool_calls=True,
+            registry=session._registry,
+            alias=session._model_alias or "",
+        )
         assert out is blocks
 
     def test_no_tool_calls_strips_orphan_client_blocks(self) -> None:
@@ -350,7 +386,13 @@ class TestFinalizeProviderBlocks:
             {"type": "thinking", "thinking": "x", "signature": "s"},
             {"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}},
         ]
-        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=False)
+        out = finalize_provider_blocks(
+            blocks,
+            [],
+            has_tool_calls=False,
+            registry=session._registry,
+            alias=session._model_alias or "",
+        )
         assert [b["type"] for b in out] == ["thinking"]
 
     def test_blank_ids_drop_messages_shaped_lane_entirely(self) -> None:
@@ -365,7 +407,14 @@ class TestFinalizeProviderBlocks:
             {"type": "text", "text": "using f"},
             {"type": "tool_use", "id": "", "name": "f", "input": {}},
         ]
-        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=True, had_blank_ids=True)
+        out = finalize_provider_blocks(
+            blocks,
+            [],
+            has_tool_calls=True,
+            had_blank_ids=True,
+            registry=session._registry,
+            alias=session._model_alias or "",
+        )
         assert out == []
 
     def test_blank_ids_drop_asymmetric_thinking_lane_without_tool_blocks(self) -> None:
@@ -377,7 +426,14 @@ class TestFinalizeProviderBlocks:
             {"type": "thinking", "thinking": "x", "signature": "s"},
             {"type": "text", "text": "t"},
         ]
-        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=True, had_blank_ids=True)
+        out = finalize_provider_blocks(
+            blocks,
+            [],
+            has_tool_calls=True,
+            had_blank_ids=True,
+            registry=session._registry,
+            alias=session._model_alias or "",
+        )
         assert out == []
 
     def test_blank_ids_drop_responses_reasoning_items(self) -> None:
@@ -389,7 +445,14 @@ class TestFinalizeProviderBlocks:
             {"type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc"},
             {"type": "function_call", "call_id": "", "name": "f", "arguments": "{}"},
         ]
-        out = session._finalize_provider_blocks(blocks, [], has_tool_calls=True, had_blank_ids=True)
+        out = finalize_provider_blocks(
+            blocks,
+            [],
+            has_tool_calls=True,
+            had_blank_ids=True,
+            registry=session._registry,
+            alias=session._model_alias or "",
+        )
         assert out == []
 
     def test_blank_ids_keep_only_reasoning_text(self) -> None:
@@ -402,8 +465,13 @@ class TestFinalizeProviderBlocks:
         blocks = [
             {"id": "", "type": "function", "function": {"name": "f", "arguments": "{}"}},
         ]
-        out = session._finalize_provider_blocks(
-            blocks, ["thinking text"], has_tool_calls=True, had_blank_ids=True
+        out = finalize_provider_blocks(
+            blocks,
+            ["thinking text"],
+            has_tool_calls=True,
+            had_blank_ids=True,
+            registry=session._registry,
+            alias=session._model_alias or "",
         )
         assert [b["type"] for b in out] == ["reasoning_text"]
         assert out[0]["text"] == "thinking text"
@@ -413,7 +481,12 @@ class TestFinalizeProviderBlocks:
         # but no client tool blocks at all — nothing can desync, so the
         # synthesized reasoning lane must be kept (the over-drop case).
         session = _make_session()
-        out = session._finalize_provider_blocks(
-            [], ["step by step"], has_tool_calls=True, had_blank_ids=True
+        out = finalize_provider_blocks(
+            [],
+            ["step by step"],
+            has_tool_calls=True,
+            had_blank_ids=True,
+            registry=session._registry,
+            alias=session._model_alias or "",
         )
         assert [b["type"] for b in out] == ["reasoning_text"]

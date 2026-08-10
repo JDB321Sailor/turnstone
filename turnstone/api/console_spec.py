@@ -47,6 +47,7 @@ from turnstone.api.console_schemas import (
     CreateSkillRequest,
     CreateSkillResourceRequest,
     CreateToolPolicyRequest,
+    DeleteModelDefinitionResponse,
     DetectModelRequest,
     DetectModelResponse,
     ImportMcpConfigRequest,
@@ -72,8 +73,10 @@ from turnstone.api.console_schemas import (
     ListVerdictsResponse,
     McpReloadResponse,
     McpServerDetail,
+    ModelAuthConstraintsResponse,
     ModelCapabilitiesResponse,
     ModelDefinitionInfo,
+    ModelDefinitionWriteResponse,
     ModelReloadResponse,
     NodeDetailResponse,
     NodeMetadataResponse,
@@ -87,7 +90,9 @@ from turnstone.api.console_schemas import (
     RoleEffectiveResponse,
     RoleInfo,
     RoleOverridesRequest,
+    RouteCreateRequest,
     RouteCreateResponse,
+    RouteLiveResponse,
     RouteResponse,
     SetNodeMetadataValueRequest,
     SettingInfo,
@@ -136,11 +141,19 @@ from turnstone.api.schemas import (
     UserInfo,
 )
 from turnstone.api.server_schemas import (
+    ApproveRequest,
+    ApproveResponse,
+    CancelRequest,
+    CancelResponse,
+    CloseWorkstreamRequest,
+    CommandRequest,
     DequeueRequest,
     ListAttachmentsResponse,
     ListSkillSummaryResponse,
     ListWorkstreamsResponse,
     RewindRequest,
+    SendRequest,
+    SendResponse,
     SkillSummary,
     UploadAttachmentResponse,
     WorkstreamDetailResponse,
@@ -942,12 +955,22 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         tags=["Admin"],
     ),
     EndpointSpec(
+        "/v1/api/admin/model-definitions/auth-constraints",
+        "GET",
+        "Dynamic-auth affordance data for the model editor (requires admin.mcp)",
+        response_model=ModelAuthConstraintsResponse,
+        error_codes=[403],
+        tags=["Admin"],
+    ),
+    EndpointSpec(
         "/v1/api/admin/model-definitions",
         "POST",
         "Create a model definition",
         request_model=CreateModelDefinitionRequest,
-        response_model=ModelDefinitionInfo,
-        error_codes=[400, 409],
+        response_model=ModelDefinitionWriteResponse,
+        # 403: dynamic-auth writes escalate to admin.mcp (no service bypass),
+        # same as the auth-constraints sibling above.
+        error_codes=[400, 403, 409, 503],
         tags=["Admin"],
     ),
     EndpointSpec(
@@ -970,14 +993,17 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "PUT",
         "Update a model definition",
         request_model=UpdateModelDefinitionRequest,
-        response_model=ModelDefinitionInfo,
-        error_codes=[400, 404, 409],
+        response_model=ModelDefinitionWriteResponse,
+        # 403: auth-relevant edits escalate to admin.mcp (no service bypass),
+        # same as the auth-constraints sibling above.
+        error_codes=[400, 403, 404, 409, 503],
         tags=["Admin"],
     ),
     EndpointSpec(
         "/v1/api/admin/model-definitions/{definition_id}",
         "DELETE",
         "Delete a model definition",
+        response_model=DeleteModelDefinitionResponse,
         error_codes=[404],
         tags=["Admin"],
     ),
@@ -995,7 +1021,11 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "POST",
         "Calibrate a reranker model definition and persist its per-model floor",
         response_model=CalibrateModelResponse,
-        error_codes=[404],
+        # 409: the conditional persist yielded to sustained concurrent
+        # capabilities writes (bounded retries exhausted).
+        # 500: the calibration merge is verified against its confinement
+        # contract before the write; a violation refuses the persist.
+        error_codes=[404, 409, 500],
         tags=["Admin"],
     ),
     EndpointSpec(
@@ -1164,43 +1194,115 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/route/workstreams/new",
         "POST",
         "Create workstream via rendezvous routing proxy",
+        description=(
+            "The documented JSON form accepts RouteCreateRequest. The endpoint also "
+            "accepts multipart/form-data with a JSON `meta` field and file parts; "
+            "multipart callers must supply `ws_id` as a query parameter; the console "
+            "requires the cached `meta.ws_id` to match before forwarding the original "
+            "body. A JSON body may instead carry "
+            "an explicit `ws_id`; the console preserves it and uses it as the "
+            "rendezvous placement key. `resume_ws` accepts an id or saved alias and "
+            "is resolved to the canonical source id before an atomic fork is routed."
+        ),
+        request_model=RouteCreateRequest,
         response_model=RouteCreateResponse,
-        error_codes=[400, 503],
+        error_codes=[400, 403, 404, 409, 413, 429, 500, 502, 503],
+        query_params=[
+            QueryParam(
+                "ws_id",
+                (
+                    "32-hex rendezvous key required for multipart creates. JSON "
+                    "callers put an optional destination ws_id in the request body."
+                ),
+            )
+        ],
         tags=["Routing"],
     ),
     EndpointSpec(
-        "/v1/api/route/send",
+        "/v1/api/route/workstreams/{ws_id}/live",
+        "GET",
+        "Probe whether a routed workstream is loaded without rehydrating it",
+        description=(
+            "Routes to the workstream's rendezvous owner and checks its "
+            "manager-authoritative active list. The response does not expose "
+            "workstream metadata; missing, unloaded, creating, and "
+            "caller-invisible rows all report ``live=false``. Routing and "
+            "upstream uncertainty fail with an error rather than reporting a "
+            "false miss."
+        ),
+        response_model=RouteLiveResponse,
+        error_codes=[400, 502, 503],
+        tags=["Routing"],
+    ),
+    EndpointSpec(
+        "/v1/api/route/workstreams/{ws_id}/send",
         "POST",
         "Proxy send to routed node",
-        error_codes=[503],
+        request_model=SendRequest,
+        response_model=SendResponse,
+        error_codes=[400, 404, 409, 502, 503],
         tags=["Routing"],
     ),
     EndpointSpec(
-        "/v1/api/route/approve",
+        "/v1/api/route/workstreams/{ws_id}/send",
+        "DELETE",
+        "Proxy queued-message cancellation to routed node",
+        request_model=DequeueRequest,
+        response_model=StatusResponse,
+        error_codes=[400, 404, 502, 503],
+        tags=["Routing"],
+    ),
+    EndpointSpec(
+        "/v1/api/route/workstreams/{ws_id}/approve",
         "POST",
         "Proxy approve to routed node",
-        error_codes=[503],
+        request_model=ApproveRequest,
+        response_model=ApproveResponse,
+        error_codes=[400, 403, 404, 409, 502, 503],
         tags=["Routing"],
     ),
     EndpointSpec(
-        "/v1/api/route/cancel",
+        "/v1/api/route/workstreams/{ws_id}/cancel",
         "POST",
         "Proxy cancel to routed node",
-        error_codes=[503],
+        request_model=CancelRequest,
+        response_model=CancelResponse,
+        error_codes=[400, 404, 502, 503],
         tags=["Routing"],
     ),
     EndpointSpec(
         "/v1/api/route/command",
         "POST",
         "Proxy command to routed node",
-        error_codes=[503],
+        request_model=CommandRequest,
+        response_model=StatusResponse,
+        error_codes=[400, 404, 409, 502, 503],
         tags=["Routing"],
     ),
     EndpointSpec(
-        "/v1/api/route/workstreams/close",
+        "/v1/api/route/workstreams/{ws_id}/close",
         "POST",
         "Proxy workstream close to routed node",
-        error_codes=[503],
+        request_model=CloseWorkstreamRequest,
+        response_model=StatusResponse,
+        error_codes=[400, 403, 404, 502, 503],
+        tags=["Routing"],
+    ),
+    EndpointSpec(
+        "/v1/api/route/workstreams/{ws_id}/rewind",
+        "POST",
+        "Proxy conversation rewind to routed node",
+        request_model=RewindRequest,
+        response_model=StatusResponse,
+        error_codes=[400, 404, 502, 503],
+        tags=["Routing"],
+    ),
+    EndpointSpec(
+        "/v1/api/route/workstreams/{ws_id}/retry",
+        "POST",
+        "Proxy last-turn retry to routed node",
+        response_model=StatusResponse,
+        error_codes=[400, 404, 502, 503],
         tags=["Routing"],
     ),
     EndpointSpec(
@@ -1367,7 +1469,7 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
             "prompt."
         ),
         request_model=CoordinatorApproveRequest,
-        response_model=StatusResponse,
+        response_model=ApproveResponse,
         error_codes=[400, 403, 404, 409, 503],
         tags=["Coordinator"],
     ),
@@ -1376,11 +1478,14 @@ CONSOLE_ENDPOINTS: list[EndpointSpec] = [
         "POST",
         "Cancel in-flight generation on the coordinator session",
         description=(
-            "Drops the in-flight LLM call and unblocks any pending approval "
-            "or plan review.  The coordinator state moves to idle; storage "
-            "is preserved."
+            "Cooperatively stops the active generation and resolves every "
+            "pending approval cycle. Set ``force=true`` to retire a stuck "
+            "worker immediately. The response includes a redacted snapshot "
+            "of work dropped by the cancellation."
         ),
-        response_model=StatusResponse,
+        request_model=CancelRequest,
+        request_required=False,
+        response_model=CancelResponse,
         error_codes=[403, 404, 503],
         tags=["Coordinator"],
     ),
@@ -1629,6 +1734,15 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ConsoleCreateWsResponse,
     ConsoleHealthResponse,
     CoordinatorApproveRequest,
+    ApproveRequest,
+    ApproveResponse,
+    CancelRequest,
+    CancelResponse,
+    CloseWorkstreamRequest,
+    CommandRequest,
+    DequeueRequest,
+    SendRequest,
+    SendResponse,
     CoordinatorChildInfo,
     CoordinatorChildrenResponse,
     CoordinatorCloseAllChildrenRequest,
@@ -1686,14 +1800,17 @@ _ALL_MODELS: list[type[BaseModel]] = [
     ImportMcpConfigResponse,
     McpReloadResponse,
     ModelDefinitionInfo,
+    ModelDefinitionWriteResponse,
     CreateModelDefinitionRequest,
     UpdateModelDefinitionRequest,
     ListModelDefinitionsResponse,
+    ModelAuthConstraintsResponse,
     PersonaInfo,
     CreatePersonaRequest,
     UpdatePersonaRequest,
     ListPersonasResponse,
     ModelReloadResponse,
+    DeleteModelDefinitionResponse,
     DetectModelRequest,
     DetectModelResponse,
     CalibrateModelResponse,
@@ -1718,6 +1835,8 @@ _ALL_MODELS: list[type[BaseModel]] = [
     CreateSkillResourceRequest,
     ListSkillResourcesResponse,
     RouteResponse,
+    RouteLiveResponse,
+    RouteCreateRequest,
     RouteCreateResponse,
     SkillSummary,
     ListSkillSummaryResponse,

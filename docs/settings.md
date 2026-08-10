@@ -54,50 +54,131 @@ When a per-model override is `NULL` (empty in the UI), the global default is
 used. Switching models via `/model <alias>` re-resolves sampling parameters
 from the new model's overrides or global defaults.
 
+### Per-model concurrency
+
+Each model definition may set `max_concurrency` to limit simultaneous model
+generations for that alias in one Turnstone process. `0` or an omitted value
+means unlimited. The gate is shared by every role using the alias—interactive
+turns, coordinators, task agents, judges, output guards, perception, compaction,
+and title generation—and a streaming generation holds its slot until the
+stream is fully drained or closed.
+
+Admission is strictly per alias. Two aliases remain independent even when they
+point to the same URL; Turnstone does not infer shared capacity from endpoint
+text. Queue time is excluded from judge/output-guard deadline accounting, and
+each retry releases its slot before backoff and reacquires for the next wire
+attempt. The cap is local to each process, not cluster-wide; account for the
+number of nodes targeting the same inference server. Direct STT/TTS protocol
+calls and Cohere/Jina reranking do not currently consume this generation cap.
+
+### Judge batch parallelism
+
+`judge.parallel_evaluations` controls how many independent tool calls from one
+approval batch the intent judge evaluates concurrently. It is an integer from
+1 through 16 and defaults to 1, preserving serial evaluation until an operator
+opts into wider fan-out. Changes are hot-read at the next batch; work already
+in flight keeps its captured worker count.
+
+This is a per-batch fan-out setting, not another backend capacity limit. The
+judge model alias's `max_concurrency` gate still caps total generations across
+all judge batches and every other role using that alias. Actual overlap is
+therefore bounded by the batch size, `judge.parallel_evaluations`, and available
+alias admission slots. A smaller positive alias cap also narrows the batch's
+worker pool so excess judge threads do not queue ahead of later alias traffic.
+
 ### Model backend authentication
 
-Model definitions support three backend credential modes:
+Model definitions support four backend credential modes:
 
 | `auth_mode` | Identity sent to the model gateway |
 |-------------|------------------------------------|
 | `static` | The definition's stored `api_key`. |
 | `entra_obo` | A caller-delegated Entra access token minted from that user's captured OIDC credential. |
 | `entra_app` | A shared app-identity token minted with Turnstone's OIDC client credentials. |
+| `rfc8693_obo` | A caller-delegated access token minted from the captured credential via RFC 8693 token exchange, requesting the definition's `obo_scopes`. |
 
-Dynamic modes require an exact `obo_audience` resource App ID URI. Before an
+Dynamic modes require an exact `obo_audience` resource identifier. Before an
 admin can save one, an operator must add that literal audience to
 `model.auth_audience_allowlist` (comma- or newline-separated). Wildcards and
-base-URL host matching are intentionally unsupported. Changing dynamic auth,
-its audience, or the gateway `base_url` also requires `admin.mcp`; service
-tokens do not bypass this capability-escalation gate.
+base-URL host matching are intentionally unsupported, and a row whose
+effective mode is `static` refuses to store a new non-empty `obo_audience` on
+either create or update — an audience cannot be staged for a later flip
+(clearing a stale value, or re-saving it unchanged, stays allowed).
+`obo_scopes` follows the same staging rule with the mode set inverted: only
+`rfc8693_obo` reads it, so every other effective mode refuses to store a new
+non-empty value, while clearing or re-saving one unchanged stays open. The
+value itself is optional and shape-checked only — whether it satisfies the
+IdP is decided at mint time. On a row that is (or becomes) dynamic, every
+change except the tuning fields — context window, temperature, max tokens,
+reasoning effort, and the two reasoning-persistence toggles — also requires
+`admin.mcp`; service tokens do not bypass this capability-escalation gate.
+The one exception is de-escalation: a save whose only gated change is
+switching `enabled` off is a pure disable, needs only `admin.models`, and
+skips validation — a de-listed audience must never block disarming its own
+row. The gate is deny-by-default: a field counts as auth-relevant unless it
+is provably neutral, so re-enabling a disabled dynamic row, re-pointing its
+`base_url`, or swapping its provider or alias all escalate.
 
-`entra_app` is supported only with `[oidc] obo_grant_profile = "entra"`.
+Validation runs in two tiers, matching the MCP `oauth_obo` write rules. Row
+validity — the audience is allow-listed — applies to every gated write that
+touches a dynamic configuration, so a revoked audience can be neither silently
+re-pointed at a new `base_url` nor re-armed by an enable flip. Deployment
+posture — the token encryption key installed, single sign-on configured, and
+the grant profile valid and able to carry the mode — is checked when a write
+*chooses* the mode/audience pair and when it re-enables a disabled dynamic
+row (arming is the flip that resumes minting, so it must meet what minting
+needs); other edits to an existing row stay open if the deployment's posture
+changed after it was saved (its mints warn at runtime instead). Refusals name
+their cause and echo the configured value.
+
+One asymmetry to be aware of: the write path counts a transient discovery
+outage (`enabled=false`, retryable) as configured, but the mints themselves
+require discovery to have completed — a config saved during an outage starts
+minting only once any authenticated request heals discovery. Until then calls
+warn and follow the fail-open/fail-closed policy above.
+
+Every dynamic mode pairs with exactly one grant profile: `entra_obo` and
+`entra_app` require `[oidc] obo_grant_profile = "entra"`, and `rfc8693_obo`
+requires `"rfc8693"`. The pairing is enforced at the posture tier, so a row
+saved before the rule existed keeps accepting same-pair edits; its mints
+refuse at runtime with `cause=grant_profile_mismatch` and no IdP traffic.
 Judge, output-guard, perception, utility, and sub-agent lanes inherit the
-session's effective user for `entra_obo`. The perception memo is partitioned by
-that principal as well as alias and content hash, so a result authorized as one
-user cannot be served to another. Scheduled and wake-driven work retains the
-workstream owner even when no user is connected. Eval and optimizer lanes are
-registry-less development tools and therefore do not use dynamic model
-authentication.
+session's effective user for the delegated modes. The perception memo is
+partitioned by that principal as well as alias and content hash, so a result
+authorized as one user cannot be served to another. Scheduled and wake-driven
+work retains the workstream owner even when no user is connected. Eval and
+optimizer lanes are registry-less development tools and therefore do not use
+dynamic model authentication.
 
 `entra_app` is an explicit model-definition choice; Turnstone never changes a
-failed or ownerless `entra_obo` call into a client-credentials grant. An
-`entra_obo` call with no effective user always refuses. A dynamic alias without
-a real static key also always refuses instead of issuing its SDK-construction
-placeholder. When a real static key is explicitly configured, mint failures
-may use it by default; set `model.auth_fail_closed = true` to prohibit even that
-fallback. A refusal is not routed through the model fallback chain.
+failed or ownerless delegated call into a client-credentials grant. A
+delegated-mode call with no effective user always refuses. A dynamic alias
+without a real static key also always refuses instead of issuing its
+SDK-construction placeholder. When a real static key is explicitly configured,
+mint failures may use it by default; set `model.auth_fail_closed = true` to
+prohibit even that fallback. A refusal is not routed through the model
+fallback chain.
 
 Dynamic token caches are encrypted in `mcp_user_tokens`, shared across nodes,
 and memoized on each host. Unlinking a user's OIDC identity purges their
-`entra_obo` rows and memo entries. `entra_app` rows belong to the shared
+delegated-mode rows and memo entries. `entra_app` rows belong to the shared
 `__app__` identity and are not user-deprovisioned; after client-credential
 revocation, an already-minted app bearer remains usable until its recorded
 expiry.
 
-`obo_audience` is literal and capped at 2048 characters. Environment-variable
-expansion is deliberately not applied, so the allow-list decision cannot vary
-by node or expand beyond the persisted boundary.
+Each model call resolves its dynamic credential against the immutable model
+definition snapshot that supplied that call's provider, client, endpoint, and
+model ID. An admin edit can therefore never pair an old `base_url` with a new
+audience, grant mode, or static-key fallback input. The principal and token
+remain per-call/live; the connection and model-owned auth configuration move
+together as one binding on the next operation. The deployment-wide
+`model.auth_fail_closed` switch is intentionally read live on every mint, so an
+operator can tighten fallback policy immediately without rebuilding sessions.
+
+`obo_audience` and `obo_scopes` are literal and capped at 2048 characters
+each. Environment-variable expansion is deliberately not applied, so the
+allow-list decision cannot vary by node or expand beyond the persisted
+boundary.
 
 ### Responses output controls (per-model)
 
@@ -177,7 +258,7 @@ initialization:
 | `mcp` | config_path, registry_url |
 | `ratelimit` | enabled, requests_per_second, burst, trusted_proxies |
 | `health` | backend_probe_interval, backend_probe_timeout, circuit_breaker_threshold, circuit_breaker_cooldown |
-| `judge` | enabled, model, provider, base_url, api_key, confidence_threshold, max_context_ratio, timeout, read_only_tools, output_guard, redact_secrets, cancel_on_approval |
+| `judge` | enabled, model, smart_approvals, confidence_threshold, max_context_ratio, timeout, parallel_evaluations, read_only_tools, output_guard, output_guard_budget_seconds, output_guard_llm, output_guard_model, output_guard_llm_timeout, redact_secrets, cancel_on_approval |
 | `interface` | close_tab_action, theme |
 | `skills` | discovery_url |
 | `memory` | relevance_k, fetch_limit, max_content, nudge_cooldown, nudges |
@@ -354,13 +435,11 @@ Reset a setting to its registry default by removing it from storage.
 
 ## Secret Settings
 
-Settings with `is_secret=True` (currently only `judge.api_key`) are blocked
-from the write API with a `403` response. This prevents accidental exposure
-through the admin UI or audit logs. Secret settings must be configured via
-`config.toml` or environment variables.
-
-The list endpoint masks secret values: stored secrets appear as `"***"`
-rather than their actual value.
+The registry currently defines no production secret system setting. The generic
+machinery nevertheless treats any future `is_secret=True` entry as write-only:
+list and write responses return `"***"`, and submitting that sentinel preserves
+the stored value. Model API keys are fields on model definitions—not
+`judge.*` system settings—and use the Models tab's separate write-only flow.
 
 ---
 
@@ -381,9 +460,39 @@ reload.
 **Behavior after reload:**
 
 - New workstreams pick up updated values immediately (via `session_factory`)
-- Existing sessions keep their frozen configuration (settings are captured at
-  workstream creation time, not read on every turn)
+- Most workstream/session settings remain the snapshot captured at creation or
+  resume. Component docs call out deliberate live-read exceptions; for
+  example, Smart Approval settings are snapshotted coherently at the start of
+  each approval batch.
 - Settings marked `restart_required=True` need a server restart to take effect
+
+### Model-definition reloads
+
+The Models tab has a separate live-reload contract from ordinary ConfigStore
+settings. Existing sessions remember the concrete registry generation that
+supplied their active alias and re-resolve that alias at the start of the next
+send. Endpoint, provider, backend model ID, capabilities, extra parameters, and
+backend-auth configuration are replaced as one immutable binding. In-flight
+turns, judges, and task agents finish or cancel against the binding they
+started with; an admin edit never tears one request across two definitions.
+The alias's admission gate is retained and resized in place, so a concurrency
+edit preserves in-flight accounting and does not reset cached judges or the
+output-guard rate limiter.
+
+Sampling and other saved workstream configuration remain workstream state. A
+model-definition edit does not silently rewrite a live workstream's chosen
+temperature, reasoning effort, max tokens, skill, or persona. Use
+`/model <alias>` (or create/fork a workstream) when an explicit session-level
+model switch is intended.
+
+If a live workstream's alias is deleted, its next send first attempts the
+configured fallback chain. Without a usable fallback, the operator-facing
+error names the removed alias and points interactive users to `/model`; adding
+the alias back causes the next send to rebind without a process restart. If a
+replacement client cannot be constructed, Turnstone logs one
+`session.model_refresh_client_construction_failed` warning per registry
+generation and retries only after another model reload, avoiding a rebuild
+storm on every send.
 
 ---
 

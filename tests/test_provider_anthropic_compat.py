@@ -313,6 +313,19 @@ class TestCompatReasoningControl:
             "foo": 1,
         }
 
+    def test_utility_pin_survives_adaptive_injection(self) -> None:
+        """The exact pair ``lane_without_thinking`` relies on: an adaptive
+        model's injection always sends ``true``, but the utility lanes'
+        pinned ``false`` is already present in extra_params and existing
+        keys win — the pin reaches the wire."""
+        caps = dataclasses.replace(self._MANUAL_CAPS, thinking_mode="adaptive")
+        kwargs = self._stream_kwargs(
+            caps,
+            "high",
+            extra_params={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+
     def test_caller_extra_params_not_mutated(self) -> None:
         """The session's extra_params dict must never be written through."""
         extra = {"chat_template_kwargs": {"foo": 1}}
@@ -468,9 +481,11 @@ class TestCompatSessionPlumbing:
         registry = ModelRegistry(models={"vllm-messages": cfg}, default="vllm-messages")
         session = _make_session(registry=registry, model_alias="vllm-messages")
         provider = create_provider("anthropic-compatible")
-        caps = session._resolve_capabilities(
-            provider, "deepseek-ai/DeepSeek-V4-Flash", "vllm-messages"
-        )
+        lane = session._model_binding.lane
+        assert lane.provider is provider
+        assert lane.model == "deepseek-ai/DeepSeek-V4-Flash"
+        caps = lane.capabilities
+        assert caps is not None
         assert caps.supports_mid_conversation_system is True
         assert caps.context_window == 131072
         # Untouched fields keep the compat-lane defaults.
@@ -480,11 +495,16 @@ class TestCompatSessionPlumbing:
         assert caps.supports_vision is False
 
     def test_session_extra_params_gate(self, tmp_db: Any) -> None:
-        """server_compat extra_body forwards for the compat lane, not real Anthropic."""
+        """server_compat extra_body forwards for the compat lane, not real Anthropic.
+
+        The gate lives in ``model_turn.provider_extra_params`` (the session's
+        delegate wrapper retired with the #832 fold — the lane resolver is the
+        one caller now, so the pin asserts the module function directly).
+        """
         from turnstone.core.model_registry import ModelConfig, ModelRegistry
+        from turnstone.core.model_turn import provider_extra_params
         from turnstone.core.providers import create_provider
 
-        session = _make_session(reasoning_effort="medium")
         cfg = ModelConfig(
             alias="vllm-messages",
             base_url="http://localhost:8000",
@@ -493,14 +513,15 @@ class TestCompatSessionPlumbing:
             provider="anthropic-compatible",
             server_compat={"extra_body": {"chat_template_kwargs": {"thinking": False}}},
         )
-        session._registry = ModelRegistry(models={"vllm-messages": cfg}, default="vllm-messages")
-        session._model_alias = "vllm-messages"
+        registry = ModelRegistry(models={"vllm-messages": cfg}, default="vllm-messages")
 
-        session._provider = create_provider("anthropic-compatible")
-        assert session._provider_extra_params() == {"chat_template_kwargs": {"thinking": False}}
+        compat = create_provider("anthropic-compatible")
+        assert provider_extra_params(compat, registry, "vllm-messages") == {
+            "chat_template_kwargs": {"thinking": False}
+        }
 
-        session._provider = create_provider("anthropic")
-        assert session._provider_extra_params() is None
+        real = create_provider("anthropic")
+        assert provider_extra_params(real, registry, "vllm-messages") is None
 
 
 # ===========================================================================

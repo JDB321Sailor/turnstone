@@ -1,12 +1,13 @@
 """Shared session-test helpers.
 
-Two reasoning-test modules (``test_session_replay_reasoning.py`` and
-``test_session_synth_reasoning_block.py``) need the same minimal
-``ChatSession`` factory + a ``SessionUIBase`` no-op subclass.  Hoisting
-keeps a future third caller from drifting on the defaults — the third
-existing ``_make_session`` (``test_model_registry.py``) deliberately
-takes a different signature (registry / model_alias / reasoning_effort
-+ ``_FakeUI``) and is NOT a candidate for sharing this helper.
+The minimal ``ChatSession`` factory, the ``SessionUIBase`` no-op/recording
+subclasses, and the tree's standard streaming provider fakes
+(``make_result`` / ``arm_session`` / ``scripted_provider`` /
+``ArmedHandle``, at the bottom): every suite driving the streaming seam
+imports them from here, so the eager-arming contract lives in one place.
+The one deliberate exception, ``test_model_registry.py``'s
+``_make_session``, takes a different signature (registry / model_alias /
+reasoning_effort + ``_FakeUI``) and is NOT a candidate for sharing.
 
 Module is named with a leading underscore so pytest doesn't try to
 collect it as a test file — it's an importable utility, not a test.
@@ -14,14 +15,17 @@ collect it as a test file — it's an importable utility, not a test.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
-from turnstone.core.providers import StreamChunk, ToolCallDelta
+from turnstone.core.model_turn import ModelTurnResult, resolve_model_binding
+from turnstone.core.providers import ModelCapabilities, StreamChunk, ToolCallDelta, UsageInfo
 from turnstone.core.session import ChatSession
 from turnstone.core.session_ui_base import SessionUIBase
+from turnstone.core.trajectory import ProviderNative, ToolCall, Turn
 
 
 class NullUI(SessionUIBase):
@@ -30,6 +34,46 @@ class NullUI(SessionUIBase):
 
     def __init__(self) -> None:
         super().__init__()
+
+
+_UNCHANGED = object()
+
+
+def replace_session_lane(
+    session: Any,
+    *,
+    provider: Any = _UNCHANGED,
+    client: Any = _UNCHANGED,
+    model: Any = _UNCHANGED,
+    alias: Any = _UNCHANGED,
+    capabilities: Any = _UNCHANGED,
+) -> Any:
+    """Atomically replace selected facets of a test session's model lane.
+
+    Production sessions deliberately expose no mutable raw provider/client
+    slots. Tests that install a scripted provider use this one helper so their
+    setup follows the same whole-lane replacement rule as registry rebinding.
+    """
+    binding = session._model_binding
+    old_lane = binding.lane
+    next_provider = old_lane.provider if provider is _UNCHANGED else provider
+    next_model = old_lane.model if model is _UNCHANGED else model
+    if capabilities is _UNCHANGED:
+        next_capabilities = old_lane.capabilities
+        if provider is not _UNCHANGED:
+            next_capabilities = next_provider.get_capabilities(next_model)
+    else:
+        next_capabilities = capabilities
+    lane = dataclasses.replace(
+        old_lane,
+        provider=next_provider,
+        client=old_lane.client if client is _UNCHANGED else client,
+        model=next_model,
+        alias=old_lane.alias if alias is _UNCHANGED else alias,
+        capabilities=next_capabilities,
+    )
+    session._model_binding = dataclasses.replace(binding, lane=lane)
+    return lane
 
 
 def make_session(**kwargs: Any) -> ChatSession:
@@ -45,6 +89,20 @@ def make_session(**kwargs: Any) -> ChatSession:
         "tool_timeout": 30,
     }
     defaults.update(kwargs)
+    registry = defaults.get("registry")
+    model_alias = defaults.get("model_alias")
+    if registry is not None and model_alias and defaults.get("model_binding") is None:
+        binding = resolve_model_binding(
+            registry,
+            model_alias,
+            config_store=defaults.get("config_store"),
+        )
+        defaults["client"] = binding.lane.client
+        defaults["model"] = binding.lane.model
+        defaults["registry_generation"] = binding.registry_generation
+        defaults["model_binding"] = binding
+        if "context_window" not in kwargs and binding.config is not None:
+            defaults["context_window"] = binding.config.context_window
     return ChatSession(**defaults)
 
 
@@ -347,3 +405,252 @@ def as_stream(result: Any) -> list[StreamChunk]:
             provider_blocks=list(result.provider_blocks or []),
         )
     ]
+
+
+def think_tag_stream(utterance: str) -> list[StreamChunk]:
+    """``create_streaming`` return value simulating a passthrough server
+    that emits *utterance* — typically think-tag-bearing — as plain
+    streamed content.
+
+    The per-lane fixture for inline-reasoning dialect pins: lane tests
+    supply their own utterances (the dialect's SEMANTICS are specified
+    once, in ``tests._reasoning_dialect.CASES``, and pinned by the
+    one-shot suites — lane pins assert lane behavior, not tag grammar).
+    Routes through the real ``drain_stream`` seam exactly like
+    ``as_stream``.
+    """
+    return as_stream(mock_completion_result(content=utterance))
+
+
+def seam_provider(utterance: str, *, provider_name: str = "openai-compatible") -> MagicMock:
+    """Provider fake whose ``create_streaming`` replays *utterance* through
+    the REAL drain seam (``think_tag_stream``) — THE lane-suite seam fake.
+
+    One definition so the lane suites cannot drift when the provider
+    surface ``model_turn`` probes grows: real ``ModelCapabilities`` for
+    the clamp math, ``provider_name`` overridable per suite.
+
+    Assign the RETURNED fake to ``session._provider`` — never mutate the
+    provider a session resolved on its own: with a MagicMock client the
+    session resolves the process-wide ``create_provider(...)`` singleton,
+    and writing that shared instance's ``create_streaming`` poisons every
+    later session in the test run (the SSE-recovery e2e servers resolve
+    the same instance).
+    """
+    provider = provider_shell(provider_name)
+    provider.create_streaming = MagicMock(return_value=think_tag_stream(utterance))
+    return provider
+
+
+class RecordingUI:
+    """UI adapter recording the ordered event stream ``send()`` emits."""
+
+    def __init__(self):
+        self.events = []
+
+    def _rec(self, kind, detail=""):
+        self.events.append((kind, detail))
+
+    def on_turn_start(self):
+        self._rec("turn_start")
+
+    def on_turn_committed(self):
+        self._rec("turn_committed")
+
+    def on_stream_discarded(self):
+        self._rec("stream_discarded")
+
+    def on_thinking_start(self):
+        self._rec("thinking_start")
+
+    def on_thinking_stop(self):
+        self._rec("thinking_stop")
+
+    def on_reasoning_token(self, text):
+        self._rec("reasoning", text)
+
+    def on_content_token(self, text):
+        self._rec("content", text)
+
+    def on_stream_end(self):
+        self._rec("stream_end")
+
+    def approve_tools(self, items):
+        return True, None
+
+    def on_tool_result(self, call_id, name, output, **kwargs):
+        pass
+
+    def on_tool_output_chunk(self, call_id, chunk):
+        pass
+
+    def on_status(self, usage, context_window, effort):
+        pass
+
+    def on_info(self, message):
+        self._rec("info", message)
+
+    def on_error(self, message):
+        self._rec("error", message)
+
+    def on_state_change(self, state):
+        self._rec("state", state)
+
+    def on_rename(self, name):
+        pass
+
+    def on_output_warning(self, call_id, assessment):
+        pass
+
+    def record_output_assessment(
+        self,
+        call_id,
+        assessment,
+        *,
+        tier="heuristic",
+        reasoning="",
+        judge_model="",
+        latency_ms=0,
+        confidence=0.0,
+    ):
+        pass
+
+    def kinds(self):
+        return [k for k, _ in self.events]
+
+    def of(self, kind):
+        return [d for k, d in self.events if k == kind]
+
+
+# ---------------------------------------------------------------------------
+# Streaming provider fakes — the #832 seam contract
+# ---------------------------------------------------------------------------
+
+
+def make_result(
+    content: str = "",
+    *,
+    tool_calls: list[dict[str, Any]] | None = None,
+    finish_reason: str = "stop",
+    usage: UsageInfo | None = None,
+    native_blocks: list[dict[str, Any]] | None = None,
+    producer: str = "openai-compatible",
+    wire_msgs: list[dict[str, Any]] | None = None,
+) -> ModelTurnResult:
+    """A ``ModelTurnResult`` shaped like the streaming wrapper's return,
+    for tests that only need "a turn happened" and patch
+    ``_stream_response`` wholesale.  Turn and ``tool_calls`` mirror are
+    built from the same dicts, preserving the #825 pairing invariant."""
+    calls = list(tool_calls or [])
+    tc_tuple = tuple(
+        ToolCall(
+            id=tc.get("id", ""),
+            name=tc.get("function", {}).get("name", ""),
+            arguments=tc.get("function", {}).get("arguments", ""),
+        )
+        for tc in calls
+    )
+    native = (
+        ProviderNative(producer=producer, blocks=tuple(native_blocks)) if native_blocks else None
+    )
+    return ModelTurnResult(
+        turn=Turn.assistant(content, tool_calls=tc_tuple, native=native),
+        finish_reason=finish_reason,
+        usage=usage,
+        tool_calls=calls,
+        wire_msgs=wire_msgs,
+        producer=producer,
+    )
+
+
+class ArmedHandle:
+    """Closeable sentinel standing in for the SDK stream handle."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def provider_shell(
+    name: str = "openai-compatible",
+    retryable: frozenset[str] = frozenset({"IncompleteStreamError"}),
+) -> MagicMock:
+    """The armed-provider fake skeleton every streaming fake builds on:
+    provider_name / capabilities / retryable set.  ONE spelling, so a new
+    attribute the seam starts probing lands in every fake at once."""
+    provider = MagicMock()
+    provider.provider_name = name
+    provider.get_capabilities.return_value = ModelCapabilities()
+    provider.retryable_error_names = retryable
+    return provider
+
+
+def arm_session(
+    session: Any,
+    *streams: Any,
+    retryable: frozenset[str] = frozenset({"IncompleteStreamError"}),
+    name: str = "openai-compatible",
+) -> MagicMock:
+    """Install a sequential multi-turn armed provider fake on *session*.
+
+    Each ``create_streaming`` call serves the next element of *streams*:
+    an iterable/generator is armed (a closeable sentinel appended to
+    ``cancel_ref`` — the eager append every real adapter performs, which
+    the creation-vs-midstream classifier keys on) and returned to be
+    consumed once; an EXCEPTION instance is raised at create time WITHOUT
+    arming, a creation-phase failure the per-lane ladder owns.  Calls
+    beyond the script fail loudly: the strict finish gate rejects an
+    exhausted iterator rather than absorbing it as a silent empty turn,
+    so an under-scripted test must say so.
+
+    Title generation is latched off — with a provider-LEVEL fake the
+    best-effort title lane would otherwise consume the first script
+    before the main loop ran.
+    """
+    session._title_generated = True
+    provider = provider_shell(name, retryable)
+    # One handle PER CREATE (the real adapters' rule): `handles` records
+    # them all, `_armed_handle` is the latest.
+    provider._armed_handle = None
+    provider.handles = []
+    remaining = list(streams)
+
+    def _create(**kwargs: Any):
+        assert remaining, "arm_session: script exhausted — send looped for more turns than scripted"
+        nxt = remaining.pop(0)
+        if isinstance(nxt, BaseException):
+            raise nxt
+        ref = kwargs.get("cancel_ref")
+        if ref is not None:
+            handle = ArmedHandle()
+            provider.handles.append(handle)
+            provider._armed_handle = handle
+            ref.append(handle)
+        return iter(nxt) if not hasattr(nxt, "__next__") else nxt
+
+    provider.create_streaming = MagicMock(side_effect=_create)
+    replace_session_lane(session, provider=provider)
+    return provider
+
+
+def scripted_provider(chunks: list[StreamChunk]) -> MagicMock:
+    """Provider fake replaying *chunks*, arming ``cancel_ref`` eagerly.
+
+    Install with :func:`replace_session_lane` (never mutate a resolved
+    provider — the create_provider singleton rule above). Each call returns a FRESH
+    iterator over the same script so ladder tests re-drive it; the armed
+    handle is appended per call, matching the one-handle-per-create
+    behavior of every real adapter.
+    """
+    provider = provider_shell()
+
+    def _create(**kwargs: Any):
+        ref = kwargs.get("cancel_ref")
+        if ref is not None:
+            ref.append(ArmedHandle())
+        return iter(chunks)
+
+    provider.create_streaming = MagicMock(side_effect=_create)
+    return provider

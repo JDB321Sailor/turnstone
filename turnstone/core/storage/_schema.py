@@ -833,6 +833,7 @@ model_definitions = sa.Table(
     sa.Column("base_url", sa.Text, nullable=False, server_default=""),
     sa.Column("api_key", sa.Text, nullable=False, server_default=""),
     sa.Column("context_window", sa.Integer, nullable=False, server_default="32768"),
+    sa.Column("max_concurrency", sa.Integer, nullable=False, server_default="0"),
     sa.Column("capabilities", sa.Text, nullable=False, server_default="{}"),
     sa.Column("enabled", sa.Integer, nullable=False, server_default="1"),
     sa.Column("temperature", sa.Float, nullable=True),
@@ -840,11 +841,13 @@ model_definitions = sa.Table(
     sa.Column("reasoning_effort", sa.Text, nullable=True),
     sa.Column("surface_persisted_reasoning", sa.Integer, nullable=False, server_default="1"),
     sa.Column("replay_reasoning_to_model", sa.Integer, nullable=False, server_default="0"),
-    # Backend-gateway credential mode. "static" sends api_key, "entra_obo"
-    # mints a delegated-user token, and "entra_app" mints a shared app token
-    # for ``obo_audience`` at call time (migration 068).
+    # Backend-gateway credential mode. "static" sends api_key; "entra_obo" /
+    # "rfc8693_obo" mint a delegated-user token and "entra_app" a shared app
+    # token for ``obo_audience`` at call time (migration 068). ``obo_scopes``
+    # is the rfc8693 exchange-leg scope request (migration 069).
     sa.Column("auth_mode", sa.Text, nullable=False, server_default="static"),
     sa.Column("obo_audience", sa.Text, nullable=False, server_default=""),
+    sa.Column("obo_scopes", sa.Text, nullable=False, server_default=""),
     sa.Column("created_by", sa.Text, nullable=False, server_default=""),
     sa.Column("created", sa.Text, nullable=False),
     sa.Column("updated", sa.Text, nullable=False),

@@ -7,21 +7,230 @@ resilience when the primary model is unreachable.
 
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+from turnstone.core.admission import ModelAdmission
 from turnstone.core.config import load_config
 from turnstone.core.log import get_logger
 from turnstone.core.providers import LLMProvider, create_client, create_provider
 
 log = get_logger(__name__)
 
-MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app"})
+MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app", "rfc8693_obo"})
+
+# One bound for the backend-auth text columns (obo_audience, obo_scopes),
+# shared with the console write path's cleaner so the two layers cannot
+# drift into "console stores it, registry refuses to load it".
+MODEL_AUTH_TEXT_MAX_LEN = 2048
+
+# ``model_definitions.max_concurrency`` is an ``INTEGER`` on both supported
+# databases.  Keep the public/config/API bound aligned with PostgreSQL's
+# signed 32-bit representation so a value accepted on SQLite cannot fail when
+# the same definition is moved to PostgreSQL.
+MAX_MODEL_CONCURRENCY = 2_147_483_647
+
+# Derived, never hand-listed (fail-safe defaults): any mode later added to
+# MODEL_AUTH_MODES lands in this set BY CONSTRUCTION unless it is literally
+# "static", so membership tests fail CLOSED for modes nobody classified.
+# Import THIS wherever "is a dynamic auth mode" is asked; a hand-spelled
+# tuple is a drift seam where one missed site classifies a new mode as
+# static and skips the write gate entirely.
+DYNAMIC_MODEL_AUTH_MODES = frozenset(MODEL_AUTH_MODES) - {"static"}
+
+# Modes whose mint reads ``obo_scopes`` (the RFC 8693 exchange-leg scope
+# request). The console write path refuses a NEW non-empty obo_scopes on any
+# other mode, and the session dispatch passes scopes to the mint only for
+# members, so a value stored outside this set is inert by construction.
+SCOPES_MODEL_AUTH_MODES = frozenset({"rfc8693_obo"})
+
+# Modes that mint as the deployment's own app identity — no acting user
+# required. Every OTHER dynamic mode delegates the acting user's credential,
+# so the session's no-user-context refusal derives from this set's
+# complement: an unclassified future mode demands a user and fails closed
+# (loudly wrong for an app-identity mode, silently unsafe never).
+APP_IDENTITY_MODEL_AUTH_MODES = frozenset({"entra_app"})
+
+# Required ``[oidc] obo_grant_profile`` per dynamic mode — the type-pairing
+# the console validator enforces when a write CHOOSES a pair, and the grant
+# leg the session pins at mint time. Values are spelled as literals rather
+# than imported from mcp_oauth's OBO_GRANT_PROFILES: lightweight consumers
+# import this module and must not pull the mint stack with it; the
+# registry-vs-legs agreement (and full coverage of the dynamic set) is
+# pinned by test_model_auth_mode_profile_map_matches_mint_legs.
+MODEL_AUTH_MODE_PROFILES: Mapping[str, str] = MappingProxyType(
+    {
+        "entra_obo": "entra",
+        "entra_app": "entra",
+        "rfc8693_obo": "rfc8693",
+    }
+)
+
+
+def _is_dynamic_auth_mode(mode: str) -> bool:
+    """The one in-module spelling of "this mode mints at runtime".
+
+    ``has_dynamic_auth`` (boot-guard input) and :func:`dynamic_auth_key_error`
+    (install/swap-guard input) both delegate here, so the two guards cannot
+    disagree about which registries need the encryption key.
+    """
+    return mode in DYNAMIC_MODEL_AUTH_MODES
 
 
 class ModelAuthConfigError(ValueError):
     """A model definition contains unsafe or internally inconsistent auth settings."""
+
+
+class ModelConcurrencyConfigError(ValueError):
+    """A model definition has an invalid per-alias concurrency limit."""
+
+
+class ModelClientConstructionError(ValueError):
+    """A registry alias exists but its binding could not be constructed.
+
+    Covers BOTH construction legs: the SDK client (``create_client``) and
+    the provider adapter (``create_provider`` refusing the row's provider /
+    api_surface pairing, re-typed in :meth:`ModelRegistry.resolve_binding`).
+
+    A ``ValueError`` subclass so the HTTP routes' existing ValueError arms keep
+    mapping it unchanged, while in-process callers — the session bind path —
+    can distinguish :class:`UnknownModelAliasError` from "the alias is present
+    but its binding cannot be built" and surface the construction cause.
+    Conflating the two gave self-contradictory diagnoses, e.g. a ``/model``
+    switch reporting the alias unknown while listing it as available.
+    """
+
+
+class UnknownModelAliasError(ValueError):
+    """A registry lookup named an alias that is not present.
+
+    The ``ValueError`` base preserves route and caller compatibility while the
+    structured ``alias`` field lets lifecycle code distinguish an alias-removal
+    race from unrelated validation failures without parsing exception text.
+    """
+
+    def __init__(self, alias: str) -> None:
+        self.alias = alias
+        super().__init__(f"Unknown model alias: {alias}")
+
+
+class DynamicAuthKeyError(RuntimeError):
+    """A registry install or swap was refused: dynamic auth present, key absent.
+
+    Deliberately NOT a ``ValueError``: the node reload endpoint maps
+    ``ValueError`` to 422 (bad registry arguments), while this is a 503-class
+    deployment fault — the same classification the console write validator
+    gives the identical state. A distinct type keeps the two exits from being
+    conflated by a broad ``except`` arm.
+    """
+
+
+# Pre-lifespan swaps only. The node builds and re-shapes its registry in
+# ``main()`` before the app exists, so there is no token store to check yet —
+# ``initialize_mcp_crypto_state`` (SystemExit at boot) owns key enforcement
+# for that process phase moments later. Passing this sentinel says exactly
+# that and nothing else: every post-lifespan caller hands the real
+# ``app.state`` so :meth:`ModelRegistry.reload` can refuse. The parameter is
+# required rather than defaulted so a new call site must actively choose —
+# fail-safe defaults, not fail-open ones.
+KEY_GUARD_DEFERRED_TO_LIFESPAN: Any = object()
+
+
+def dynamic_auth_key_error(models: Mapping[str, ModelConfig], app_state: Any) -> str:
+    """The dynamic-auth key requirement, shared by every install/swap site.
+
+    One derivation so no two sites can drift: a registry carrying
+    dynamic-auth aliases must not become live on a host whose token store is
+    absent, or every mint fails per-call while the operator sees nothing.
+    Used by the swap chokepoint in :meth:`ModelRegistry.reload` and by the
+    console's first-install bootstrap paths. Returns ``""`` when permitted,
+    else the refusal message. Token-store presence is process-constant, so a
+    refusal here is stable until restart.
+    """
+    if not any(_is_dynamic_auth_mode(cfg.auth_mode) for cfg in models.values()):
+        return ""
+    if getattr(app_state, "mcp_token_store", None) is not None:
+        return ""
+    # Function-local: model_registry is imported by lightweight consumers
+    # that never touch crypto; keep the cryptography dependency off this
+    # module's import graph.
+    from turnstone.core.mcp_crypto import STARTUP_KEY_REQUIRED_HINT
+
+    # Mode list derived from the frozenset above, so a fourth dynamic mode
+    # cannot make this refusal name only the modes it was written against.
+    return (
+        f"dynamic model auth ({'/'.join(sorted(DYNAMIC_MODEL_AUTH_MODES))}) "
+        "is configured but " + STARTUP_KEY_REQUIRED_HINT
+    )
+
+
+def profile_mismatched_aliases(
+    models: Mapping[str, ModelConfig], obo_grant_profile: str
+) -> list[tuple[str, str, str]]:
+    """Dynamic aliases whose mode's paired profile is not *obo_grant_profile*.
+
+    Pure projection for the swap/boot visibility warnings: such a row is
+    legal to keep (same-pair edits and re-arms pass the write validator) but
+    can never mint on this deployment — its mint refuses with
+    ``grant_profile_mismatch``. Returns sorted ``(alias, auth_mode,
+    required_profile)``. Static and unmapped modes are skipped: static never
+    mints, and an unmapped dynamic mode is refused at pair-choose and fails
+    closed at dispatch, so neither is a *profile* mismatch.
+    """
+    rows = [
+        (alias, cfg.auth_mode, MODEL_AUTH_MODE_PROFILES[cfg.auth_mode])
+        for alias, cfg in models.items()
+        if cfg.auth_mode in DYNAMIC_MODEL_AUTH_MODES
+        and cfg.auth_mode in MODEL_AUTH_MODE_PROFILES
+        and MODEL_AUTH_MODE_PROFILES[cfg.auth_mode] != obo_grant_profile
+    ]
+    return sorted(rows)
+
+
+def warn_profile_mismatched_aliases(models: Mapping[str, ModelConfig], app_state: Any) -> None:
+    """Warn for every alias whose mode can never mint on this deployment.
+
+    The one spelling of the visibility pass both swap surfaces run —
+    :meth:`ModelRegistry.reload` and the lifespan boot — so the wording and
+    the profile extraction cannot drift. Not a gate: such a row stays legal
+    to keep (same-pair edits pass the write validator), but its mint always
+    refuses. No-op unless OIDC is ENABLED and names a grant profile: the
+    runtime refuses at the enabled check first (the loaded config defaults
+    ``obo_grant_profile`` even when OIDC is off), so a mismatch warning on a
+    disabled deployment would name a remedy — flip the profile — that cannot
+    make the alias mint. The named cause matches what the alias's mint
+    actually records at refusal: the app-identity mint refuses a non-entra
+    profile as ``unsupported_grant_profile``; the delegated legs refuse as
+    ``grant_profile_mismatch`` — so an operator can grep the runtime
+    heartbeat for exactly the token this warning names.
+    """
+    oidc_config = getattr(app_state, "oidc_config", None)
+    if oidc_config is None or not getattr(oidc_config, "enabled", False):
+        return
+    profile = str(getattr(oidc_config, "obo_grant_profile", "") or "")
+    if not profile:
+        return
+    for alias, mode, required in profile_mismatched_aliases(models, profile):
+        cause = (
+            "unsupported_grant_profile"
+            if mode in APP_IDENTITY_MODEL_AUTH_MODES
+            else "grant_profile_mismatch"
+        )
+        log.warning(
+            "model alias %r auth_mode %r requires obo_grant_profile=%r "
+            "(configured: %r) — it will not mint (cause=%s)",
+            alias,
+            mode,
+            required,
+            profile,
+            cause,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -56,21 +265,111 @@ class ModelConfig:
     server_compat: dict[str, Any] = field(default_factory=dict)
     # Backend credential mode. ``static`` (default) sends ``api_key`` unchanged;
     # ``entra_obo`` mints a caller-delegated Entra token; ``entra_app`` mints a
-    # shared app-identity token. Dynamic tokens are bound as the SDK credential
-    # (x-api-key for Anthropic surfaces, Authorization: Bearer for OpenAI-style).
-    # ``obo_audience`` is the exact operator-approved resource App ID URI.
+    # shared app-identity token; ``rfc8693_obo`` mints a caller-delegated token
+    # via RFC 8693 token exchange. Dynamic tokens are bound as the SDK
+    # credential (x-api-key for Anthropic surfaces, Authorization: Bearer for
+    # OpenAI-style). ``obo_audience`` is the exact operator-approved resource
+    # identifier; ``obo_scopes`` is the space-separated scope list the
+    # rfc8693 exchange leg requests (inert for every other mode).
     auth_mode: str = "static"
     obo_audience: str = ""
+    obo_scopes: str = ""
+    # Per-process admission limit for this alias.  Zero preserves the
+    # historical unlimited behavior.  Operational admission changes do not
+    # change binding identity, hence ``compare=False``.
+    max_concurrency: int = field(default=0, compare=False)
+
+    def __post_init__(self) -> None:
+        # ``bool`` is an ``int`` subclass, so use exact type equality.  A
+        # permissive coercion here could turn ``true`` into a one-request cap
+        # or a typo into unlimited operation.
+        if (
+            type(self.max_concurrency) is not int
+            or self.max_concurrency < 0
+            or self.max_concurrency > MAX_MODEL_CONCURRENCY
+        ):
+            raise ModelConcurrencyConfigError(
+                f"Model {self.alias!r} max_concurrency must be an integer "
+                f"between 0 and {MAX_MODEL_CONCURRENCY}"
+            )
 
 
-def _normalize_auth_mode(alias: str, mode: Any, audience: Any) -> tuple[str, str]:
+def strip_control_characters(value: str) -> str:
+    """Remove every C0 (U+0000–U+001F) and DEL (U+007F) character.
+
+    The ONE spelling of the control-character class every backend-auth text
+    surface guards — the scopes sanitize below, the registry's refuse
+    predicate, the mint entry points' audience/alias hygiene, and the
+    console's OAuth text cleaner all delegate here, so a later widening of
+    the class (or a narrowing) lands everywhere at once instead of silently
+    splitting the write path's strip from the load path's refusal.
+    """
+    return "".join(ch for ch in value if ord(ch) >= 32 and ord(ch) != 127)
+
+
+def sanitize_backend_auth_scopes(value: Any) -> str:
+    """The ONE spelling of the backend-auth scopes sanitize.
+
+    The sanctioned separators — tab, newline, CR — read as spaces FIRST
+    (stripping a tab-separated list outright would CONCATENATE the scopes
+    the tab separates), then every remaining C0/DEL control character is
+    stripped, and finally whitespace runs collapse to single spaces. The
+    separator vocabulary deliberately matches the registry guard's: the C0
+    separator block (U+001C–U+001F) is a CONTROL here, never a separator —
+    a bare ``str.split()`` would silently promote it to one — so a control
+    byte inside a token strips-and-joins rather than splitting the token
+    into two valid-looking scopes. No length cap and no refusal — policy
+    (caps, and refuse-vs-strip on garbage) stays with each consuming
+    layer; this function only fixes the shared spelling those policies
+    measure, so the console store, the registry load, and the mint request
+    can never disagree on what a scopes value *is*.
+    """
+    blessed = re.sub(r"[\t\n\r]", " ", str(value or ""))
+    return " ".join(strip_control_characters(blessed).split())
+
+
+def _check_auth_text(alias: str, field: str, value: str) -> None:
+    """Refuse control characters and over-length in a backend-auth text field.
+
+    The registry's REFUSE policy, shared by the audience and scopes arms of
+    :func:`_normalize_auth_mode` so the two cannot drift on wording or
+    bounds: the write path sanitizes, this layer refuses what sanitization
+    would have prevented, so DB-direct garbage fails loud rather than
+    loading.
+    """
+    if strip_control_characters(value) != value:
+        raise ModelAuthConfigError(f"Model '{alias}' {field} contains control characters")
+    if len(value) > MODEL_AUTH_TEXT_MAX_LEN:
+        raise ModelAuthConfigError(
+            f"Model '{alias}' {field} exceeds {MODEL_AUTH_TEXT_MAX_LEN} characters"
+        )
+
+
+def _normalize_auth_mode(
+    alias: str, mode: Any, audience: Any, scopes: Any = ""
+) -> tuple[str, str, str]:
     """Validate and normalize one model's backend-auth configuration.
 
     DB and config.toml rows share this path so a typo cannot silently downgrade
-    dynamic authentication to a static key. Audience values remain literal:
-    environment expansion would make authorization node-dependent and could
-    bypass the admin allow-list and length boundary.
+    dynamic authentication to a static key. Audience and scope values remain
+    literal: environment expansion would make authorization node-dependent and
+    could bypass the admin allow-list and length boundary.
+
+    ``obo_scopes`` gets shape checks only, and — like the audience's shape
+    checks — they run REGARDLESS of auth_mode: the write path sanitizes,
+    this layer refuses what sanitization would have prevented, so DB-direct
+    garbage fails loud rather than loading. What IS mode-tolerant is the
+    coupling: a stored value on a mode outside SCOPES_MODEL_AUTH_MODES is
+    accepted exactly like a stale audience on a static row — the console
+    refuses NEW staging, an already-stored value must not make the alias
+    unloadable, and the dispatch never reads it, so it is inert.
     """
+    # The alias is the identity every mint-cache, cooldown, cause and purge
+    # key derives from, so it takes the same refuse-not-strip guard as the
+    # auth text fields: a control-bearing alias would silently collide with
+    # its stripped twin at the key builders (which strip controls as a
+    # raw-caller seam), merging two definitions onto one identity.
+    _check_auth_text(alias, "alias", str(alias or ""))
     normalized_mode = str(mode or "static").strip() or "static"
     normalized_audience = str(audience or "").strip()
     if normalized_mode not in MODEL_AUTH_MODES:
@@ -82,11 +381,21 @@ def _normalize_auth_mode(alias: str, mode: Any, audience: Any) -> tuple[str, str
         raise ModelAuthConfigError(
             f"Model '{alias}' requires obo_audience when auth_mode is {normalized_mode!r}"
         )
-    if any(ord(ch) < 32 or ord(ch) == 127 for ch in normalized_audience):
-        raise ModelAuthConfigError(f"Model '{alias}' obo_audience contains control characters")
-    if len(normalized_audience) > 2048:
-        raise ModelAuthConfigError(f"Model '{alias}' obo_audience exceeds 2048 characters")
-    return normalized_mode, normalized_audience
+    _check_auth_text(alias, "obo_audience", normalized_audience)
+    # The guard sees the separator-tolerated spelling, NOT the sanitized
+    # one: the sanctioned separators — tab/newline/CR, the config spellings
+    # the corpus blesses — read as collapsed spaces, while every OTHER C0
+    # byte stays visible for the refusal. A bare str.split() would swallow
+    # the C0 separator block (U+001C–U+001F counts as Python whitespace)
+    # before the guard could see it, silently loading bytes the write path
+    # could never have stored (pinned:
+    # test_obo_scopes_normalizers_agree_across_modules). Once the guard
+    # passes, the spellings converge, so the returned value routes through
+    # the shared transform.
+    tolerated = re.sub(r"[ \t\n\r]+", " ", str(scopes or "")).strip()
+    _check_auth_text(alias, "obo_scopes", tolerated)
+    normalized_scopes = sanitize_backend_auth_scopes(scopes)
+    return normalized_mode, normalized_audience, normalized_scopes
 
 
 def _api_surface_of(cfg: ModelConfig) -> str | None:
@@ -173,74 +482,100 @@ class ModelRegistry:
         self.task_effort = task_effort
         self._clients: dict[str, Any] = {}
         self._providers: dict[str, LLMProvider] = {}
+        self._admissions = {
+            alias: ModelAdmission(alias, int(getattr(cfg, "max_concurrency", 0)))
+            for alias, cfg in self._models.items()
+        }
         self._client_lock = threading.Lock()
+        # Monotone count of completed reload() swaps. A counter, not a field
+        # diff: sessions re-resolve on ANY difference at the next send, so an
+        # in-place swap propagates even when the backend model id is
+        # unchanged, and future auth-relevant columns are covered by
+        # construction.
+        self._generation = 0
 
     # -- query methods -------------------------------------------------------
 
     def get_client(self, alias: str) -> Any:
         """Get or lazily create an API client for *alias*. Thread-safe."""
         with self._client_lock:
-            if alias not in self._models:
-                raise ValueError(f"Unknown model alias: {alias}")
-            if alias not in self._clients:
-                cfg = self._models[alias]
-                # An entra_obo / entra_app backend authenticates per-call via a
-                # minted token bound with ``client.with_options(api_key=...)``, so
-                # the cached client only needs to CONSTRUCT — feed a placeholder
-                # when no static fallback key is set (the SDKs reject an empty key
-                # that also has no env fallback).  The real credential is supplied
-                # per call and never rides on this base client object.
-                client_key = cfg.api_key
-                if not client_key and cfg.auth_mode in ("entra_obo", "entra_app"):
-                    client_key = "backend-auth-placeholder-unused"
-                try:
-                    self._clients[alias] = create_client(
-                        cfg.provider, base_url=cfg.base_url, api_key=client_key
-                    )
-                except ValueError:
-                    # create_client's own misconfig errors already carry
-                    # remediation text — pass through untouched.
-                    raise
-                except Exception as exc:
-                    # SDK construction can fail on environment problems the
-                    # config never sees — e.g. httpx resolving a CA-bundle
-                    # path that a venv rebuild deleted (FileNotFoundError).
-                    # Routes map ValueError to a 503 with the message;
-                    # anything else surfaces as an opaque 500, so re-type
-                    # here where the alias is known.  The ValueError text is
-                    # echoed to HTTP callers, so it carries only the
-                    # exception TYPE — arbitrary SDK exception text can
-                    # embed filesystem paths; the full detail goes to the
-                    # server log instead.
-                    log.warning(
-                        "Client construction failed for model alias %r (provider %s)",
-                        alias,
-                        cfg.provider,
-                        exc_info=True,
-                    )
-                    raise ValueError(
-                        f"failed to construct {cfg.provider} client for model "
-                        f"alias {alias!r}: {type(exc).__name__} (details in server log)"
-                    ) from exc
-            return self._clients[alias]
+            return self._get_client_locked(alias)
+
+    def _get_client_locked(self, alias: str) -> Any:
+        """``get_client`` body; the caller holds ``_client_lock``."""
+        if alias not in self._models:
+            raise UnknownModelAliasError(alias)
+        if alias not in self._clients:
+            cfg = self._models[alias]
+            # An entra_obo / entra_app backend authenticates per-call via a
+            # minted token bound with ``client.with_options(api_key=...)``, so
+            # the cached client only needs to CONSTRUCT — feed a placeholder
+            # when no static fallback key is set (the SDKs reject an empty key
+            # that also has no env fallback).  The real credential is supplied
+            # per call and never rides on this base client object.
+            client_key = cfg.api_key
+            if not client_key and _is_dynamic_auth_mode(cfg.auth_mode):
+                client_key = "backend-auth-placeholder-unused"
+            try:
+                self._clients[alias] = create_client(
+                    cfg.provider, base_url=cfg.base_url, api_key=client_key
+                )
+            except ValueError as exc:
+                # create_client's own misconfig errors already carry
+                # remediation text — keep the message verbatim, add the
+                # type so callers can tell "construction failed" from
+                # "alias missing".
+                raise ModelClientConstructionError(str(exc)) from exc
+            except Exception as exc:
+                # SDK construction can fail on environment problems the
+                # config never sees — e.g. httpx resolving a CA-bundle
+                # path that a venv rebuild deleted (FileNotFoundError).
+                # Routes map ValueError to a 503 with the message;
+                # anything else surfaces as an opaque 500, so re-type
+                # here where the alias is known.  The message text is
+                # echoed to HTTP callers, so it carries only the
+                # exception TYPE — arbitrary SDK exception text can
+                # embed filesystem paths; the full detail goes to the
+                # server log instead.
+                log.warning(
+                    "Client construction failed for model alias %r (provider %s)",
+                    alias,
+                    cfg.provider,
+                    exc_info=True,
+                )
+                raise ModelClientConstructionError(
+                    f"failed to construct {cfg.provider} client for model "
+                    f"alias {alias!r}: {type(exc).__name__} (details in server log)"
+                ) from exc
+        return self._clients[alias]
 
     def get_provider(self, alias: str) -> LLMProvider:
         """Get the ``LLMProvider`` for *alias*. Thread-safe, cached."""
         with self._client_lock:
-            if alias not in self._models:
-                raise ValueError(f"Unknown model alias: {alias}")
-            if alias not in self._providers:
-                cfg = self._models[alias]
-                self._providers[alias] = create_provider(
-                    cfg.provider, api_surface=_api_surface_of(cfg)
-                )
-            return self._providers[alias]
+            return self._get_provider_locked(alias)
+
+    def _get_provider_locked(self, alias: str) -> LLMProvider:
+        """``get_provider`` body; the caller holds ``_client_lock``."""
+        if alias not in self._models:
+            raise UnknownModelAliasError(alias)
+        if alias not in self._providers:
+            cfg = self._models[alias]
+            self._providers[alias] = create_provider(cfg.provider, api_surface=_api_surface_of(cfg))
+        return self._providers[alias]
 
     def get_config(self, alias: str) -> ModelConfig:
         """Return the ModelConfig for *alias*."""
         if alias not in self._models:
-            raise ValueError(f"Unknown model alias: {alias}")
+            raise UnknownModelAliasError(alias)
         return self._models[alias]
+
+    def get_admission(self, alias: str) -> ModelAdmission:
+        """Return the stable per-alias admission gate."""
+        with self._client_lock:
+            gate = self._admissions.get(alias)
+            if gate is None:
+                raise UnknownModelAliasError(alias)
+            return gate
 
     def has_alias(self, alias: str) -> bool:
         """Check if *alias* exists in the registry."""
@@ -248,20 +583,64 @@ class ModelRegistry:
 
     def has_dynamic_auth(self) -> bool:
         """Return whether any alias needs a runtime-minted backend credential."""
-        return any(cfg.auth_mode != "static" for cfg in self._models.values())
+        return any(_is_dynamic_auth_mode(cfg.auth_mode) for cfg in self._models.values())
 
     def list_aliases(self) -> list[str]:
         """Return all registered model aliases."""
         return list(self._models.keys())
 
-    def resolve(self, alias: str | None = None) -> tuple[Any, str, ModelConfig]:
-        """Resolve *alias* to ``(client, model_name, config)``.
+    def resolve(self, alias: str | None = None) -> tuple[Any, str, ModelConfig, int]:
+        """Resolve *alias* to ``(client, model_name, config, generation)``.
 
-        Uses the default alias when *alias* is ``None``.
+        Uses the default alias when *alias* is ``None``. One lock
+        acquisition, so config, client and generation all come from the same
+        registry snapshot and a caller stamping the returned generation
+        beside the returned client holds an exactly-paired binding.
         """
-        alias = alias or self.default
-        cfg = self.get_config(alias)
-        return self.get_client(alias), cfg.model, cfg
+        with self._client_lock:
+            alias = alias or self.default
+            cfg = self._models.get(alias)
+            if cfg is None:
+                raise UnknownModelAliasError(alias)
+            return self._get_client_locked(alias), cfg.model, cfg, self._generation
+
+    def resolve_binding(
+        self, alias: str | None = None
+    ) -> tuple[Any, str, ModelConfig, LLMProvider, ModelAdmission, int]:
+        """Resolve client, model, config, provider, admission, and generation.
+
+        The session bind primitive: everything a rebind commits, read under
+        ONE lock acquisition, so a :meth:`reload` landing between separate
+        ``resolve()`` / ``get_provider()`` calls cannot tear the binding by
+        pairing old-map client and config with a new-map provider. The
+        generation is read in the same hold, so the caller's stamp is
+        exactly the snapshot its binding came from.
+
+        Provider-leg construction failures are re-typed to
+        :class:`ModelClientConstructionError`, matching the client leg: the
+        alias provably exists here, so a plain ``ValueError`` would be
+        misread by the bind path as alias-missing.
+        """
+        with self._client_lock:
+            alias = alias or self.default
+            cfg = self._models.get(alias)
+            if cfg is None:
+                raise UnknownModelAliasError(alias)
+            client = self._get_client_locked(alias)
+            try:
+                provider = self._get_provider_locked(alias)
+            except ModelClientConstructionError:
+                raise
+            except ValueError as exc:
+                raise ModelClientConstructionError(str(exc)) from exc
+            return (
+                client,
+                cfg.model,
+                cfg,
+                provider,
+                self._admissions[alias],
+                self._generation,
+            )
 
     def resolve_agent_alias(self, kind: str) -> str | None:
         """Return the configured alias for a sub-agent ``kind``.
@@ -294,6 +673,16 @@ class ModelRegistry:
         return len(self._models)
 
     @property
+    def generation(self) -> int:
+        """Monotone count of completed :meth:`reload` swaps.
+
+        Consumers compare by EQUALITY against the generation their binding
+        was resolved from; any difference means "re-resolve everything
+        derived from here". Never compare by ordering.
+        """
+        return self._generation
+
+    @property
     def models(self) -> dict[str, ModelConfig]:
         """Return a copy of the models dict (public accessor for reload)."""
         return dict(self._models)
@@ -306,16 +695,55 @@ class ModelRegistry:
         default: str,
         fallback: list[str] | None = None,
         agent_model: str | None = None,
+        *,
+        app_state: Any,
         task_model: str | None = None,
         task_effort: str | None = None,
     ) -> None:
         """Hot-reload all model configs. Thread-safe; clears cached clients.
 
+        THE model-registry swap chokepoint (complete mediation): every
+        live-registry swap on every host routes through here, so the
+        dynamic-auth-needs-key refusal below cannot be forgotten at a call
+        site (fail-safe defaults). ``app_state`` is required; pre-lifespan
+        boot paths pass :data:`KEY_GUARD_DEFERRED_TO_LIFESPAN` (see its
+        comment for why that is not a bypass). Raises
+        :class:`DynamicAuthKeyError` WITHOUT mutating when refused, and the
+        caller applies per-host policy.
+
         Validates arguments before mutating state so a bad reload
         does not leave the registry in an inconsistent state.
+
+        Every completed swap bumps :attr:`generation`; live sessions compare
+        it per send and re-resolve on mismatch, so the swap reaches them even
+        when an alias keeps its backend model id (see
+        ``ChatSession._refresh_model_from_registry``).
         """
+        if app_state is not KEY_GUARD_DEFERRED_TO_LIFESPAN:
+            key_err = dynamic_auth_key_error(models, app_state)
+            if key_err:
+                raise DynamicAuthKeyError(key_err)
+            # Visibility, not a gate: a persisted row whose mode names the
+            # other grant dialect stays valid to keep, but its mint always
+            # refuses on this deployment — say so at every swap chokepoint.
+            warn_profile_mismatched_aliases(models, app_state)
         _validate_registry_args(models, default, fallback, agent_model, task_model)
         with self._client_lock:
+            # FIRST write inside the lock, deliberately BEFORE the map swap
+            # and the client teardown. The per-send refresh reads the maps
+            # lock-free and samples the generation AFTER them (see
+            # ``ChatSession._refresh_model_from_registry``); with the bump
+            # ordered first, that reader can observe new-generation +
+            # old-maps — a benign extra rebind, since ``resolve_binding()``
+            # takes this lock and lands on the completed swap — but never
+            # stale-generation + new-maps, which would let the skip-compare
+            # pass and route the turn into a client this reload is about to
+            # close. Sessions' STAMPED values come from
+            # resolve()/resolve_binding() under this same lock, so a stamp
+            # can never be newer than the binding it vouches for. Never
+            # bumped on a refused reload: both guards raise above, before
+            # any mutation.
+            self._generation += 1
             old_models = self._models
             self._models = dict(models)
             self.default = default
@@ -323,6 +751,20 @@ class ModelRegistry:
             self.agent_model = agent_model
             self.task_model = task_model
             self.task_effort = task_effort
+            # Admission is strictly per alias.  Resize surviving gates in
+            # place so live lanes and new resolutions coordinate through the
+            # same FIFO even when the alias moves to a different endpoint.
+            for alias, cfg in self._models.items():
+                limit = int(getattr(cfg, "max_concurrency", 0))
+                gate = self._admissions.get(alias)
+                if gate is None:
+                    self._admissions[alias] = ModelAdmission(alias, limit)
+                else:
+                    gate.set_limit(limit)
+            # Removed aliases remain as tombstones for this registry's
+            # lifetime.  A stale lane may still hold or queue on that object;
+            # re-adding the alias must reconfigure the same gate rather than
+            # split old and new work across two independent limits.
             # Selective teardown — close + drop only clients whose
             # construction/connection target changed (alias removed, or
             # base_url / api_key / provider / auth_mode differs). Keeps connection
@@ -485,12 +927,14 @@ def load_model_registry(
                 # pre-052 row missing these columns degrades gracefully.
                 row_surface_persisted_reasoning = bool(row.get("surface_persisted_reasoning", True))
                 row_replay_reasoning = bool(row.get("replay_reasoning_to_model", False))
-                # Per-user OBO auth (defaults match a pre-068 row missing the
-                # columns → "static", no audience → unchanged behaviour).
-                row_auth_mode, row_obo_audience = _normalize_auth_mode(
+                # Per-user OBO auth (defaults match a pre-068/pre-069 row
+                # missing the columns → "static", no audience/scopes →
+                # unchanged behaviour).
+                row_auth_mode, row_obo_audience, row_obo_scopes = _normalize_auth_mode(
                     alias,
                     row.get("auth_mode"),
                     row.get("obo_audience"),
+                    row.get("obo_scopes"),
                 )
                 configs[alias] = ModelConfig(
                     alias=alias,
@@ -511,8 +955,10 @@ def load_model_registry(
                     server_compat=row_server_compat,
                     auth_mode=row_auth_mode,
                     obo_audience=row_obo_audience,
+                    obo_scopes=row_obo_scopes,
+                    max_concurrency=row.get("max_concurrency", 0),
                 )
-        except ModelAuthConfigError:
+        except (ModelAuthConfigError, ModelConcurrencyConfigError):
             # Configuration errors are authoritative row content, not a
             # transient storage-read failure. Never degrade past them into a
             # config-only registry or provider SDK environment credentials.
@@ -569,10 +1015,11 @@ def load_model_registry(
         entry_server_compat = entry_caps.pop("server_compat", {})
         if not isinstance(entry_server_compat, dict):
             entry_server_compat = {}
-        entry_auth_mode, entry_obo_audience = _normalize_auth_mode(
+        entry_auth_mode, entry_obo_audience, entry_obo_scopes = _normalize_auth_mode(
             alias,
             entry.get("auth_mode", "static"),
             entry.get("obo_audience", ""),
+            entry.get("obo_scopes", ""),
         )
         configs[alias] = ModelConfig(
             alias=alias,
@@ -594,6 +1041,8 @@ def load_model_registry(
             server_compat=entry_server_compat,
             auth_mode=entry_auth_mode,
             obo_audience=entry_obo_audience,
+            obo_scopes=entry_obo_scopes,
+            max_concurrency=entry.get("max_concurrency", 0),
         )
 
     # 3. Back-compat shim: synthesize a "default" alias from CLI/auto-detected

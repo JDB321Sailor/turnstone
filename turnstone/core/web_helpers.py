@@ -106,7 +106,13 @@ async def read_json_or_400(request: Request) -> dict[str, Any] | JSONResponse:
     from starlette.responses import JSONResponse as _JSONResponse
 
     try:
-        body: dict[str, Any] = await request.json()
+        raw: Any = await request.json()
+        if not isinstance(raw, dict):
+            # Valid JSON, wrong shape (list/string/number at top level):
+            # without this check the declared dict type is a lie and every
+            # caller's first ``body.get`` raises into a 500.
+            return _JSONResponse({"error": "Request body must be a JSON object"}, status_code=400)
+        body: dict[str, Any] = raw
         return body
     except (ValueError, json.JSONDecodeError):
         return _JSONResponse({"error": "Invalid JSON body"}, status_code=400)
@@ -344,6 +350,7 @@ def resolve_workstream_owner(
     *,
     mgr: Any | None = None,
     not_found_label: str = "Workstream not found",
+    resolved_row: dict[str, Any] | None = None,
 ) -> tuple[str, JSONResponse | None]:
     """Resolve ``ws_id`` to its owner; 404 when the row doesn't exist.
 
@@ -394,7 +401,12 @@ def resolve_workstream_owner(
     owner: str | None = None
     project_id = ""
 
-    if mgr is not None:
+    if resolved_row is not None:
+        if resolved_row.get("state") == "creating":
+            return "", _JSONResponse({"error": not_found_label}, status_code=404)
+        owner = resolved_row.get("user_id") or ""
+        project_id = resolved_row.get("project_id") or ""
+    elif mgr is not None:
         ws_mem = mgr.get(ws_id)
         if ws_mem is not None:
             owner = ws_mem.user_id or ""
@@ -406,7 +418,7 @@ def resolve_workstream_owner(
         from turnstone.core.memory import get_workstream_row
 
         row = get_workstream_row(ws_id)
-        if row is None:
+        if row is None or row.get("state") == "creating":
             return "", _JSONResponse({"error": not_found_label}, status_code=404)
         owner = row.get("user_id") or ""
         project_id = row.get("project_id") or ""

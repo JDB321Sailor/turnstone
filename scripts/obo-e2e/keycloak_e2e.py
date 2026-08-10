@@ -17,6 +17,19 @@ Checks E1–E7 mirror the Entra harness:
   E6 unconsented audience C → NOT token, credential SURVIVES
   E7 cache flush → re-mint
 
+M1-M3 drive the MODEL-backend mint (``mint_obo_access_token``, #898/#955) on
+the same captured credential — the path an ``auth_mode=rfc8693_obo`` model
+alias takes, distinct from the classified MCP path above:
+  M1 model mint audience A with the alias's exchange scopes → token carries A
+     (the #955 fix: model definitions now carry per-row ``obo_scopes``, so
+     the exchange leg requests the audience's scope exactly as MCP rows do)
+  M2 warm re-mint serves the synthetic ``__model_obo__`` cache row —
+     identity-keyed on the owning alias, audience + scopes in the row's
+     own columns — with zero IdP calls
+  M3 an entra-leg mode (``entra_obo``) on this rfc8693 deployment refuses
+     BEFORE any IdP traffic, recording cause=grant_profile_mismatch — the
+     mode/profile pairing that replaced the pre-#955 overload
+
 Env (set by keycloak_e2e.sh):
   KC_TOKEN_ENDPOINT, KC_ISSUER, KC_CLIENT_ID, KC_CLIENT_SECRET,
   KC_USER, KC_PASSWORD, AUD_A, SCOPE_A, AUD_B, SCOPE_B, AUD_C
@@ -40,7 +53,13 @@ from turnstone.core.mcp_crypto import (
     MCPTokenCipherConfig,
     MCPTokenStore,
 )
-from turnstone.core.mcp_oauth import get_obo_access_token_classified
+from turnstone.core.mcp_oauth import (
+    get_obo_access_token_classified,
+    mint_obo_access_token,
+    model_mint_refusal_cause,
+    model_obo_cache_server,
+    model_obo_cause_key,
+)
 from turnstone.core.oidc import OIDCConfig
 from turnstone.core.storage._sqlite import SQLiteBackend
 
@@ -234,6 +253,87 @@ async def _run(cfg: dict[str, str], refresh_token: str) -> None:
         record(
             "VERIFIED" if r7.kind == "token" and client.posts > posts_before else "FAILED",
             f"E7 flush→re-mint: kind={r7.kind} kc_calls={client.posts - posts_before} (want >=1)",
+        )
+
+        # M1-M3 — MODEL backend mint on the rfc8693 profile: same captured
+        # credential and legs as E1-E7, but through mint_obo_access_token —
+        # the path an auth_mode=rfc8693_obo alias takes, carrying the
+        # per-alias exchange scopes MCP rows always had (#955). The mint's
+        # cache and cause records are identity-keyed on the owning alias, so
+        # the harness names one per mode-variant exactly as a deployment
+        # would define separate rows.
+        posts_before = client.posts
+        m1 = await mint_obo_access_token(
+            app_state=app_state,
+            user_id=USER,
+            alias="model-a",
+            audience=cfg["AUD_A"],
+            scopes=cfg.get("SCOPE_A", ""),
+            grant_leg="rfc8693",
+        )
+        m1_kc_calls = client.posts - posts_before
+        if m1:
+            ok1, why1 = aud_carries(m1, cfg["AUD_A"])
+            record(
+                "VERIFIED" if ok1 and m1_kc_calls > 0 else "FAILED",
+                f"M1 model mint (rfc8693_obo, scoped exchange): token={redact(m1)} "
+                f"aud_ok={ok1} ({why1}) kc_calls={m1_kc_calls} (want >=1)",
+            )
+        else:
+            record(
+                "FAILED",
+                f"M1 model mint (rfc8693_obo): no token (kc_calls={m1_kc_calls}) — "
+                "the #955 scope wire-through should mint here",
+            )
+
+        # M2 — warm re-mint serves the synthetic __model_obo__ cache row —
+        # identity-keyed on the owning alias, audience + scopes in the row's
+        # own columns — with zero IdP calls, and the row is named so
+        # deprovisioning can find it by prefix.
+        posts_before = client.posts
+        m2 = await mint_obo_access_token(
+            app_state=app_state,
+            user_id=USER,
+            alias="model-a",
+            audience=cfg["AUD_A"],
+            scopes=cfg.get("SCOPE_A", ""),
+            grant_leg="rfc8693",
+        )
+        cache_row = storage.get_mcp_user_token(USER, model_obo_cache_server("model-a"))
+        if m1:
+            record(
+                "VERIFIED"
+                if m2 and client.posts == posts_before and cache_row is not None
+                else "FAILED",
+                f"M2 model cache-hit: token={redact(m2)} kc_calls="
+                f"{client.posts - posts_before} (want 0) synthetic_row="
+                f"{'present' if cache_row is not None else 'MISSING'}",
+            )
+        else:
+            record("FAILED", "M2 model cache-hit: blocked behind M1 — M1 failed, see above")
+
+        # M3 — the mode/profile pairing refusal that replaced the pre-#955
+        # overload: an entra-leg mode on this rfc8693 deployment must yield
+        # None with ZERO IdP calls and record the grant_profile_mismatch
+        # cause the session heartbeat reads (under its own alias — a
+        # deployment defines the entra-mode variant as its own row).
+        posts_before = client.posts
+        m3 = await mint_obo_access_token(
+            app_state=app_state,
+            user_id=USER,
+            alias="model-a-entra",
+            audience=cfg["AUD_A"],
+            grant_leg="entra",
+        )
+        m3_cause = model_mint_refusal_cause(
+            "model_obo", model_obo_cause_key("model-a-entra", grant_leg="entra"), USER
+        )
+        record(
+            "VERIFIED"
+            if m3 is None and client.posts == posts_before and m3_cause == "grant_profile_mismatch"
+            else "FAILED",
+            f"M3 mode/profile mismatch refusal: token={redact(m3)} (want absent) "
+            f"kc_calls={client.posts - posts_before} (want 0) cause={m3_cause!r}",
         )
     finally:
         await inner.aclose()
