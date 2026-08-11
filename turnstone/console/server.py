@@ -4811,13 +4811,89 @@ def _probe_candidate_url(services: list[dict[str, Any]] | None) -> tuple[str, st
         if parsed.scheme not in _PROBE_ALLOWED_SCHEMES:
             continue
         host = (parsed.hostname or "").lower()
-        # 169.254.0.0/16 is the AWS / GCP instance metadata range;
-        # an http target there would turn a compromised registry into
-        # an SSRF to IMDS.  Loopback is retained for single-box dev.
-        if host.startswith("169.254."):
+        # Cheap, DNS-free rejection of an entry that NAMES a bad address. A
+        # poisoned registry pointing straight at cloud metadata is refused here
+        # without touching the resolver, so selection stays pure and console
+        # startup does no I/O; a hostname that RESOLVES somewhere bad is caught
+        # by _probe_url_is_safe, off the event loop, before the request.
+        if not host or _names_never_allowed_address(host):
             continue
         return raw_url, nid
     return "", ""
+
+
+def _names_never_allowed_address(host: str) -> bool:
+    """True when *host* is an IP literal in the never-allowed lane. No DNS."""
+    import ipaddress
+
+    from turnstone.core.ip_classify import AddressLane, classify_address
+
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # a name, not a literal — resolved later by the caller
+    return classify_address(addr) is AddressLane.NEVER
+
+
+def _probe_url_is_safe(url: str) -> bool:
+    """True when *url* resolves entirely outside the never-allowed lane.
+
+    Blocking: the caller runs it off the event loop under a deadline.  Uses the
+    same screen as the fetch tools rather than a private copy, so a new lane or
+    a new metadata prefix reaches this guard automatically.
+
+    Fails CLOSED.  The probe sends ``Authorization: Bearer <collector token>``,
+    so a registry entry that SERVFAILs here and resolves at request time must
+    not be probed.  Note this bounds the DAMAGE, not the audience: any
+    resolvable public host in the registry still receives that token, which is
+    a property of the registry being trusted input, not of this check.
+    """
+    from turnstone.core.ip_classify import AddressLane
+    from turnstone.core.web import screen_url
+
+    return screen_url(url).lane is not AddressLane.NEVER
+
+
+_PROBE_RESOLVE_TIMEOUT_SECONDS = 2.0
+
+
+async def _first_safe_candidate(services: list[dict[str, Any]] | None) -> tuple[str, str, int]:
+    """Return the first registry entry that passes the safety screen.
+
+    Returns ``(url, node_id, refused)``.  ``refused`` counts entries that were
+    selectable but screened out, so the caller can tell "registry is malformed"
+    (an operator-actionable alarm) from "the entries are fine, none is reachable
+    right now" — logging the former for the latter sends operators to audit a
+    healthy registry.
+
+    Walks the WHOLE registry rather than a fixed prefix: capping the walk meant
+    a cluster whose first few entries were briefly unresolvable skipped the boot
+    check entirely and still raised the malformed alarm.
+
+    Each resolution runs off the event loop under a deadline, because this is
+    awaited before the console lifespan yields and ``getaddrinfo`` has no
+    timeout of its own.  A deadline bounds the AWAIT, not the work — the thread
+    stays parked until the resolver gives up — so a timeout stops the walk
+    rather than starting another one, keeping at most one thread parked on the
+    shared executor.
+    """
+    remaining = list(services or [])
+    refused = 0
+    while True:
+        url, nid = _probe_candidate_url(remaining)
+        if not url:
+            return "", "", refused
+        remaining = [s for s in remaining if s.get("service_id") != nid]
+        try:
+            async with asyncio.timeout(_PROBE_RESOLVE_TIMEOUT_SECONDS):
+                safe = await asyncio.to_thread(_probe_url_is_safe, url)
+        except TimeoutError:
+            log.warning("collector_scope_probe.resolver_timeout node=%s", nid)
+            return "", "", refused + 1
+        if safe:
+            return url, nid, refused
+        refused += 1
+        log.warning("collector_scope_probe.candidate_refused node=%s", nid)
 
 
 async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncClient) -> None:
@@ -4860,13 +4936,19 @@ async def _verify_collector_service_scope(app: Starlette, client: httpx.AsyncCli
             exc_info=True,
         )
         return
-    probe_url, probe_node = _probe_candidate_url(services)
+    probe_url, probe_node, refused = await _first_safe_candidate(services)
     if not probe_url:
-        # Distinguish "registry empty" (normal pre-discovery) from
-        # "registry populated but every entry malformed" (operator-
-        # actionable drift) so the two aren't both logged as INFO
-        # silent-skips.
-        if services:
+        # Three distinct states, three distinct log lines: an empty registry is
+        # normal pre-discovery, entries that screened out are a reachability
+        # problem, and entries that could not even be selected are the
+        # operator-actionable drift the malformed alarm is for.
+        if refused:
+            log.warning(
+                "collector_scope_probe.no_reachable_candidate count=%d refused=%d",
+                len(services or []),
+                refused,
+            )
+        elif services:
             log.warning(
                 "collector_scope_probe.registry_malformed count=%d",
                 len(services),
