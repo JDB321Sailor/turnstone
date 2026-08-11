@@ -43,3 +43,138 @@ def demodulize(path: Path) -> str:
     )
     src = re.sub(r"^export\s*\{[^}]*\};\s*$", "", src, flags=re.M)
     return src
+
+
+def slice_braced_block(source: str, anchor: int) -> str | None:
+    """Slice the ``{ … }`` block starting at/just after ``anchor``.
+
+    THE brace walker every JS harness suite shares (the comment-AND-
+    string-aware superset of the per-suite predecessors, which disagreed
+    on comment handling and window bounds — the same source
+    reorganization could pass one suite's structural pin while breaking
+    the other's with a slice-dependent failure).  Comment awareness makes
+    it correct on raw AND pre-stripped input alike.  Returns ``None``
+    when no ``{`` opens within 200 chars of ``anchor`` (a missing brace
+    must not silently slice some later unrelated block) or the block is
+    unterminated.
+    """
+    start = source.find("{", anchor)
+    if start == -1 or start - anchor > 200:
+        return None
+    depth = 0
+    quote = ""
+    escaped = False
+    line_comment = False
+    block_comment = False
+    i = start
+    while i < len(source):
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < len(source) else ""
+        if line_comment:
+            if ch == "\n":
+                line_comment = False
+        elif block_comment:
+            if ch == "*" and nxt == "/":
+                block_comment = False
+                i += 1
+        elif quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = ""
+        elif ch == "/" and nxt == "/":
+            line_comment = True
+            i += 1
+        elif ch == "/" and nxt == "*":
+            block_comment = True
+            i += 1
+        elif ch in {'"', "'", "`"}:
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : i + 1]
+        i += 1
+    return None
+
+
+def extract_braced(source: str, signature: str) -> str:
+    """Extract one JS function/method (signature included) — raising form.
+
+    ``signature`` must end at its opening ``{``.  The loud sibling of
+    :func:`slice_braced_block` for suites that treat a missing or
+    unterminated function as a hard failure rather than a skip.
+    """
+    start = source.index(signature)
+    brace = start + len(signature) - 1
+    if source[brace] != "{":
+        raise AssertionError(f"signature does not end at an opening brace: {signature}")
+    block = slice_braced_block(source, brace)
+    if block is None:
+        raise AssertionError(f"unterminated JavaScript function: {signature}")
+    return source[start:brace] + block
+
+
+def strip_js_comments(source: str) -> str:
+    """Strip ``//`` and ``/* */`` comments for source-pattern assertions —
+    the single implementation every JS harness suite shares.
+
+    STRING-AWARE and OFFSET-PRESERVING (comments become spaces, byte
+    length identical): a ``//`` inside a string literal (``"https://…"``)
+    is content, not a comment — a string-blind scanner truncates the rest
+    of the line, and pattern pins then silently assert against corrupted
+    text (a ``not in`` guard passes vacuously after the pattern it
+    polices was reintroduced).  Length preservation keeps downstream
+    offset math (brace walkers, ``.index`` comparisons) valid.  This is
+    the strict superset of every per-suite predecessor, hoisted so the
+    suites cannot diverge again.
+
+    Limitation — regex literals (``/pattern/flags``) are not detected: a
+    ``//`` inside one would be misread as a line comment.  Safe for
+    every region currently scanned; extend the tracker before scanning a
+    region with regex literals.
+    """
+    out: list[str] = []
+    n = len(source)
+    i = 0
+    in_str: str | None = None
+    while i < n:
+        ch = source[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(source[i + 1])
+                i += 2
+                continue
+            if ch == in_str:
+                in_str = None
+            i += 1
+            continue
+        # Line comment: replace with spaces up to newline (preserve
+        # length so downstream offset math still works).
+        if ch == "/" and i + 1 < n and source[i + 1] == "/":
+            j = source.find("\n", i)
+            if j == -1:
+                j = n
+            out.append(" " * (j - i))
+            i = j
+            continue
+        # Block comment: replace with spaces up to closing */.
+        if ch == "/" and i + 1 < n and source[i + 1] == "*":
+            j = source.find("*/", i + 2)
+            if j == -1:
+                out.append(" " * (n - i))
+                i = n
+                continue
+            out.append(" " * (j + 2 - i))
+            i = j + 2
+            continue
+        if ch in ('"', "'", "`"):
+            in_str = ch
+        out.append(ch)
+        i += 1
+    return "".join(out)
