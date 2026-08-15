@@ -49,6 +49,10 @@ from turnstone.core.oidc import (
     provision_oidc_user,
     validate_id_token,
 )
+from turnstone.core.project_access import (
+    decide_project_access,
+    decide_project_management_access,
+)
 
 log = get_logger(__name__)
 
@@ -206,13 +210,81 @@ class ProjectAccess(NamedTuple):
 _PROJECT_DENY = ProjectAccess(False, False, "", "")
 
 
+def _evaluate_project_row_access(
+    user_id: str,
+    project: dict[str, Any],
+    *,
+    storage: Any,
+    management: bool,
+) -> ProjectAccess:
+    """Apply one named project policy to an already-fetched project row."""
+    if not user_id or storage is None:
+        return _PROJECT_DENY
+    project_id = str(project.get("project_id") or "")
+    if not project_id:
+        return _PROJECT_DENY
+    name = project.get("name", "") or ""
+    state = project.get("state", "active") or "active"
+    is_member = bool(storage.is_project_member(project_id, user_id))
+    permissions = _load_user_permissions(storage, user_id)
+    if management:
+        decision = decide_project_management_access(
+            principal_id=user_id,
+            owner_id=str(project.get("owner_id") or ""),
+            visibility=str(project.get("visibility") or "private"),
+            is_member=is_member,
+            permissions=permissions,
+        )
+    else:
+        decision = decide_project_access(
+            principal_id=user_id,
+            owner_id=str(project.get("owner_id") or ""),
+            visibility=str(project.get("visibility") or "private"),
+            state=str(state),
+            is_member=is_member,
+            permissions=permissions,
+        )
+    return ProjectAccess(decision.can_read, decision.can_write, name, state)
+
+
+def _resolve_project_access(
+    user_id: str,
+    project_id: str,
+    *,
+    storage: Any = None,
+    management: bool,
+) -> ProjectAccess:
+    """Resolve project facts once, then apply the selected named policy."""
+    if not user_id or not project_id:
+        return _PROJECT_DENY
+    if storage is None:
+        from turnstone.core.storage._registry import get_storage
+
+        storage = get_storage()
+    if storage is None:
+        return _PROJECT_DENY
+    try:
+        project = storage.get_project(project_id)
+        if project is None:
+            return _PROJECT_DENY
+        return _evaluate_project_row_access(
+            user_id,
+            project,
+            storage=storage,
+            management=management,
+        )
+    except Exception:
+        log.warning("project access check failed for user=%s project=%s", user_id, project_id)
+        return _PROJECT_DENY
+
+
 def resolve_project_access(
     user_id: str,
     project_id: str,
     *,
     storage: Any = None,
 ) -> ProjectAccess:
-    """Resolve read/write access + name/state for *project_id* in ONE fetch.
+    """Resolve active-runtime access + name/state for *project_id* in one fetch.
 
     The single-fetch core behind :func:`user_can_access_project`.  The session
     constructor calls this directly to avoid three redundant ``get_project``
@@ -230,34 +302,17 @@ def resolve_project_access(
     Fail-closed: empty ids, a missing/unknown project, or a storage failure all
     return :data:`_PROJECT_DENY`.
     """
-    if not user_id or not project_id:
-        return _PROJECT_DENY
-    if storage is None:
-        from turnstone.core.storage._registry import get_storage
+    return _resolve_project_access(user_id, project_id, storage=storage, management=False)
 
-        storage = get_storage()
-    if storage is None:
-        return _PROJECT_DENY
-    try:
-        project = storage.get_project(project_id)
-        if project is None:
-            return _PROJECT_DENY
-        name = project.get("name", "") or ""
-        state = project.get("state", "active") or "active"
-        if project.get("owner_id") == user_id:
-            return ProjectAccess(True, True, name, state)
-        # One membership lookup + the capability checks, then derive both access
-        # bits from the single project row (vs three get_project round-trips).
-        is_member = bool(storage.is_project_member(project_id, user_id))
-        is_public = project.get("visibility") == "public"
-        can_read = user_has_permission(user_id, "project.read", storage=storage) and (
-            is_member or is_public
-        )
-        can_write = user_has_permission(user_id, "project.write", storage=storage) and is_member
-        return ProjectAccess(can_read, can_write, name, state)
-    except Exception:
-        log.warning("project access check failed for user=%s project=%s", user_id, project_id)
-        return _PROJECT_DENY
+
+def resolve_project_management_access(
+    user_id: str,
+    project_id: str,
+    *,
+    storage: Any = None,
+) -> ProjectAccess:
+    """Resolve lifecycle-independent project management access in one fetch."""
+    return _resolve_project_access(user_id, project_id, storage=storage, management=True)
 
 
 def user_can_access_project(
@@ -271,11 +326,22 @@ def user_can_access_project(
 
     Thin boolean wrapper over :func:`resolve_project_access` — composes the RBAC
     capability gate with the per-project ACL, safe to call from contexts with no
-    HTTP permission middleware (memory recall, the management route ACL check).
-    Fail-closed via the resolver.  HTTP handlers still gate on
-    :func:`require_permission` first; this adds the per-resource ACL.
+    HTTP permission middleware (memory recall and session admission). Fail-closed
+    via the resolver.
     """
     acc = resolve_project_access(user_id, project_id, storage=storage)
+    return acc.can_write if write else acc.can_read
+
+
+def user_can_manage_project(
+    user_id: str,
+    project_id: str,
+    *,
+    write: bool,
+    storage: Any = None,
+) -> bool:
+    """Return whether a principal may manage a project in any lifecycle state."""
+    acc = resolve_project_management_access(user_id, project_id, storage=storage)
     return acc.can_write if write else acc.can_read
 
 
@@ -285,8 +351,8 @@ class WorkstreamProjectVisibility:
     Answers "may *user_id* see a workstream attached to *project_id*?" for
     listing filters and the row-access gate. Distinct from
     :func:`user_can_access_project` on purpose: that composes the RBAC
-    capability (``project.read``, admin-default) with the ACL and gates the
-    project *management* surfaces, whereas workstream visibility is a
+    capability (``project.read``, admin-default) with the ACL and gates active
+    project *runtime* use, whereas workstream visibility is a
     tenancy question — an explicit ``project_members`` row (or ownership)
     IS the grant, no capability required, or members without ``project.read``
     would lose sight of their own shared workstreams.
@@ -368,9 +434,9 @@ class WorkstreamProjectVisibility:
     def _project_grants(self, project: dict[str, Any]) -> bool:
         """The tenancy rule for one already-fetched project row.
 
-        THE single statement of who may see a project's workstreams —
-        :meth:`ws_visibility` and :func:`ensure_project_attachable` both
-        route through here so the security decision cannot diverge.
+        This deliberately governs existing-row visibility only. Fresh project
+        attachment uses canonical active-project RBAC in
+        :func:`ensure_project_attachable`.
         """
         if (project.get("visibility") or "private") != "private":
             return True
@@ -437,37 +503,41 @@ def ensure_project_attachable(
     :meth:`WorkstreamProjectVisibility.ws_visible` in one way — a
     nonexistent project is a 400 (a dangling link on an EXISTING row is
     tolerated because project deletion leaves links behind, but minting
-    a fresh dangling link is a caller error) — and shares its tenancy
-    rule: private projects accept workstreams only from their owner or
-    members; public/active-or-archived projects accept from anyone
-    (memory writes stay member-gated at the session layer).
+    a fresh dangling link is a caller error). Existing projects use the
+    canonical active-runtime policy: owners retain access, while members and
+    public principals need ``project.read``. Project-memory writes remain
+    independently gated by ``can_write`` at the session layer.
 
     Fail-closed: empty ``user_id`` or a storage failure denies with 403.
     """
     pid = (project_id or "").strip()
     if not pid:
         return None
-    if storage is None:
-        from turnstone.core.storage._registry import get_storage
-
-        storage = get_storage()
-    if storage is None:
-        return (403, "project access could not be verified")
+    denied = (403, "project is not available for workstream attachment")
+    if not user_id:
+        return denied
     try:
+        if storage is None:
+            from turnstone.core.storage._registry import get_storage
+
+            storage = get_storage()
+        if storage is None:
+            return denied
         project = storage.get_project(pid)
         if project is None:
             return (400, "unknown project_id")
-        # One tenancy rule, one place: reuse the visibility predicate's
-        # core (same-module private access; the fetched row is seeded
-        # into the memo so this costs no second get_project).
-        vis = WorkstreamProjectVisibility(user_id, storage=storage)
-        vis._projects[pid] = project
-        if vis._project_grants(project):
+        access = _evaluate_project_row_access(
+            user_id,
+            project,
+            storage=storage,
+            management=False,
+        )
+        if access.can_read:
             return None
-        return (403, "cannot attach a workstream to a private project you don't belong to")
+        return denied
     except Exception:
         log.warning("project attach check failed user=%s project=%s — failing closed", user_id, pid)
-        return (403, "project access could not be verified")
+        return denied
 
 
 # ---------------------------------------------------------------------------

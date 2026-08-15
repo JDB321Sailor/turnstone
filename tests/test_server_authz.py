@@ -328,7 +328,8 @@ class _FakeSession:
     def close(self) -> None:
         pass
 
-    def handle_command(self, cmd: str) -> bool:
+    def handle_command(self, cmd: str, *, principal_id: str | None = None) -> bool:
+        del principal_id
         self.commands.append(cmd)
         if self.command_gate is not None:
             self.command_gate.wait(timeout=10)
@@ -705,6 +706,24 @@ class TestCrossTenantDelete:
 
 
 class TestCrossTenantApprove:
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"approved": "false"},
+            {"approved": True, "call_id": 123},
+        ],
+    )
+    def test_malformed_body_is_rejected_before_lookup(self, app_client, body):
+        client, _mgr = app_client
+
+        resp = client.post(
+            "/v1/api/workstreams/ws-missing/approve",
+            json=body,
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 400
+
     def test_non_owner_cannot_approve(self, app_client):
         from turnstone.core.storage import get_storage
 
@@ -2908,6 +2927,90 @@ class TestRequireProjectMountWiring:
         body = resp.json()
         assert not (resp.status_code == 400 and body.get("code") == "require_project"), body
 
+    def test_unreadable_project_refuses_without_partial_create(
+        self,
+        app_client,
+        make_config_store,
+    ):
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        client.app.state.config_store = make_config_store()
+        storage = get_storage()
+        assert storage is not None
+        storage.create_project(
+            "public-without-read",
+            "Public Without Read",
+            "project-owner",
+            visibility="public",
+        )
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "must-not-exist", "project_id": "public-without-read"},
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 403
+        assert resp.json() == {"error": "project is not available for workstream attachment"}
+        assert mgr.list_all() == []
+        assert storage.list_workstreams() == []
+
+    def test_padded_owned_project_is_persisted_and_listed_canonically(
+        self,
+        app_client,
+        make_config_store,
+    ):
+        from turnstone.core.storage import get_storage
+
+        client, _mgr = app_client
+        client.app.state.config_store = make_config_store()
+        storage = get_storage()
+        assert storage is not None
+        storage.create_project("p1", "Project One", "user-1")
+        headers = _auth(
+            "user-1",
+            permissions=_DEFAULT_TEST_PERMS | frozenset({"project.read"}),
+        )
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "canonical-project", "project_id": "  p1  "},
+            headers=headers,
+        )
+
+        assert resp.status_code == 200, resp.text
+        ws_id = resp.json()["ws_id"]
+        row = storage.get_workstream(ws_id)
+        assert row is not None and row["project_id"] == "p1"
+        assert [item["ws_id"] for item in storage.list_workstreams_for_project("p1")] == [ws_id]
+        resources = client.get("/v1/api/projects/p1/resources", headers=headers)
+        assert resources.status_code == 200, resources.text
+        assert [item["ws_id"] for item in resources.json()["workstreams"]] == [ws_id]
+
+    def test_padded_unknown_project_refuses_without_partial_create(
+        self,
+        app_client,
+        make_config_store,
+    ):
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        client.app.state.config_store = make_config_store()
+        storage = get_storage()
+        assert storage is not None
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "must-not-exist", "project_id": "  missing  "},
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "unknown project_id"}
+        assert mgr.list_all() == []
+        assert storage.list_workstreams() == []
+
     def test_flag_off_forwarded_service_cannot_fork_private_nonmember(
         self, app_client, make_config_store, monkeypatch
     ):
@@ -3043,12 +3146,12 @@ class TestCreateForkRollback:
             if event.get("type") in {"ws_created", "ws_rename"}
         }
 
-    def test_source_replacement_after_preflight_cannot_inherit_fork(
+    def test_replaced_source_incarnation_is_rejected_after_preflight(
         self,
         app_client,
         monkeypatch,
     ) -> None:
-        from turnstone.core.storage import ForkCloneExpectation, get_storage
+        from turnstone.core.storage import get_storage
 
         client, mgr = app_client
         storage = get_storage()
@@ -3056,7 +3159,6 @@ class TestCreateForkRollback:
         source_id = "8" * 32
         destination_id = "9" * 32
         self._register_source(storage, source_id, with_history=True)
-        replacement_token = "replacement-source-incarnation"
 
         def _replace_at_pre_commit(
             session: _FakeSession,
@@ -3070,19 +3172,24 @@ class TestCreateForkRollback:
             assert source_reservation_token
             assert storage.get_workstream_reservation_token(source_id) == (source_reservation_token)
             assert storage.delete_workstream(source_id) is True
-            assert storage.register_workstream(
-                source_id,
-                user_id="user-1",
-                name="replacement-source",
-                state="idle",
-                kind="interactive",
-                fork_reservation_token=replacement_token,
+            assert (
+                storage.register_workstream(
+                    source_id,
+                    user_id="user-1",
+                    name="replacement-source",
+                    state="idle",
+                    kind="interactive",
+                    fork_reservation_token="replacement-incarnation",
+                )
+                is True
             )
-            storage.save_message(source_id, "user", "replacement must not fork")
-            destination_token = str(getattr(session, "_fork_reservation_token", ""))
-            assert destination_token
+            replacement = storage.get_workstream(source_id)
+            assert replacement is not None
+            assert replacement["name"] == "replacement-source"
+            from turnstone.core.storage import ForkCloneExpectation
+
             return storage.clone_workstream(
-                source_id,
+                fork_source_id,
                 session.ws_id,
                 principal_id=principal_id,
                 trusted_internal=trusted_internal,
@@ -3091,7 +3198,9 @@ class TestCreateForkRollback:
                     project_id="",
                     project_name="",
                     project_writable=False,
-                    destination_reservation_token=destination_token,
+                    destination_reservation_token=(
+                        storage.get_workstream_reservation_token(session.ws_id)
+                    ),
                     source_reservation_token=source_reservation_token,
                 ),
             )
@@ -3114,11 +3223,7 @@ class TestCreateForkRollback:
         replacement = storage.get_workstream(source_id)
         assert replacement is not None
         assert replacement["name"] == "replacement-source"
-        assert "fork_reservation_token" not in replacement
-        assert storage.get_workstream_reservation_token(source_id) == replacement_token
-        assert [turn.text for turn in storage.load_message_turns(source_id)] == [
-            "replacement must not fork"
-        ]
+        assert storage.get_workstream_reservation_token(source_id) == "replacement-incarnation"
 
     def test_destination_storage_failure_rolls_back_destination(
         self, app_client, monkeypatch

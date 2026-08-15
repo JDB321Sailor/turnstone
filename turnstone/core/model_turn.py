@@ -145,6 +145,15 @@ class WirePreparationError(RuntimeError):
     """
 
 
+class ModelAdmissionError(RuntimeError):
+    """The caller's local admitted-request hook failed before dispatch.
+
+    Unlike ``prepare_wire``, this hook may durably bind request context before
+    the serving lane's capacity lease. Its failure is still a local lifecycle
+    fault, never evidence that the selected model backend is unhealthy.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # Lane resolution — the ONE place capability / extra-params / flag lookup
 # happens.  ``ChatSession`` delegates its wrappers here; the judges build
@@ -1094,6 +1103,34 @@ def lane_call_client(
     return call_client
 
 
+def _prepare_wire_for_lane(
+    messages: list[dict[str, Any]],
+    lane: ModelLane,
+    prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]] | None,
+    *,
+    cfg: Any | None,
+) -> list[dict[str, Any]]:
+    """Apply caller lowering and the lane's final deterministic projection.
+
+    Lowering failures retain only the exception class on the wrapper because a
+    caller-owned error message can quote stored conversation content. The cause
+    remains available to tracebacks without leaking through operator surfaces.
+    """
+    prepared = messages
+    if prepare_wire is not None:
+        try:
+            prepared = prepare_wire(prepared, lane)
+        except Exception as prep_err:
+            raise WirePreparationError(type(prep_err).__name__) from prep_err
+    return maybe_attach_vllm_chat_reasoning(
+        prepared,
+        lane.provider,
+        lane.registry,
+        lane.alias,
+        cfg=cfg,
+    )
+
+
 def model_turn(
     lane: ModelLane,
     turns: Sequence[Turn],
@@ -1110,6 +1147,7 @@ def model_turn(
     acting_principal_id: str = "",
     deferred_names: frozenset[str] | None = None,
     prepare_wire: Callable[[list[dict[str, Any]], ModelLane], list[dict[str, Any]]] | None = None,
+    admit_request: Callable[[ModelLane], None] | None = None,
     on_chunk: Callable[[StreamChunk], None] | None = None,
 ) -> ModelTurnResult:
     """Advance a trajectory by one model turn: lower, sample, re-ingest.
@@ -1136,12 +1174,14 @@ def model_turn(
     operator never engaged.  Pass an explicit value only to relay an
     operator- or user-resolved knob (the session's own knobs, a CLI flag).
 
-    *resolve_attachments* materializes by-reference ``AttachmentRef``
-    content immediately before admission (``{type: kind, attachment_id}``
-    placeholders → inline parts; one id may expand to several parts, e.g.
-    a rasterized PDF).  This ordering keeps any nested perception/audio work
-    outside the outer alias's gate, avoiding self-deadlock at a limit of one.
-    Turn IR itself never carries inline media bytes.
+    *resolve_attachments* materializes by-reference ``AttachmentRef`` content
+    after a context-first *admit_request* succeeds but before the outer model
+    capacity lease (``{type: kind, attachment_id}`` placeholders → inline
+    parts; one id may expand to several parts, e.g. a rasterized PDF). Ordinary
+    calls preserve their established lowering-before-materialization cadence.
+    Keeping nested perception/audio work outside the outer alias's gate avoids
+    self-deadlock at a limit of one. Turn IR itself never carries inline media
+    bytes.
 
     *mint* rewrites each returned tool call's id (provider-original →
     caller-scoped) before the Turn is built; the native blocks keep the
@@ -1198,6 +1238,13 @@ def model_turn(
     tool-search deferred-loading set is per-call state (it grows as the
     session discovers tools), so it is a parameter and not a
     ``ModelLane`` field.
+
+    *admit_request* is the request-admission seam used when admission changes
+    the cached prefix itself. It runs before ``prepare_wire``, dynamic backend
+    authentication, attachment materialization, and the serving lane's capacity
+    lease, so a refusal cannot trigger attachment storage/perception work and
+    none of that local work occupies a model slot. A successful hook may
+    durably bind the prefix before the request queues for model capacity.
 
     *on_chunk* is the streaming surface (#832): each normalized
     :class:`StreamChunk` reaches the caller as it arrives — via a tee
@@ -1264,23 +1311,22 @@ def model_turn(
         sanitize_tool_call_arguments(dicts_from_turns(list(turns))),
         wire_id_map if wire_id_map is not None else {},
     )
-    if prepare_wire is not None:
+    if admit_request is not None:
         try:
-            # The serving lane rides along so caller lowering can be
-            # capability-correct per attempt — a fallback's fold posture
-            # is its own, not the primary's.
-            wire = prepare_wire(wire, lane)
-        except Exception as prep_err:
-            # A caller-data fault, never a backend signal — typed so the
-            # retry and fallback ladders cannot treat it as one.  The
-            # wrapper carries the cause's CLASS, not its message: this is
-            # our lowering over the caller's stored history, so the
-            # message can quote that history, and callers render
-            # ``str(exc)`` on surfaces that reach the operator and the
-            # persisted error row.  The message rides ``__cause__``, which
-            # tracebacks and debug logs still have.
-            raise WirePreparationError(type(prep_err).__name__) from prep_err
-    wire = maybe_attach_vllm_chat_reasoning(wire, lane.provider, lane.registry, lane.alias, cfg=cfg)
+            admit_request(lane)
+        except Exception as admission_err:
+            raise ModelAdmissionError(type(admission_err).__name__) from admission_err
+        _raise_if_aborted(cancel_ref, lane)
+    else:
+        # Ordinary lowering remains once per model_turn, before attachment
+        # materialization. Admitted lowering runs per transport attempt below
+        # because its prefix does not exist until the hook above succeeds.
+        wire = _prepare_wire_for_lane(
+            wire,
+            lane,
+            prepare_wire,
+            cfg=cfg,
+        )
     # The effort assignment scheme's lower rungs: explicit relay → lane
     # (operator) → in-code model definition → None.  None/unset knobs are
     # OMITTED from the wire so the inference engine's default rules
@@ -1294,9 +1340,11 @@ def model_turn(
         or None
     )
     # Materialization may perform storage reads and nested perception/audio
-    # sampling.  Complete it before taking the outer alias's admission slot so
-    # a cap of one cannot deadlock on a nested call that needs the same alias.
+    # sampling. A context-first refusal above performs none of it. A successful
+    # request completes it before taking the outer alias's admission slot so a
+    # cap of one cannot deadlock on a nested call that needs the same alias.
     served_wire = materialize_attachments(wire, resolve_attachments)
+    dispatched_wire = served_wire
     # A partially-surfaced stream is never silently re-issued — the
     # streaming caller owns re-issue.
     drain_retries = 0 if on_chunk is not None else _DRAIN_RETRIES
@@ -1304,17 +1352,32 @@ def model_turn(
     request_metrics: list[ProviderRequestMetrics] = []
     while True:
         _raise_if_aborted(cancel_ref, lane)
+        if admit_request is not None:
+            # Preserve the established per-transport-attempt lowering cadence,
+            # but keep it outside the capacity lease.  Admission itself runs
+            # once above: its durable prefix cannot change during a same-wire
+            # drain retry.
+            dispatched_wire = _prepare_wire_for_lane(
+                served_wire,
+                lane,
+                prepare_wire,
+                cfg=cfg,
+            )
+            _raise_if_aborted(cancel_ref, lane)
         lease = lane.admission.acquire(cancel_ref=cancel_ref) if lane.admission else None
         drain_error: Exception | None = None
         with lease if lease is not None else contextlib.nullcontext():
-            # Admission precedes a dynamic credential mint.  This work and the
-            # full create+drain remain inside the hold; the context exits before
-            # any retry backoff below.
+            # Dynamic credential mint and the full create+drain remain inside
+            # the hold; local request admission completed before this slot was
+            # acquired. The context exits before any retry backoff below.
             call_client = lane_call_client(
                 lane,
                 backend_auth_token=backend_auth_token,
                 cancel_ref=cancel_ref,
             )
+            _raise_if_aborted(cancel_ref, lane)
+            if admit_request is None:
+                dispatched_wire = served_wire
             _raise_if_aborted(cancel_ref, lane)
             mark_dispatch = getattr(cancel_ref, "mark_dispatch", None)
             if callable(mark_dispatch):
@@ -1326,7 +1389,7 @@ def model_turn(
             chunks = lane.provider.create_streaming(
                 client=call_client,
                 model=lane.model,
-                messages=served_wire,
+                messages=dispatched_wire,
                 tools=tools,
                 max_tokens=max_tokens,
                 temperature=temperature if temperature is not None else lane.temperature,
@@ -1338,8 +1401,8 @@ def model_turn(
                 replay_reasoning_to_model=resolve_replay_reasoning_to_model(
                     lane.registry, lane.alias, caps=lane.capabilities, cfg=cfg
                 ),
-                # Already materialized before admission; provider translators
-                # retain their no-op fallback for direct callers.
+                # Already materialized above after request admission; provider
+                # translators retain their no-op fallback for direct callers.
                 resolve_attachments=None,
                 request_metrics_ref=request_metrics,
             )
@@ -1451,7 +1514,7 @@ def model_turn(
         usage=result.usage,
         tool_calls=raw_calls,
         provenance=provenance,
-        wire_msgs=served_wire,
+        wire_msgs=dispatched_wire,
         producer=lane.provider.provider_name,
         serving_model=lane.model,
         tool_def_chars=(

@@ -2231,7 +2231,10 @@ async def command(request: Request) -> JSONResponse:
         def _run_cmd() -> None:
             me = threading.current_thread()
             try:
-                should_exit = session.handle_command(cmd)
+                should_exit = session.handle_command(
+                    cmd,
+                    principal_id=command_principal,
+                )
                 # Post-command follow-ups run HERE, on the worker, not
                 # after the endpoint's done-wait: past the 25s backstop the
                 # endpoint has already answered {"status": "running"}, and
@@ -2665,17 +2668,19 @@ async def _interactive_create_validate_request(
         body["_resume_incarnation_token"] = str(_src_row.get("fork_reservation_token") or "")
         body["project_id"] = source_project
         resume_inherited_pid = bool(source_project)
-    # Project attach gate (explicit or parent-inherited): a private
-    # project accepts new workstreams only from its owner/members, and a
-    # nonexistent EXPLICIT project_id is a caller error rather than a
-    # silent dangling link. Re-checking the inherited value is deliberate
+    # Project attach gate (explicit or parent-inherited): a project requires
+    # canonical active-runtime read access, and a nonexistent EXPLICIT
+    # project_id is a caller error rather than a silent dangling link.
+    # Re-checking the inherited value is deliberate
     # — a coordinator owner whose membership was revoked fails the child
     # spawn loudly here instead of minting rows they can no longer see.
     # The one asymmetry: an INHERITED project that no longer exists is
     # not the spawner's error — project deletion leaves the parent's
     # link dangling by design and must not disable spawn_workstream, so
     # the child simply isn't attached.
-    attach_pid = str(body.get("project_id") or "")
+    project_raw = body.get("project_id")
+    attach_pid = project_raw.strip() if isinstance(project_raw, str) else ""
+    body["project_id"] = attach_pid
     if attach_pid:
         from turnstone.core.auth import ensure_project_attachable
 
@@ -3646,16 +3651,17 @@ async def list_memories(request: Request) -> JSONResponse:
 
 async def save_memory(request: Request) -> JSONResponse:
     """POST /v1/api/memories — save (upsert) a structured memory."""
-    from turnstone.core.memory import save_structured_memory_strict
+    from turnstone.core.memory import normalize_memory_name, save_structured_memory_strict
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
-    name = str(body.get("name", "")).strip()
+    try:
+        name = normalize_memory_name(body.get("name"))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     content = str(body.get("content", "")).strip()
-    if not name or len(name) > 256:
-        return JSONResponse({"error": "name is required (max 256 characters)"}, status_code=400)
     if not content:
         return JSONResponse({"error": "content is required"}, status_code=400)
     if len(content) > _MAX_MEMORY_CONTENT:
@@ -3663,11 +3669,13 @@ async def save_memory(request: Request) -> JSONResponse:
             {"error": f"content exceeds {_MAX_MEMORY_CONTENT} character limit"},
             status_code=400,
         )
-    raw_desc = body.get("description")
-    description = "" if raw_desc is None else str(raw_desc).strip()
-    if not description:
+    from turnstone.core.memory_index import normalize_memory_description
+
+    try:
+        description = normalize_memory_description(body.get("description"))
+    except ValueError as exc:
         return JSONResponse(
-            {"error": "description is required and must be non-empty"},
+            {"error": str(exc)},
             status_code=400,
         )
     raw_type = body.get("type")
@@ -3763,11 +3771,48 @@ async def search_memories(request: Request) -> JSONResponse:
     return JSONResponse({"memories": rows, "total": len(rows)})
 
 
+async def get_memory_endpoint(request: Request) -> JSONResponse:
+    """GET /v1/api/memories/{name} — fetch one full body and record access."""
+    from turnstone.core.memory import (
+        get_and_touch_structured_memory_by_name_strict,
+        normalize_memory_name,
+    )
+
+    try:
+        name = normalize_memory_name(request.path_params["name"])
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    scope = request.query_params.get("scope", "global")
+    scope_id = request.query_params.get("scope_id", "")
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=False,
+    )
+    if err:
+        return err
+    try:
+        memory = get_and_touch_structured_memory_by_name_strict(name, scope, scope_id)
+    except Exception:
+        log.warning("memory.rest_get_failed", name=name, exc_info=True)
+        return JSONResponse({"error": "Memory storage unavailable"}, status_code=500)
+    if memory is None:
+        return JSONResponse({"error": f"Memory '{name}' not found"}, status_code=404)
+    return JSONResponse(memory)
+
+
 async def delete_memory_endpoint(request: Request) -> JSONResponse:
     """DELETE /v1/api/memories/{name} — delete a memory by name and scope."""
-    from turnstone.core.memory import delete_structured_memory_returning_strict, normalize_key
+    from turnstone.core.memory import (
+        delete_structured_memory_returning_strict,
+        normalize_memory_name,
+    )
 
-    name = normalize_key(request.path_params["name"])
+    try:
+        name = normalize_memory_name(request.path_params["name"])
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     scope = request.query_params.get("scope", "global")
     scope_id = request.query_params.get("scope_id", "")
     scope, scope_id, err = _resolve_rest_memory_scope(
@@ -3795,8 +3840,8 @@ async def delete_memory_endpoint(request: Request) -> JSONResponse:
 #
 # User-facing CRUD over projects.  Every handler gates first on the RBAC
 # capability (``project.{create,read,write,delete}`` — admin-default) and then,
-# for a specific project, on the per-project ACL via
-# ``auth.user_can_access_project`` (or ownership for destructive / membership
+# for a specific project, on the lifecycle-independent per-project ACL via
+# ``auth.user_can_manage_project`` (or ownership for destructive / membership
 # ops).  Registered by both the standalone server and the console — projects
 # are global / shared-DB, so the handlers are node-agnostic.
 
@@ -3887,7 +3932,7 @@ async def create_project(request: Request) -> JSONResponse:
 
 async def get_project_endpoint(request: Request) -> JSONResponse:
     """GET /v1/api/projects/{project_id} — one project the caller can read."""
-    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.auth import require_permission, user_can_manage_project
     from turnstone.core.storage import get_storage
 
     err = require_permission(request, "project.read")
@@ -3901,7 +3946,7 @@ async def get_project_endpoint(request: Request) -> JSONResponse:
     row = storage.get_project(project_id) if storage else None
     if row is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
-    if not user_can_access_project(uid, project_id, write=False, storage=storage):
+    if not user_can_manage_project(uid, project_id, write=False, storage=storage):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     return JSONResponse(_project_view(row))
 
@@ -3915,7 +3960,7 @@ async def project_resources_endpoint(request: Request) -> JSONResponse:
     Same access gate as ``get_project_endpoint``: ``project.read`` plus the
     per-project ACL.
     """
-    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.auth import require_permission, user_can_manage_project
     from turnstone.core.storage import get_storage
 
     err = require_permission(request, "project.read")
@@ -3929,7 +3974,7 @@ async def project_resources_endpoint(request: Request) -> JSONResponse:
     row = storage.get_project(project_id) if storage else None
     if row is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
-    if not user_can_access_project(uid, project_id, write=False, storage=storage):
+    if not user_can_manage_project(uid, project_id, write=False, storage=storage):
         return JSONResponse({"error": "forbidden"}, status_code=403)
 
     def _collect() -> dict[str, Any]:
@@ -3949,7 +3994,7 @@ async def project_resources_endpoint(request: Request) -> JSONResponse:
 
 async def update_project_endpoint(request: Request) -> JSONResponse:
     """PATCH /v1/api/projects/{project_id} — rename / re-visibility / archive."""
-    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.auth import require_permission, user_can_manage_project
     from turnstone.core.storage import get_storage
     from turnstone.core.web_helpers import read_json_or_400
 
@@ -3964,7 +4009,7 @@ async def update_project_endpoint(request: Request) -> JSONResponse:
     row = storage.get_project(project_id) if storage else None
     if storage is None or row is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
-    if not user_can_access_project(uid, project_id, write=True, storage=storage):
+    if not user_can_manage_project(uid, project_id, write=True, storage=storage):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
@@ -4024,7 +4069,7 @@ async def delete_project_endpoint(request: Request) -> JSONResponse:
 
 async def list_project_members_endpoint(request: Request) -> JSONResponse:
     """GET /v1/api/projects/{project_id}/members — member user_ids."""
-    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.auth import require_permission, user_can_manage_project
     from turnstone.core.storage import get_storage
 
     err = require_permission(request, "project.read")
@@ -4037,7 +4082,7 @@ async def list_project_members_endpoint(request: Request) -> JSONResponse:
     storage = get_storage()
     if storage is None or storage.get_project(project_id) is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
-    if not user_can_access_project(uid, project_id, write=False, storage=storage):
+    if not user_can_manage_project(uid, project_id, write=False, storage=storage):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     return JSONResponse({"members": storage.list_project_members(project_id)})
 
@@ -5706,6 +5751,7 @@ def create_app(
                     Route("/api/memories", list_memories),
                     Route("/api/memories", save_memory, methods=["POST"]),
                     Route("/api/memories/search", search_memories, methods=["POST"]),
+                    Route("/api/memories/{name}", get_memory_endpoint, methods=["GET"]),
                     Route("/api/memories/{name}", delete_memory_endpoint, methods=["DELETE"]),
                     Route("/api/projects", list_projects),
                     Route("/api/projects", create_project, methods=["POST"]),
@@ -6153,10 +6199,9 @@ def main() -> None:
         trusted_proxies=config_store.get("ratelimit.trusted_proxies"),
     )
 
-    # Config builders — shared between startup logging and session factory.
-    # Re-read from ConfigStore each call so hot-reload works.
+    # Judge config is shared between startup logging and session construction.
+    # Re-read from ConfigStore for each new session so hot-reload works.
     from turnstone.core.judge import JudgeConfig
-    from turnstone.core.memory_relevance import MemoryConfig
 
     def _build_judge_config() -> JudgeConfig:
         return JudgeConfig(
@@ -6174,15 +6219,6 @@ def main() -> None:
             output_guard_model=config_store.get("judge.output_guard_model"),
             output_guard_llm_timeout=config_store.get("judge.output_guard_llm_timeout"),
             redact_secrets=config_store.get("judge.redact_secrets"),
-        )
-
-    def _build_memory_config() -> MemoryConfig:
-        return MemoryConfig(
-            relevance_k=config_store.get("memory.relevance_k"),
-            fetch_limit=config_store.get("memory.fetch_limit"),
-            max_content=config_store.get("memory.max_content"),
-            nudge_cooldown=config_store.get("memory.nudge_cooldown"),
-            nudges=config_store.get("memory.nudges"),
         )
 
     judge_config = _build_judge_config()
@@ -6265,7 +6301,6 @@ def main() -> None:
                 log.debug("Failed to resolve username for uid %s", uid, exc_info=True)
 
         # Re-resolve from ConfigStore so new workstreams pick up hot-reloaded settings.
-        live_memory_config = _build_memory_config()
         live_judge_config = _build_judge_config()
         if live_judge_config and judge_model:
             import dataclasses
@@ -6329,7 +6364,6 @@ def main() -> None:
             skill=skill or args.skill or None,
             judge_config=live_judge_config,
             user_id=uid,
-            memory_config=live_memory_config,
             config_store=config_store,
             client_type=ClientType(client_type)
             if client_type in {ct.value for ct in ClientType}

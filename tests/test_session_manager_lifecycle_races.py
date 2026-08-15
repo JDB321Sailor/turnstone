@@ -929,10 +929,10 @@ def test_delete_drains_and_tombstones_predecessor_state_before_same_id_successor
     assert storage.rows[ws_id].state == "idle"
 
 
-def test_delete_drains_admitted_conversation_write_before_same_id_successor(
+def test_delete_drains_admitted_conversation_write_and_fences_same_id_successor(
     storage_backend: Any,
 ) -> None:
-    """An accepted save cannot land after delete and leak into successor B."""
+    """An accepted save drains before delete; its closed lane cannot hit a successor."""
     backend = storage_backend
     adapter = FakeAdapter()
     mgr = SessionManager(
@@ -996,7 +996,8 @@ def test_delete_drains_admitted_conversation_write_before_same_id_successor(
     assert delete_called.is_set()
 
     successor = mgr.create(ws_id=ws_id, user_id="u2", name="successor")
-    assert successor is not predecessor
+    assert successor.user_id == "u2"
+    assert successor.name == "successor"
     assert backend.load_message_turns(ws_id) == []
     assert (
         session.commit_durable(
@@ -1078,7 +1079,7 @@ def test_same_id_successor_created_waits_for_predecessor_closed_publication(
     ]
 
 
-def test_retirement_probe_never_blocks_on_held_session_locks() -> None:
+def test_retirement_probe_never_blocks_on_held_session_locks(tmp_db: str) -> None:
     """Round-4 review pin (AB/BA deadlock): the idle-close and eviction scans
     probe persistence while holding ``ws._lock``, and force-cancel's finalizer
     holds the generation lock and then takes ``ws._lock`` — so the retirement

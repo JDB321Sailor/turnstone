@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from turnstone.api.openapi import EndpointSpec, QueryParam, build_openapi
+from turnstone.api.openapi import EndpointSpec, PathParam, QueryParam, build_openapi
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
@@ -19,6 +19,7 @@ from turnstone.api.schemas import (
     StatusResponse,
 )
 from turnstone.api.server_schemas import (
+    MEMORY_NAME_INPUT_DESCRIPTION,
     ApproveRequest,
     ApproveResponse,
     AvailableModelInfo,
@@ -39,6 +40,7 @@ from turnstone.api.server_schemas import (
     ListSkillSummaryResponse,
     ListWorkstreamsResponse,
     MemoryInfo,
+    MemorySummary,
     PersonaChoice,
     RewindRequest,
     SaveMemoryRequest,
@@ -140,7 +142,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Approve or deny a tool call",
         request_model=ApproveRequest,
         response_model=ApproveResponse,
-        error_codes=[404, 409],
+        error_codes=[400, 404, 409],
         tags=["Chat"],
     ),
     EndpointSpec(
@@ -514,7 +516,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "POST",
         "Save (upsert) a structured memory",
         request_model=SaveMemoryRequest,
-        response_model=MemoryInfo,
+        response_model=MemorySummary,
         error_codes=[400, 403, 404, 500],
         tags=["Memories"],
     ),
@@ -529,9 +531,33 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
     ),
     EndpointSpec(
         "/v1/api/memories/{name}",
+        "GET",
+        "Fetch a structured memory body by exact name and scope",
+        response_model=MemoryInfo,
+        path_params=[
+            PathParam(
+                "name",
+                MEMORY_NAME_INPUT_DESCRIPTION,
+            )
+        ],
+        query_params=[
+            QueryParam("scope", "Scope (default: global)"),
+            QueryParam("scope_id", "Scope identifier"),
+        ],
+        error_codes=[400, 403, 404, 500],
+        tags=["Memories"],
+    ),
+    EndpointSpec(
+        "/v1/api/memories/{name}",
         "DELETE",
         "Delete a structured memory by name and scope",
         response_model=StatusResponse,
+        path_params=[
+            PathParam(
+                "name",
+                MEMORY_NAME_INPUT_DESCRIPTION,
+            )
+        ],
         query_params=[
             QueryParam("scope", "Scope (default: global)"),
             QueryParam("scope_id", "Scope identifier"),
