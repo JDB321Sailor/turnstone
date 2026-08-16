@@ -18,9 +18,11 @@ user.
 
 **Other ways to install**
 
-- **Already have Docker?** Clone the repo and `docker compose up` for the full
-  local cluster, or `docker compose -f turnstone/deploy/compose.yaml up` for the
-  released single-node stack. See [docs/docker.md](docs/docker.md).
+- **Already have Docker?** Clone the stable source with
+  `git clone --branch main https://github.com/turnstonelabs/turnstone`, then run
+  `docker compose up` for the full local cluster, or
+  `docker compose -f turnstone/deploy/compose.yaml up` for the released
+  single-node stack. See [docs/docker.md](docs/docker.md).
 - **Python package:** `pip install turnstone` (add `--pre` for the experimental
   track), then run `turnstone-server` / `turnstone-console` directly. See the
   [README](README.md#quickstart).

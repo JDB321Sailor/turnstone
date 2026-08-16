@@ -10,7 +10,7 @@ Turnstone ships two Docker Compose stacks:
 ## Quick start — local cluster
 
 ```bash
-git clone https://github.com/turnstonelabs/turnstone
+git clone --branch main https://github.com/turnstonelabs/turnstone
 cd turnstone
 docker compose up
 ```

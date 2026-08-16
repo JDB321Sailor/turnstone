@@ -19,13 +19,15 @@
 # Re-running is safe: it updates the checkout and keeps an existing .env.
 #
 # Env overrides:
-#   TURNSTONE_DIR   where to clone (default: $HOME/turnstone)
-#   TURNSTONE_REPO  git URL (default: https://github.com/turnstonelabs/turnstone.git)
+#   TURNSTONE_DIR     where to clone (default: $HOME/turnstone)
+#   TURNSTONE_REPO    git URL (default: https://github.com/turnstonelabs/turnstone.git)
+#   TURNSTONE_BRANCH  git branch to clone (default: main, the stable source)
 
 set -Eeuo pipefail
 
 REPO_URL="${TURNSTONE_REPO:-https://github.com/turnstonelabs/turnstone.git}"
 INSTALL_DIR="${TURNSTONE_DIR:-$HOME/turnstone}"
+SOURCE_BRANCH="${TURNSTONE_BRANCH:-main}"
 
 # -- output helpers -----------------------------------------------------------
 if [ -t 1 ]; then
@@ -124,13 +126,18 @@ ensure_git() {
 clone_repo() {
     if [ -d "$INSTALL_DIR/.git" ]; then
         info "Updating existing checkout at $INSTALL_DIR"
+        local current_branch
+        current_branch=$(git -C "$INSTALL_DIR" symbolic-ref --quiet --short HEAD || true)
+        if [ -n "$current_branch" ] && [ "$current_branch" != "$SOURCE_BRANCH" ]; then
+            warn "existing checkout is on '$current_branch', not configured branch '$SOURCE_BRANCH'; leaving its branch unchanged."
+        fi
         git -C "$INSTALL_DIR" pull --ff-only || warn "could not fast-forward; using the existing checkout."
     else
         [ -e "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ] \
             && die "$INSTALL_DIR exists and is not a turnstone checkout. Set TURNSTONE_DIR to an empty path."
-        info "Cloning $REPO_URL into $INSTALL_DIR"
+        info "Cloning $REPO_URL branch $SOURCE_BRANCH into $INSTALL_DIR"
         # Skip Git LFS smudge — the LFS objects are only diagram PNGs, not needed to run.
-        GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
+        GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 --branch "$SOURCE_BRANCH" "$REPO_URL" "$INSTALL_DIR"
     fi
 }
 

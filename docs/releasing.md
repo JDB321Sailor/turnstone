@@ -1,90 +1,162 @@
 # Release Process
 
-Turnstone ships several parallel release tracks from a single PyPI package.
+Beginning with 1.8.0, Turnstone separates the stable checkout from next-release
+development while preserving real Git ancestry between supported lines.
 
-## Release Tracks
+## Branch Roles
 
-| Track | Versions | Branch | Docker tags | PyPI install |
-|-------|----------|--------|-------------|--------------|
-| **Stable 1.5** | `1.5.x` | `stable/1.5` | `:1.5.x`, `:1.5` | `pip install 'turnstone==1.5.*'` |
-| **Stable 1.6** | `1.6.x` | `stable/1.6` | `:1.6.x`, `:1.6`, `:stable`, `:latest` | `pip install turnstone` |
-| **Experimental** | `1.7.0aN` | `main` | `:1.7.0aN`, `:experimental` | `pip install turnstone --pre` |
+| Branch | Versions | Purpose | Docker aliases |
+|--------|----------|---------|----------------|
+| `main` | final `X.Y.Z` | Current stable release and install source | exact, `:X.Y`, `:stable`, `:latest` |
+| `dev` | `X.Y.0aN`, `bN`, or `rcN` | Next-release integration and GitHub default | exact, `:experimental` |
+| `stable/X.Y` | final `X.Y.Z` | Supported prior minor after `main` moves on | exact, `:X.Y` |
 
-- **Stable** tracks receive bugfixes only.  The most-recent stable minor
-  owns the `:stable` / `:latest` Docker tags and the default PyPI
-  install.
-- **Experimental** (always on `main`) receives new features. May be
-  rough around the edges.
-- When experimental matures, it is promoted to a new stable minor via
-  a `stable/X.Y` branch. One prior stable track is maintained alongside
-  the current one; at each promotion the oldest track is retired — its
-  branch is deleted, while its tags and released artifacts remain
-  available.
+`main` is the only writable authority for the current stable minor. Do not
+maintain a same-minor `stable/X.Y` branch beside it. Immediately before `main`
+advances to a new minor, preserve its current tip as `stable/X.Y`; that branch
+then becomes the maintenance line for the prior minor.
+
+Archived stable branches and their released artifacts may remain available even
+after support ends, but they are not active release targets.
+
+## Pull Request Targets and Forward Merges
+
+- Features, refactors, and fixes needed only by the next release target `dev`.
+- Fixes needed by the current stable release target `main`.
+- Fixes needed by a supported prior minor start on the oldest affected
+  `stable/X.Y` branch.
+
+Move stable fixes forward in order:
+
+```text
+stable/X.Y  →  main  →  dev
+```
+
+Use a merge commit or a true fast-forward for branch-to-branch synchronization.
+Do not squash, rebase, or cherry-pick synchronization PRs: the shared ancestry
+is what lets Git recognize the same fix the next time the branches meet. This
+restriction applies to synchronization PRs; ordinary focused PRs may follow the
+repository's normal merge policy.
+
+Release-only metadata belongs to the destination branch. When a forward merge
+touches `pyproject.toml`, `turnstone/__init__.py`, `uv.lock`, or the changelog
+header, keep the destination line's version and release state while accepting
+the source branch's code and documentation changes. The release commit itself
+should still become an ancestor of newer branches.
+
+Never merge `dev` backward into a stable branch outside the deliberate promotion
+process.
 
 ## Version Scheme
 
-[PEP 440](https://peps.python.org/pep-0440/) pre-release suffixes on a single package:
+Turnstone uses [PEP 440](https://peps.python.org/pep-0440/) versions in one PyPI
+package:
 
-- `1.0.0` — stable release
-- `1.1.0a1` — alpha (experimental)
-- `1.1.0b1` — beta (experimental, more stable)
-- `1.1.0rc1` — release candidate (experimental, nearly stable)
-- `1.1.0` — promoted to stable
+- `1.8.1` — stable release
+- `1.9.0a1` — alpha pre-release
+- `1.9.0b1` — beta pre-release
+- `1.9.0rc1` — release candidate
+- `1.9.0` — promoted stable release
 
-## Releasing an Experimental Version (from main)
+## Release Helper
 
-```bash
-scripts/release.sh 1.7.0a2 --push
-```
+`scripts/release.sh` validates the version and branch, requires a clean worktree,
+updates `pyproject.toml` and `turnstone/__init__.py`, regenerates `uv.lock`,
+commits, and creates the `vX.Y.Z` tag. With `--push`, it pushes the branch and
+tag atomically so CI never observes only half of a release.
 
-This bumps `pyproject.toml` + `turnstone/__init__.py`, regenerates `uv.lock`, commits, tags `v1.7.0a2`, and pushes. CI runs, then publish + Docker workflows fire automatically.
+The helper enforces these release locations:
 
-## Releasing a Stable Patch (from stable/X.Y)
+- pre-releases: `dev` only
+- current stable releases: `main`
+- prior-line patches: the matching `stable/X.Y` branch
 
-```bash
-git checkout stable/1.6
-git cherry-pick <commit-hash>    # bugfix from main
-scripts/release.sh 1.6.1 --push
-```
-
-## Promoting Experimental to Stable
-
-When `main` is ready for a stable release:
+### Next-release pre-release
 
 ```bash
-# 1. Tag the stable release on main
-scripts/release.sh 1.6.0 --push
-
-# 2. Create the stable maintenance branch from that tag
-git branch stable/1.6 v1.6.0
-git push origin stable/1.6
-
-# 3. Start the next experimental cycle on main
-scripts/release.sh 1.7.0a1 --push
+git switch dev
+git pull --ff-only origin dev
+scripts/release.sh 1.9.0rc1 --push
 ```
 
-The previous stable branch continues to receive security-only patches;
-the track before it is retired at each promotion (at 1.6.0:
-`stable/1.5` stays maintained, `stable/1.4` is retired).
+### Current stable patch
 
-## CI/CD Pipeline
+```bash
+git switch main
+git pull --ff-only origin main
+scripts/release.sh 1.8.1 --push
+```
 
-All releases are gated on CI success:
+After publication, forward-merge the release commit from `main` into `dev`,
+retaining the development version in the release metadata files.
 
-1. `git push` with `v*` tag triggers **CI** (lint, typecheck, test, test-postgres, lock-check, security audit)
-2. On CI success, **Publish to PyPI** fires via `workflow_run`
-3. On CI success, **Publish Docker Image** fires via `workflow_run`
+### Prior stable patch
 
-Pre-release tags (`a`, `b`, `rc` suffixes) produce:
-- PyPI: pre-release version (not installed by default)
-- GitHub Release: marked as pre-release
-- Docker: `:experimental` alias + exact version tag
+```bash
+git switch stable/1.8
+git pull --ff-only origin stable/1.8
+scripts/release.sh 1.8.2 --push
+```
 
-Stable tags produce:
-- PyPI: stable version (default `pip install`)
-- GitHub Release: full release
-- Docker: `:stable`, `:latest`, `:X.Y`, `:X.Y.Z` tags
+Then merge `stable/1.8` into `main` and `main` into `dev`, retaining each
+destination branch's version metadata. This replaces the old repeated
+cherry-pick workflow.
+
+## Promoting `dev` to Stable
+
+For a 1.8 to 1.9 promotion:
+
+1. Freeze `dev` and forward-merge the latest `main` into it.
+2. Finalize the changelog and run the full release gates on `dev`.
+3. Create `stable/1.8` from the current `main` tip. It becomes the prior-line
+   maintenance branch only when `main` advances.
+4. Merge `dev` into `main` with ancestry preserved.
+5. From `main`, run `scripts/release.sh 1.9.0 --push`.
+6. Fast-forward `dev` to the 1.9.0 release commit, then begin the next
+   pre-release cycle there.
+
+Do not create `stable/1.9` at the 1.9.0 release. `main` already owns that line;
+create the maintenance branch only when `main` is about to advance again.
+
+## 1.8.0 Cutover
+
+The initial transition has no existing `dev` branch:
+
+1. Merge the 1.8.0 release preparation into `main` and run the full gates.
+2. From `main`, run `scripts/release.sh 1.8.0` to create the release commit and
+   tag locally.
+3. Create `dev` from `v1.8.0`, then atomically push `main`, `dev`, and the tag.
+4. Make `dev` the GitHub default branch.
+5. Start the 1.9 line on `dev`; publish `1.9.0a1` when that first alpha is ready.
+6. Leave the 1.7 and earlier stable branches frozen.
+
+GitHub's default branch is `dev`, so normal clones and pull requests begin on
+the development line. Stable install paths select `main` explicitly, and
+Renovate is configured to target `dev` directly.
+
+## CI and Publication
+
+Pushes and pull requests to `main`, `dev`, and `stable/*` run CI. A `v*` tag runs
+the same gates; only a successful same-repository tag run can start the PyPI,
+GitHub Release, and Docker publication jobs.
+
+Pre-release tags produce:
+
+- a PyPI pre-release
+- a GitHub pre-release that is never marked latest
+- exact and `:experimental` Docker tags
+
+Final tags on the current `main` minor produce:
+
+- a normal PyPI and GitHub release, marked latest on GitHub
+- exact, `:X.Y`, `:stable`, and `:latest` Docker tags
+
+Final tags on a prior `stable/X.Y` line produce a normal PyPI/GitHub maintenance
+release plus exact and `:X.Y` Docker tags. They do not move GitHub's latest
+release or the global Docker aliases backward.
 
 ## Dependency Updates
 
-Renovate targets `main` (experimental) only. Stable branches receive manual dependency updates via cherry-pick when security-relevant.
+Renovate targets `dev`. A dependency or supply-chain fix needed on a stable line
+starts on the oldest affected supported branch and follows the same forward-merge
+path as any other stable fix.
