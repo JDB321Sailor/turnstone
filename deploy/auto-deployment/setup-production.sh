@@ -477,7 +477,9 @@ _gitignore_has_line() {
         line="${line%"${line##*[![:space:]]}"}"   # strip trailing blanks
         [ -z "$line" ] && continue
         [ "${line:0:1}" = "#" ] && continue
-        [ "$line" = "$entry" ] || [ "$line" = "/$entry" ] && return 0
+        if [ "$line" = "$entry" ] || [ "$line" = "/$entry" ]; then
+            return 0
+        fi
     done <"$gitignore"
     return 1
 }
