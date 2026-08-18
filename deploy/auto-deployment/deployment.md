@@ -54,28 +54,34 @@ cd deploy/auto-deployment
 
 ### Order of operations
 
-1. **Deployment mode** — production or development. Choosing development
+1. **Git ignore sync** — before any prompt, the repository-root `.gitignore`
+   is checked for the generated deployment paths (`compose.yaml`,
+   `compose.override.yaml`, `tls.compose.yaml`, `Caddyfile`, `caddy/`,
+   `config/`, `searxng/`, `setup-production.env`, `.env`, and
+   `override.compose.yaml`). Any path not already ignored is appended; nothing
+   existing is modified.
+2. **Deployment mode** — production or development. Choosing development
    ends the script and directs you to `./run.sh` in the repository root,
    which starts the local development stack.
-2. **Image tag** — track the rolling `latest` image, or pin a released tag.
+3. **Image tag** — track the rolling `latest` image, or pin a released tag.
    The pinned path looks up the newest release tag automatically and lets
    you confirm or replace it.
-3. **Server nodes** — how many `turnstone-server` nodes to run (default: 1).
+4. **Server nodes** — how many `turnstone-server` nodes to run (default: 1).
    See [Server nodes](#server-nodes).
-4. **OIDC single sign-on** (yes/no) — see below.
-5. **TLS** (yes/no) — enables mutual TLS between the Turnstone services via
+5. **OIDC single sign-on** (yes/no) — see below.
+6. **TLS** (yes/no) — enables mutual TLS between the Turnstone services via
    the `tls.compose.yaml` overlay (an init container bootstraps an internal
    CA; services auto-provision certificates through the console's ACME
    endpoint — see `docs/tls.md`).
-6. **Public DNS** (yes/no) — serve the dashboard at a public hostname with
+7. **Public DNS** (yes/no) — serve the dashboard at a public hostname with
    a browser-trusted Let's Encrypt certificate on port 443.
-7. **LLM backend** (yes/no) — bootstrap default for an OpenAI-compatible
+8. **LLM backend** (yes/no) — bootstrap default for an OpenAI-compatible
    backend. Backends can also be connected later in the console Models tab.
-8. **Channel gateway** (yes/no) — Discord and/or Slack tokens.
-9. **File generation** — the stack files are copied into this folder, the
-   overlays and `Caddyfile` are written, and secrets
-   (`TURNSTONE_JWT_SECRET`, `POSTGRES_PASSWORD`) are preserved from the
-   existing `.env` if present, or generated fresh on a first run.
+9. **Channel gateway** (yes/no) — Discord and/or Slack tokens.
+10. **File generation** — the stack files are copied into this folder, the
+    overlays and `Caddyfile` are written, and secrets
+    (`TURNSTONE_JWT_SECRET`, `POSTGRES_PASSWORD`) are preserved from the
+    existing `.env` if present, or generated fresh on a first run.
 
 Answering **no** to every optional section still produces a safe and secure
 deployment: random secrets, the dashboard served over HTTPS on
