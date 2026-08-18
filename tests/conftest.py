@@ -15,20 +15,6 @@ from unittest.mock import MagicMock
 import pytest
 
 
-def pytest_sessionstart(session: pytest.Session) -> None:
-    """Resolve MCP v1's generic FastMCP settings model for test servers.
-
-    MCP 1.29.0 defines ``Settings`` before ``FastMCP``, so its ``lifespan``
-    annotation remains an unresolved forward reference after import. Rebuild
-    once, after the module is fully loaded, before any integration fixture
-    constructs a FastMCP server. Pydantic's public hook is a no-op once the SDK
-    ships a complete model.
-    """
-    from mcp.server.fastmcp.server import Settings as FastMCPSettings
-
-    FastMCPSettings.model_rebuild()
-
-
 def stop_loop_thread(loop: asyncio.AbstractEventLoop, thread: threading.Thread) -> None:
     """Fully tear down a ``loop.run_forever``-in-a-thread test loop.
 
@@ -360,49 +346,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         choices=["sqlite", "postgresql"],
         help="Storage backend for integration tests (default: sqlite)",
     )
-
-
-def _pg_base_url() -> str:
-    return os.environ.get(
-        "TURNSTONE_TEST_PG_URL",
-        "postgresql+psycopg://postgres:postgres@localhost:5432/turnstone_test",
-    )
-
-
-@pytest.fixture
-def fresh_pg_url(request: pytest.FixtureRequest) -> Iterator[Any]:
-    """Create a throwaway PostgreSQL database for migration-path tests.
-
-    Skips unless the suite is running against PostgreSQL. Tests that exercise
-    migrations from scratch cannot use the shared ``turnstone_test`` schema.
-    """
-    if request.config.getoption("--storage-backend") != "postgresql":
-        pytest.skip("PostgreSQL-only migration path")
-
-    import uuid
-
-    import sqlalchemy as sa
-
-    base = sa.make_url(_pg_base_url())
-    db_name = f"ts_migtest_{uuid.uuid4().hex[:12]}"
-    # CREATE/DROP DATABASE cannot run in a transaction.
-    admin = sa.create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
-    try:
-        with admin.connect() as conn:
-            conn.execute(sa.text(f'CREATE DATABASE "{db_name}"'))
-        yield base.set(database=db_name)
-    finally:
-        with admin.connect() as conn:
-            # Terminate any lingering backends before dropping the database.
-            conn.execute(
-                sa.text(
-                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                    "WHERE datname = :d AND pid <> pg_backend_pid()"
-                ),
-                {"d": db_name},
-            )
-            conn.execute(sa.text(f'DROP DATABASE IF EXISTS "{db_name}"'))
-        admin.dispose()
 
 
 @pytest.fixture

@@ -1,7 +1,6 @@
-"""SQLAlchemy Core definitions for current metadata and create-all schemas.
+"""SQLAlchemy Core schema — single source of truth for all table definitions.
 
-Alembic revision history is maintained separately. Parity tests keep these two
-manual definitions aligned; neither is generated from the other.
+Used by both storage backends and Alembic migrations.
 """
 
 from __future__ import annotations
@@ -25,45 +24,6 @@ structured_memories = sa.Table(
     sa.Column("last_accessed", sa.Text, nullable=False, server_default=""),
     sa.Column("access_count", sa.Integer, nullable=False, server_default="0"),
     sa.UniqueConstraint("name", "scope", "scope_id", name="uq_smem_name_scope"),
-)
-
-sa.Index("idx_smem_type", structured_memories.c.type)
-sa.Index("idx_smem_scope", structured_memories.c.scope, structured_memories.c.scope_id)
-
-# Every metadata-only memory surface shares this projection. Keeping it next
-# to the table definition makes omitting ``content`` a storage contract rather
-# than an endpoint convention that can drift when fields are added.
-structured_memory_summary_columns = (
-    structured_memories.c.memory_id,
-    structured_memories.c.name,
-    structured_memories.c.description,
-    structured_memories.c.type,
-    structured_memories.c.scope,
-    structured_memories.c.scope_id,
-    structured_memories.c.created,
-    structured_memories.c.updated,
-    structured_memories.c.last_accessed,
-    structured_memories.c.access_count,
-)
-
-memory_index_snapshots = sa.Table(
-    "memory_index_snapshots",
-    metadata,
-    sa.Column("ws_id", sa.Text, nullable=False),
-    # One immutable binding per durable workstream row. principal_id and
-    # visibility_key are provenance describing the first admitted model turn;
-    # neither is part of the identity.
-    sa.Column("principal_id", sa.Text, nullable=False, server_default=""),
-    sa.Column("project_id", sa.Text, nullable=False, server_default=""),
-    sa.Column("project_name", sa.Text, nullable=False, server_default=""),
-    sa.Column("visibility_key", sa.Text, nullable=False),
-    sa.Column("content", sa.Text, nullable=False),
-    sa.Column("format_version", sa.Integer, nullable=False),
-    sa.Column("entry_count", sa.Integer, nullable=False),
-    sa.Column("char_count", sa.Integer, nullable=False),
-    sa.Column("invalid_description_count", sa.Integer, nullable=False, server_default="0"),
-    sa.Column("captured_at", sa.Text, nullable=False),
-    sa.PrimaryKeyConstraint("ws_id"),
 )
 
 conversations = sa.Table(
@@ -115,13 +75,6 @@ conversations = sa.Table(
     # Stripped before the LLM wire (it is a ``_``-prefixed key by the time it
     # reaches a provider).  Added in migration 060.
     sa.Column("meta", sa.Text, nullable=True),
-    # Stable idempotency identity for an admitted live conversation commit. A
-    # retry after an ambiguous database acknowledgement can recover the original
-    # row instead of duplicating it. Nullable keeps every legacy/offline bulk
-    # writer on the historical append-only path; the partial composite unique
-    # index therefore constrains only keyed commits on both SQLite and
-    # PostgreSQL. Added in 071.
-    sa.Column("commit_key", sa.Text),
 )
 
 sa.Index("idx_conversations_timestamp", conversations.c.timestamp)
@@ -129,14 +82,6 @@ sa.Index("idx_conversations_timestamp", conversations.c.timestamp)
 # seek, not a row scan) and per-ws event-cursor range queries.  See
 # migration 059.
 sa.Index("idx_conversations_ws_event", conversations.c.ws_id, conversations.c.event_id)
-sa.Index(
-    "uq_conversations_ws_commit_key",
-    conversations.c.ws_id,
-    conversations.c.commit_key,
-    unique=True,
-    sqlite_where=conversations.c.commit_key.is_not(None),
-    postgresql_where=conversations.c.commit_key.is_not(None),
-)
 
 workstreams = sa.Table(
     "workstreams",
@@ -772,8 +717,6 @@ intent_verdicts = sa.Table(
     sa.Column("tier", sa.Text, nullable=False),
     sa.Column("judge_model", sa.Text, nullable=False, server_default=""),
     sa.Column("user_decision", sa.Text, nullable=False, server_default=""),
-    sa.Column("resolver_principal_id", sa.Text, nullable=False, server_default=""),
-    sa.Column("execution_principal_id", sa.Text, nullable=False, server_default=""),
     sa.Column("latency_ms", sa.Integer, nullable=False, server_default="0"),
     sa.Column("created", sa.Text, nullable=False),
 )

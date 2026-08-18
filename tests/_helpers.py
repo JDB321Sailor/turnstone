@@ -39,7 +39,7 @@ def make_chat_session(**overrides: Any) -> Any:
     """Build a minimal ``ChatSession`` with sane test defaults.
 
     Caller passes any constructor arg as a kwarg to override the default —
-    e.g. ``make_chat_session(memory_config=MemoryConfig(relevance_k=5))``.
+    e.g. ``make_chat_session(memory_config=MemoryConfig(fetch_limit=5))``.
     """
     from turnstone.core.session import ChatSession
 
@@ -62,7 +62,10 @@ def patch_session_storage(
     active: bool = True,
     raise_on_is_active: bool = False,
 ) -> list[str]:
-    """Patch session storage for watch predicate tests."""
+    """Patch ``session.get_storage`` to a stub whose ``is_watch_active``
+    returns *active* (or raises if *raise_on_is_active*).  Returns the
+    list of ``watch_id``s the predicate was called with.
+    """
     from turnstone.core import session as session_mod
 
     calls: list[str] = []

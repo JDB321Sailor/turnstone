@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import threading
-
 import pytest
 
 from turnstone.core.settings_registry import (
@@ -55,44 +53,6 @@ class TestValidateKey:
         assert defn.default is False  # opt-in: off by default
         assert defn.section == "judge"
         assert "judge.smart_approvals" in SETTINGS
-
-    def test_approval_timeout_defaults_to_waiting_indefinitely(self):
-        defn = validate_key("tools.approval_timeout_seconds")
-        assert defn.type == "int"
-        assert defn.default == 0
-        assert defn.min_value == 0
-        assert defn.max_value == int(threading.TIMEOUT_MAX)
-        assert defn.section == "tools"
-        assert "0 = wait indefinitely" in defn.description
-
-        assert validate_value("tools.approval_timeout_seconds", 0) == 0
-        assert validate_value("tools.approval_timeout_seconds", "90000") == 90_000
-        assert validate_value(
-            "tools.approval_timeout_seconds",
-            int(threading.TIMEOUT_MAX),
-        ) == int(threading.TIMEOUT_MAX)
-        with pytest.raises(ValueError, match="minimum"):
-            validate_value("tools.approval_timeout_seconds", -1)
-        with pytest.raises(ValueError, match="maximum"):
-            validate_value(
-                "tools.approval_timeout_seconds",
-                int(threading.TIMEOUT_MAX) + 1,
-            )
-
-    def test_memory_index_over_budget_notice_is_opt_in(self):
-        defn = validate_key("memory.model_index_over_budget_notice")
-        assert defn.type == "bool"
-        assert defn.default is False
-        assert defn.section == "memory"
-        assert "successful model memory-tool save" in defn.help
-        assert "REST and SDK save responses are unchanged" in defn.help
-        assert "Console admin health remains available" in defn.help
-
-    def test_memory_nudges_help_preserves_index_and_tool(self):
-        defn = validate_key("memory.nudges")
-        assert defn.default is True
-        assert "live memory pointers" in defn.help
-        assert "immutable initial memory index and memory tool remain available" in defn.help
 
     def test_confidence_threshold_is_smart_approval_bar(self):
         """Default bumped to the Smart Approvals auto-approve bar (0.95),

@@ -131,9 +131,6 @@ class _DurabilitySession(FakeSession):
         self.shutdown_entered.set()
         ChatSession.shutdown_publication_and_drain_durability(self)  # type: ignore[arg-type]
 
-    def resolve_close_approvals(self) -> None:
-        pass
-
 
 class _ReplaceAfterSnapshotStorage(FakeStorage):
     """Replace A immediately after returning its first open snapshot."""
@@ -212,130 +209,6 @@ class _AcquireProbe:
 
     def __exit__(self, *_exc: object) -> None:
         self.release()
-
-
-class _BlockingSoftCloseSession(FakeSession):
-    """Expose the close-preparation window and its durability refusal."""
-
-    def __init__(
-        self,
-        ws_id: str,
-        *,
-        prepare_result: bool = True,
-        unresolved: bool = False,
-    ) -> None:
-        super().__init__(ws_id)
-        self.prepare_result = prepare_result
-        self.unresolved = unresolved
-        self.prepare_entered = threading.Event()
-        self.release_prepare = threading.Event()
-
-    def has_unresolved_conversation_persistence(self) -> bool:
-        return self.unresolved
-
-    def prepare_soft_close(self) -> bool:
-        self.prepare_entered.set()
-        assert self.release_prepare.wait(timeout=10), "test did not release close preparation"
-        if self.prepare_result:
-            self.unresolved = False
-        return self.prepare_result
-
-
-def test_soft_close_fences_fresh_send_before_session_preparation() -> None:
-    """A send crossing the close drain is refused before worker admission."""
-    mgr, adapter, storage = _make_manager()
-    ws = mgr.create(user_id="u1", name="closing")
-    session = _BlockingSoftCloseSession(ws.id)
-    ws.session = session  # type: ignore[assignment]
-    close_results: list[bool] = []
-    worker_ran = threading.Event()
-
-    close_thread = threading.Thread(
-        target=lambda: close_results.append(mgr.close(ws.id)),
-        daemon=True,
-    )
-    close_thread.start()
-    assert session.prepare_entered.wait(timeout=5), "close never entered session preparation"
-
-    # ``prepare_soft_close`` is deliberately blocked. The dispatch tombstone
-    # must already be visible under the worker's own admission lock; otherwise
-    # the caller gets a false accepted response for a generation that the
-    # session close fence will reject after the thread starts.
-    assert session_worker.send(ws, enqueue=lambda: None, run=worker_ran.set) is False
-    assert worker_ran.is_set() is False
-    assert ws.worker_thread is None
-
-    session.release_prepare.set()
-    close_thread.join(timeout=5)
-
-    assert not close_thread.is_alive()
-    assert close_results == [True]
-    assert mgr.get(ws.id) is None
-    assert ws._closed is True
-    assert storage.rows[ws.id].state == "closed"
-    assert adapter.cleaned_up == [ws.id]
-
-
-def test_unresolved_soft_close_retries_inside_dispatch_fence() -> None:
-    """Recovery is attempted while fresh worker admission stays fenced."""
-    mgr, adapter, storage = _make_manager()
-    ws = mgr.create(user_id="u1", name="close-retry-unresolved")
-    session = _BlockingSoftCloseSession(ws.id, unresolved=True)
-    ws.session = session  # type: ignore[assignment]
-    close_results: list[bool] = []
-
-    close_thread = threading.Thread(
-        target=lambda: close_results.append(mgr.close(ws.id)),
-        daemon=True,
-    )
-    close_thread.start()
-    assert session.prepare_entered.wait(timeout=5), "close never retried persistence"
-    assert session_worker.send(ws, enqueue=lambda: None, run=lambda: None) is False
-
-    session.release_prepare.set()
-    close_thread.join(timeout=5)
-
-    assert not close_thread.is_alive()
-    assert close_results == [True]
-    assert session.unresolved is False
-    assert mgr.get(ws.id) is None
-    assert ws._closed is True
-    assert storage.rows[ws.id].state == "closed"
-    assert adapter.cleaned_up == [ws.id]
-
-
-def test_refused_soft_close_restores_fresh_dispatch() -> None:
-    """A durability refusal rolls back only the workstream dispatch fence."""
-    mgr, adapter, storage = _make_manager()
-    ws = mgr.create(user_id="u1", name="close-refused")
-    session = _BlockingSoftCloseSession(ws.id, prepare_result=False, unresolved=True)
-    ws.session = session  # type: ignore[assignment]
-
-    close_results: list[bool] = []
-    close_thread = threading.Thread(
-        target=lambda: close_results.append(mgr.close(ws.id)),
-        daemon=True,
-    )
-    close_thread.start()
-    assert session.prepare_entered.wait(timeout=5), "close never entered session preparation"
-    assert session_worker.send(ws, enqueue=lambda: None, run=lambda: None) is False
-    session.release_prepare.set()
-    close_thread.join(timeout=5)
-    assert not close_thread.is_alive()
-    assert close_results == [False]
-
-    assert mgr.get(ws.id) is ws
-    assert ws._closed is False
-    assert ws.id not in adapter.cleaned_up
-    assert storage.rows[ws.id].state != "closed"
-
-    worker_ran = threading.Event()
-    assert session_worker.send(ws, enqueue=lambda: None, run=worker_ran.set) is True
-    assert worker_ran.wait(timeout=5), "fresh worker did not run after close rollback"
-    worker = ws.worker_thread
-    assert worker is not None
-    worker.join(timeout=5)
-    assert not worker.is_alive()
 
 
 def test_close_idle_does_not_retire_an_admitted_worker() -> None:
@@ -932,10 +805,10 @@ def test_delete_drains_and_tombstones_predecessor_state_before_same_id_successor
     assert storage.rows[ws_id].state == "idle"
 
 
-def test_delete_drains_admitted_conversation_write_and_fences_same_id_successor(
+def test_delete_drains_admitted_conversation_write_before_same_id_successor(
     storage_backend: Any,
 ) -> None:
-    """An accepted save drains before delete; its closed lane cannot hit a successor."""
+    """An accepted save cannot land after delete and leak into successor B."""
     backend = storage_backend
     adapter = FakeAdapter()
     mgr = SessionManager(
@@ -999,8 +872,7 @@ def test_delete_drains_admitted_conversation_write_and_fences_same_id_successor(
     assert delete_called.is_set()
 
     successor = mgr.create(ws_id=ws_id, user_id="u2", name="successor")
-    assert successor.user_id == "u2"
-    assert successor.name == "successor"
+    assert successor is not predecessor
     assert backend.load_message_turns(ws_id) == []
     assert (
         session.commit_durable(
@@ -1080,57 +952,3 @@ def test_same_id_successor_created_waits_for_predecessor_closed_publication(
         ("closed", ws_id),
         ("created", ws_id),
     ]
-
-
-def test_retirement_probe_never_blocks_on_held_session_locks(tmp_db: str) -> None:
-    """Round-4 review pin (AB/BA deadlock): the idle-close and eviction scans
-    probe persistence while holding ``ws._lock``, and force-cancel's finalizer
-    holds the generation lock and then takes ``ws._lock`` — so the retirement
-    probe must never BLOCK on the session's generation/handoff locks. A held
-    lock reads as busy → not retirable this sweep (True), never a hang.
-    """
-    from tests._session_helpers import make_session
-    from turnstone.core.session_manager import _session_persistence_blocks_retirement
-
-    session = make_session()
-    # Free locks: a clean session is retirable...
-    assert _session_persistence_blocks_retirement(session) is False
-    # ...and a pending journal row blocks retirement.
-    with session._history_handoff_lock:
-        session._journal_conversation_row_locked(
-            commit_key="probe-key",
-            message={"role": "system", "content": "accepted overlay"},
-            persist=lambda: 0,
-            event_id=None,
-        )
-    assert _session_persistence_blocks_retirement(session) is True
-
-    for lock_name in ("_generation_lock", "_history_handoff_lock"):
-        hold = threading.Event()
-        release = threading.Event()
-        lock = getattr(session, lock_name)
-
-        def _holder(
-            lock: Any = lock,
-            hold: threading.Event = hold,
-            release: threading.Event = release,
-        ) -> None:
-            with lock:
-                hold.set()
-                release.wait(5)
-
-        holder = threading.Thread(target=_holder, daemon=True)
-        holder.start()
-        assert hold.wait(2)
-        outcome: list[bool] = []
-        prober = threading.Thread(
-            target=lambda out=outcome: out.append(_session_persistence_blocks_retirement(session)),
-            daemon=True,
-        )
-        prober.start()
-        prober.join(2)
-        still_running = prober.is_alive()
-        release.set()
-        holder.join(2)
-        assert not still_running, f"probe blocked on a held {lock_name}"
-        assert outcome == [True], lock_name

@@ -282,11 +282,9 @@ names from the resolved cycle and does not flip this field.
   "messages": [
     {"role": "user", "content": "Hello"},
     {"role": "assistant", "content": "Hi there!", "tool_calls": null},
-    {"role": "tool", "content": "..."},
-    {"role": "system", "source": "compaction", "content": "Summary..."}
+    {"role": "tool", "content": "..."}
   ],
-  "cursor": null,
-  "handoff_token": "opaque-live-revision"
+  "cursor": null
 }
 ```
 
@@ -295,49 +293,13 @@ trailing turn that the event ring can reconstruct, open the SSE URL with
 `?last_event_id=<cursor>` (or send `Last-Event-ID`) so the buffered delta fills
 that turn without double-rendering it.
 
-For a loaded workstream, `messages` is the requested tail projection of one
-authoritative total accepted conversation-row prefix. It includes user,
-assistant, tool, and system rows, including compaction checkpoints projected as
-`role: "system", source: "compaction"` and cancellation-generated partial
-assistant or synthesized tool-result markers when present.
-
-`handoff_token` is non-null exactly when the workstream's session is live on
-the serving node (a pane opened it there); it identifies the exact total
-prefix used for that render. Pass it once on the initial SSE URL as
-`history_token`. The token is opaque and process-local: do not parse,
-persist, or reuse it. Admission of any later conversation row changes the
-token; moving a row from the pending journal to durable storage does not. The
-server validates the token while atomically registering the listener. A
-mismatch emits `history_resync` and closes the stream; fetch history again
-instead of replaying from a numeric cursor. A native reconnect's
-`Last-Event-ID` header takes priority and follows the normal ring-replay
-path.
-
-A null `handoff_token` on a 200 is the cold storage-only read: the workstream
-is not loaded on the serving node, so there is no live writer and no splice
-to witness. The payload may seed a render and a token-less stream bootstrap
-(the server converges the pane through `clear_ui`), never a cursor handoff.
-`/history` never loads a session — reading an archived transcript leaves the
-session pool untouched.
-
 Each message in the `messages` array has:
 
 | Field        | Type              | Description                                   |
 |--------------|-------------------|-----------------------------------------------|
-| `role`       | string            | `"user"`, `"assistant"`, `"tool"`, or `"system"` |
+| `role`       | string            | `"user"`, `"assistant"`, or `"tool"`          |
 | `content`    | string or null    | Text content of the message                   |
 | `tool_calls` | array or null     | Present only on assistant messages with calls  |
-| `source`     | string (optional) | Operator-context or marker source, including `"compaction"` |
-| `meta`       | object (optional) | Structured display metadata for the source     |
-| `attachments` | array (optional) | Accepted attachment metadata: `attachment_id`, `kind`, `filename`, and `mime_type` |
-| `sender` | string (optional) | Authenticated participant attributed to an accepted user row |
-| `client_send_ids` | string[] (optional) | Optimistic-send correlation tokens carried by an accepted user row; never idempotency keys |
-| `tool_call_id` | string (tool only) | Provider correlation id for the corresponding assistant call; ids may be reused across turns |
-| `tool_name` | string (tool only) | Function name for the tool result |
-| `event_id` | integer (optional) | Accepted SSE row identity used for replay deduplication |
-| `is_error` | bool (tool only) | Final error disposition |
-| `effect_status` | string (optional) | Persisted effect disposition when known |
-| `preview` | object (optional) | Content-addressed preview descriptor; does not contain preview bytes |
 | `reasoning`  | string (optional) | Concatenated reasoning / chain-of-thought text on assistant turns whose `provider_data` carried reasoning-bearing blocks (Anthropic `thinking`, OpenAI Responses `reasoning`, or synthetic `reasoning_text` from local-model servers). Present only when the active model's `surface_persisted_reasoning` flag is True. |
 
 Each entry in `tool_calls`:
@@ -351,64 +313,6 @@ Each entry in `tool_calls`:
 
 After the synthetic replay or cursor delta, the server streams real-time events
 as the model generates a response:
-
-Typed accepted-user projection is capability-gated. Add `?user_turn=1` to every
-per-workstream SSE URL to receive `user_turn`; the embedded panes and both SDKs
-do this automatically. A raw client that omits the capability receives a
-`replay_truncated` frame with reason `user_turn_projection_unsupported`, whose
-SSE id is anchored immediately before the unrepresented row. It must fetch and
-render `/history` before reconnecting. This backward-compatible repair frame
-does not expose the row content, and a failed history fetch must retain the
-pre-row cursor so the repair signal repeats.
-
-Final accepted-tool projection is separately capability-gated. Browser panes
-add `tool_turn=1` to every per-workstream SSE URL, including every manual and
-native reconnect. A capable listener receives a second `tool_result` with
-`accepted: true`, the row's `_event_id`, and the final scalar text, error,
-preview, and effect fields that entered accepted history. Reducers replace the
-earlier executor receipt in place. A client that omits `tool_turn=1` receives a
-redacted `replay_truncated` frame with reason
-`tool_turn_projection_unsupported`, anchored at the cursor immediately before
-the accepted row, and must rebuild from `/history`.
-
-This accepted projection is a transcript-consistency mechanism, not a wire
-confidentiality boundary. The preliminary `tool_result` is deliberately sent
-as soon as execution completes and can precede post-execution output transforms;
-do not treat `accepted: true` as proof that earlier frames contained the same
-text.
-
-**`user_turn`** -- the canonical accepted user row. Every upgraded listener on
-the shared workstream receives the event, including peer browsers, so peers can
-render the turn without refetching all history. The originating pane uses
-`client_send_ids` only to replace or mark its exact optimistic bubble; peers
-render the row once by SSE event id. Reusing a client token still admits and
-emits a distinct turn.
-
-```json
-{
-  "type": "user_turn",
-  "ws_id": "abc123",
-  "content": "Inspect this file",
-  "attachments": [
-    {
-      "attachment_id": "a1",
-      "kind": "text",
-      "filename": "notes.txt",
-      "mime_type": "text/plain"
-    }
-  ],
-  "sender": "user-123",
-  "client_send_ids": ["browserSend_42"],
-  "_event_id": 17
-}
-```
-
-`client_send_ids` is empty for callers that did not provide a correlation
-token. `_event_id` is the accepted row's monotonic SSE identity and is the
-deduplication key; `client_send_ids` is not. Correlation tokens are not
-credentials. When both identities are known, an upgraded pane settles a local
-optimistic bubble only when the event's `sender` matches that viewer; peer rows
-still render canonically without touching local optimistic state.
 
 **`thinking_start`** -- the model has begun generating (shown as a spinner).
 
@@ -478,31 +382,6 @@ auto-reconnect re-replays).
 |--------------|--------|------------------------------------------------------------|
 | `content`    | string | Joined assistant content text accumulated this turn        |
 | `reasoning`  | string | Joined reasoning / chain-of-thought text accumulated       |
-
-**`agent_context`** -- latest prompt usage for one running `task_agent`, sent
-after each of that agent's model turns when the provider reports usage. The
-parent call ID targets the existing task-agent card; clients should replace the
-prior reading for that parent rather than append a new badge. No event is sent
-when usage is unavailable. A matching `tool_result` (`call_id` equals
-`parent_call_id`) is the terminal signal: discard the reading then. Fresh and
-truncated recovery rebuild the active set from the synthetic readings they
-include, so an omitted parent is no longer active; completed readings are not
-persisted in conversation history.
-
-```json
-{
-  "type": "agent_context",
-  "parent_call_id": "call_task_abc123",
-  "prompt_tokens": 41000,
-  "context_window": 128000
-}
-```
-
-| Field             | Type   | Description                                      |
-|-------------------|--------|--------------------------------------------------|
-| `parent_call_id`  | string | Parent `task_agent` call whose card owns the badge |
-| `prompt_tokens`   | int    | Prompt tokens used by the agent's latest model turn |
-| `context_window`  | int    | Resolved context window for the agent's model lane |
 
 **`tool_info`** -- one or more tool calls that were auto-approved (no user
 action required).
@@ -584,11 +463,10 @@ Each item in `items` (shared by `tool_info` and `approve_request`):
 {"type": "tool_output_chunk", "call_id": "call_abc123", "chunk": "Building project...\n"}
 ```
 
-**`tool_result`** -- output from a completed tool execution. The first event is the executor receipt. With `tool_turn=1`, a later event carrying `accepted: true` is the canonical accepted-history replacement and includes `_event_id`; `preview` and `effect_status` are present when persisted. The `call_id` matches the corresponding `tool_info`/`approve_request` item and any preceding `tool_output_chunk` events, but clients must scope reused ids to the newest rendered tool batch. For bash tools, the receipt arrives after all streaming chunks and includes both stdout and stderr. The `is_error` field is `true` when the tool execution failed (e.g. bash exit code >= 2 or signal, file not found, timeout). Exit code 1 is ambiguous (e.g. `grep` no-match) and is not flagged. User denials are tracked separately via a `denied` flag. Clients should use `is_error` instead of text-prefix heuristics.
+**`tool_result`** -- final output from a completed tool execution. The `call_id` matches the corresponding `tool_info`/`approve_request` item and any preceding `tool_output_chunk` events. For bash tools, this arrives after all streaming chunks and includes both stdout and stderr. The `is_error` field is `true` when the tool execution failed (e.g. bash exit code >= 2 or signal, file not found, timeout). Exit code 1 is ambiguous (e.g. `grep` no-match) and is not flagged. User denials are tracked separately via a `denied` flag. Clients should use `is_error` instead of text-prefix heuristics.
 
 ```json
 {"type": "tool_result", "call_id": "call_abc123", "name": "bash", "output": "file1.py\nfile2.py\n", "is_error": false}
-{"type": "tool_result", "accepted": true, "_event_id": 42, "call_id": "call_abc123", "name": "bash", "output": "file1.py\nfile2.py\n", "is_error": false, "effect_status": "unknown"}
 ```
 
 **`status`** -- token usage statistics, sent after each model turn.
@@ -685,25 +563,6 @@ dedicated rewind/retry, successful fork publication, and opening saved history.
 {"type": "clear_ui"}
 ```
 
-**`history_resync`** -- the history rendered before this stream opened no
-longer names the live accepted conversation-row prefix. The server closes the
-stream after this event. Keep the current transcript visible, fetch `/history`
-again, render the successful response, and open a new stream with its new
-one-shot handoff token. A numeric event cursor cannot prove that a complete row
-was rendered and is not a substitute for this repair.
-
-```json
-{"type": "history_resync", "ws_id": "abc123", "reason": "handoff_mismatch"}
-```
-
-`ws_id` is present for registration-time handoff mismatches; on an already
-scoped live stream, clients may infer it from the stream when omitted.
-
-`reason` is a free string. `workstream_gone` means the workstream's durable
-row was deleted out from under a live session (by another node, or by
-startup cleanup); the follow-up `/history` fetch answers 503/404 rather than
-minting a new token, and new sends are refused.
-
 **`cancelled`** -- a cancel request was acknowledged (via the Stop button or
 `POST /v1/api/workstreams/{ws_id}/cancel`). This signals that cancellation is in
 progress, not that it is complete. The worker thread may still be finishing.
@@ -712,11 +571,6 @@ the workstream emits a terminal `state_change` (`idle` in the normal cancel
 path, or `error`). `stream_end` only closes assistant rendering: it may already
 have arrived before Stop reaches an approval or tool phase, so it is not a
 cancellation-completion signal.
-
-The `cancelled` event is not itself a history row. If cancellation accepts a
-partial assistant response or synthesizes tool-result receipts to close
-outstanding calls, those assistant/tool rows appear in `/history` and advance
-the same handoff prefix.
 
 ```json
 {"type": "cancelled"}
@@ -787,11 +641,9 @@ so multiple consumers (browser, console proxy, SDK) can connect
 simultaneously and each receives every event.  On reconnect the client receives
 either the event-ring delta after its cursor or a synthetic recovery replay.
 The synthetic replay includes `connected`, cached `status`, every pending
-approval cycle, the current `state_change`, an optional
-`in_progress_snapshot` with partial content/reasoning, and the latest
-`agent_context` reading for each running task agent. A matching `tool_result`
-ends that reading. Conversation history stays on the REST `/history` endpoint;
-completed task-agent readings are not retained.
+approval cycle, the current `state_change`, and an optional
+`in_progress_snapshot` with partial content/reasoning. Conversation history
+stays on the REST `/history` endpoint.
 
 ---
 
@@ -806,24 +658,11 @@ visibility checks run before storage reconstruction.
 |-----------------|------|---------|-------------|
 | `limit` | integer | `100` | Tail row limit, clamped to 1--500 |
 
-The response is
-`{"ws_id": ..., "messages": [...], "cursor": ..., "handoff_token": ...}`
-using the message shape and total-prefix contract documented in the event-stream
-bootstrap above. `cursor` is normally `null`; when non-null, pass it as
-`last_event_id` on the initial `/events` request. For a loaded workstream, pass
-the non-null `handoff_token` from the history just rendered on that same initial
-request. A missing, invisible, or wrong-kind workstream returns the endpoint's
-ordinary `404` shape.
-
-If the durable prefix cannot be loaded, the endpoint returns:
-
-```json
-{"error": "History temporarily unavailable"}
-```
-
-Status code: `503`. This response is not authoritative and carries no usable
-handoff token. Keep any current transcript, do not open a tokenless replacement
-stream, and retry the history read.
+The response is `{"ws_id": ..., "messages": [...], "cursor": ...}` using the
+message shape documented in the event-stream bootstrap above. `cursor` is
+normally `null`; when non-null, open `/events?last_event_id=<cursor>` so the
+ring replays the deliberately trimmed in-progress tail. A missing, invisible,
+or wrong-kind workstream returns the endpoint's ordinary `404` shape.
 
 ---
 
@@ -836,14 +675,13 @@ indicators.
 **Events:**
 
 ```json
-{"type": "ws_state", "ws_id": "abc123", "state": "thinking", "persistence_state": "healthy"}
+{"type": "ws_state", "ws_id": "abc123", "state": "thinking"}
 ```
 
-| Field               | Type   | Description |
-|---------------------|--------|-------------|
-| `ws_id`             | string | Workstream identifier |
-| `state`             | string | Current workstream state |
-| `persistence_state` | string | Sanitized history-save state: `healthy`, `pending`, `retrying`, or `conflict`; omitted by older nodes means `healthy` |
+| Field   | Type   | Description              |
+|---------|--------|--------------------------|
+| `ws_id` | string | Workstream identifier    |
+| `state` | string | Current workstream state |
 
 Possible `state` values:
 
@@ -873,25 +711,19 @@ Returns a list of all active workstreams.
 ```json
 {
   "workstreams": [
-    {"ws_id": "abc123", "name": "default", "state": "idle", "persistence_state": "healthy"},
-    {"ws_id": "def456", "name": "hacker-news", "state": "thinking", "persistence_state": "retrying"}
+    {"ws_id": "abc123", "name": "default", "state": "idle"},
+    {"ws_id": "def456", "name": "hacker-news", "state": "thinking"}
   ]
 }
 ```
 
 Each workstream object:
 
-| Field               | Type   | Description |
-|---------------------|--------|-------------|
-| `ws_id`             | string | Unique workstream routing identifier |
-| `name`              | string | Display name (alias if set, otherwise `ws-xxxx`) |
-| `state`             | string | Current state (see state values above) |
-| `persistence_state` | string | Sanitized history-save state; defaults to `healthy` for older or unloaded rows |
-
-The persistence state intentionally carries no retry counts, timestamps,
-storage errors, commit keys, or conversation content. `pending` means an
-accepted row awaits its first durable save, `retrying` means automatic repair is
-active, and `conflict` requires operator intervention.
+| Field        | Type        | Description                                            |
+|--------------|-------------|--------------------------------------------------------|
+| `ws_id`      | string      | Unique workstream routing identifier                   |
+| `name`       | string      | Display name (alias if set, otherwise `ws-xxxx`)       |
+| `state`      | string      | Current state (see state values above)                 |
 
 ---
 
@@ -1012,20 +844,13 @@ Sends a user message to a workstream. Spawns a daemon worker thread that calls
 **Request body:**
 
 ```json
-{"message": "Explain how the server works", "attachment_ids": ["a1"], "client_send_id": "browserSend_42"}
+{"message": "Explain how the server works", "attachment_ids": ["a1"]}
 ```
 
 | Field            | Type       | Required | Description                                          |
 |------------------|------------|----------|------------------------------------------------------|
 | `message`        | string     | yes      | The user's message text                              |
 | `attachment_ids` | string[]   | no       | Staged uploads to attach (omit = auto-consume; `[]` = none) |
-| `client_send_id` | string     | no       | Opaque optimistic-UI correlation token matching `[A-Za-z0-9_-]{1,128}`; echoed in `user_turn` and history, never used for idempotency |
-
-The token correlates delivery only. Reusing the same value does not collapse or
-deduplicate requests: each accepted send remains a distinct history row and
-`user_turn` event. A live `message_queued` event carrying the token can prove
-server acceptance before the POST response arrives, including when that HTTP
-acknowledgement is lost.
 
 **Response.** Every 200 body carries `attached_ids` and
 `dropped_attachment_ids` (empty lists when no attachments are involved):
@@ -1052,7 +877,6 @@ acknowledgement is lost.
 | Status | Body                                            | Condition                              |
 |--------|-------------------------------------------------|----------------------------------------|
 | 400    | `{"error": "message is required"}`              | Message is empty                       |
-| 400    | `{"error": "client_send_id must match ..."}`    | Correlation token is invalid           |
 | 404    | `{"error": "Unknown workstream"}`               | `ws_id` not found (or closed mid-send) |
 | 409    | `{"status": "cross_user_interjection", ...}`    | Another participant's turn is in flight |
 
@@ -1447,16 +1271,6 @@ the close proceeds without writing the field.
 
 Status code: `400`
 
-**Error (conversation persistence unresolved):**
-
-```json
-{"error": "workstream has unresolved persistence"}
-```
-
-Status code: `409`. At least one accepted live conversation row still requires
-idempotent persistence reconciliation. The workstream remains loaded and no
-history is discarded; retry the close after storage recovers.
-
 ---
 
 ### `POST /v1/api/workstreams/{ws_id}/attachments`
@@ -1785,19 +1599,16 @@ Status code: `403`
 
 ### `GET /v1/api/memories`
 
-List body-free memory metadata with optional filters. Requires `read` scope. Without
-`scope`, returns only `global` plus the authenticated caller's `user`
-namespace. The public endpoint accepts `global`, `workstream`, and `user`;
-explicit workstream access is owner-bound.
+List structured memories with optional filters. Requires `read` scope.
 
 **Query parameters:**
 
 | Parameter  | Type   | Required | Default | Description                  |
 |------------|--------|----------|---------|------------------------------|
-| `type`     | string | no       | `""`    | Filter by memory type (user, general, feedback, reference) |
+| `type`     | string | no       | `""`    | Filter by memory type (user, project, feedback, reference) |
 | `scope`    | string | no       | `""`    | Filter by scope (global, workstream, user) |
 | `scope_id` | string | no       | `""`    | Scope qualifier. Auto-resolved for `scope=user` when auth is active. |
-| `limit`    | int    | no       | `100`   | Max results (1-200)          |
+| `limit`    | int    | no       | `100`   | Max results (capped at 200)  |
 
 **Response:**
 
@@ -1808,13 +1619,12 @@ explicit workstream access is owner-bound.
       "memory_id": "a1b2c3d4-e5f6-...",
       "name": "project_architecture",
       "description": "Core architecture patterns",
-      "type": "general",
+      "type": "project",
       "scope": "global",
       "scope_id": "",
+      "content": "The project uses a hexagonal architecture...",
       "created": "2026-03-10T10:00:00",
-      "updated": "2026-03-12T14:30:00",
-      "last_accessed": "",
-      "access_count": 0
+      "updated": "2026-03-12T14:30:00"
     }
   ],
   "total": 1
@@ -1826,9 +1636,7 @@ explicit workstream access is owner-bound.
 ### `POST /v1/api/memories`
 
 Save or upsert a structured memory. Requires `write` scope. Returns `201` on
-create, `200` on update. Every write must include an authored `description`
-that normalizes to 1-512 characters on one line; content-only updates are
-rejected.
+create, `200` on update.
 
 **Request body:**
 
@@ -1837,7 +1645,7 @@ rejected.
   "name": "deployment_process",
   "content": "Deploy via GitHub Actions. Staging auto-deploys on push to main.",
   "description": "CI/CD deployment workflow",
-  "type": "general",
+  "type": "project",
   "scope": "global",
   "scope_id": ""
 }
@@ -1847,8 +1655,8 @@ rejected.
 |--------------|--------|----------|-------------|--------------------------------------|
 | `name`       | string | yes      | --          | Memory name (max 256 chars)          |
 | `content`    | string | yes      | --          | Memory content (max 65536 chars)     |
-| `description`| string | yes      | --          | Authored one-line index hook (1-512 characters), required on every write |
-| `type`       | string | no       | unset       | user, general, feedback, or reference |
+| `description`| string | no       | `""`        | Short description for search ranking |
+| `type`       | string | no       | `"project"` | One of: user, project, feedback, reference |
 | `scope`      | string | no       | `"global"`  | One of: global, workstream, user     |
 | `scope_id`   | string | no       | `""`        | Scope qualifier (auto-resolved for user scope) |
 
@@ -1859,42 +1667,34 @@ rejected.
   "memory_id": "a1b2c3d4-e5f6-...",
   "name": "deployment_process",
   "description": "CI/CD deployment workflow",
-  "type": "general",
+  "type": "project",
   "scope": "global",
   "scope_id": "",
+  "content": "Deploy via GitHub Actions...",
   "created": "2026-03-14T10:00:00",
-  "updated": "2026-03-14T10:00:00",
-  "last_accessed": "",
-  "access_count": 0
+  "updated": "2026-03-14T10:00:00"
 }
 ```
-
-The response is body-free; use the exact-name GET endpoint when content is
-needed.
 
 **Error responses:**
 
 | Status | Condition                                              |
 |--------|--------------------------------------------------------|
-| 400    | Invalid input, public scope, scope ID, or limit |
-| 403    | Cross-user or non-owner workstream access |
-| 404    | Explicit workstream does not exist |
-| 500    | Storage mutation failed |
+| 400    | Missing name, empty content, invalid type/scope, name too long, content too long |
 
 ---
 
 ### `POST /v1/api/memories/search`
 
-Search body-free memory metadata by query. Uses POST for the request body but is non-mutating
-(requires only `read` scope). An omitted scope searches only `global` plus the
-authenticated caller's `user` namespace.
+Search memories by query. Uses POST for the request body but is non-mutating
+(requires only `read` scope).
 
 **Request body:**
 
 ```json
 {
   "query": "authentication",
-  "type": "general",
+  "type": "project",
   "scope": "",
   "limit": 20
 }
@@ -1906,7 +1706,7 @@ authenticated caller's `user` namespace.
 | `type`     | string | no       | `""`    | Filter by type                 |
 | `scope`    | string | no       | `""`    | Filter by scope                |
 | `scope_id` | string | no       | `""`    | Filter by scope ID             |
-| `limit`    | int    | no       | `20`    | Max results (1-50)             |
+| `limit`    | int    | no       | `20`    | Max results (capped at 50)     |
 
 **Response:**
 
@@ -1917,13 +1717,12 @@ authenticated caller's `user` namespace.
       "memory_id": "a1b2c3d4-e5f6-...",
       "name": "auth_patterns",
       "description": "Authentication architecture",
-      "type": "general",
+      "type": "project",
       "scope": "global",
       "scope_id": "",
+      "content": "JWT tokens with HS256...",
       "created": "2026-03-10T10:00:00",
-      "updated": "2026-03-12T14:30:00",
-      "last_accessed": "",
-      "access_count": 0
+      "updated": "2026-03-12T14:30:00"
     }
   ],
   "total": 1
@@ -1934,32 +1733,9 @@ authenticated caller's `user` namespace.
 
 ---
 
-### `GET /v1/api/memories/{name}`
-
-Fetch one live full memory body by exact name and scope. Requires `read` scope
-and records the access. List and search do not update access metadata.
-
-| Parameter  | Location | Required | Default    | Description         |
-|------------|----------|----------|------------|---------------------|
-| `name`     | path     | yes      | --         | Memory name         |
-| `scope`    | query    | no       | `"global"` | Scope of the memory |
-| `scope_id` | query    | no       | `""`       | Scope qualifier     |
-
-**Response (success):** `200` -- the full memory schema, including `content`.
-
-**Response (not found):** `404`
-
-```json
-{"error": "Memory 'auth_patterns' not found"}
-```
-
----
-
 ### `DELETE /v1/api/memories/{name}`
 
-Delete a memory by name and scope. Requires `write` scope. The delete returns
-success only for the row atomically removed and records the authenticated
-actor in the audit log.
+Delete a memory by name and scope. Requires `write` scope.
 
 **Path parameters:**
 
@@ -1990,7 +1766,7 @@ actor in the audit log.
 
 ### `GET /v1/api/admin/memories` (Console)
 
-List body-free memory metadata across all scopes. Requires `admin.memories`
+List structured memories across all scopes. Requires `admin.memories`
 permission.
 
 **Query parameters:**
@@ -2002,9 +1778,7 @@ permission.
 | `scope_id` | string | no       | `""`    | Filter by scope ID           |
 | `limit`    | int    | no       | `100`   | Max results (capped at 200)  |
 
-**Response:** `200` -- `AdminMemorySummary`, the public body-free metadata plus
-`scope_label`, a human-readable label for `scope_id` (empty when there is no
-scope ID, with the raw ID as fallback).
+**Response:** `200` -- same schema as `GET /v1/api/memories`.
 
 ---
 
@@ -2022,8 +1796,7 @@ Search memories by query. Requires `admin.memories` permission.
 | `scope_id` | string | no       | `""`    | Filter by scope ID            |
 | `limit`    | int    | no       | `20`    | Max results (capped at 50)    |
 
-**Response:** `200` -- the same `AdminMemorySummary` schema as
-`GET /v1/api/admin/memories`.
+**Response:** `200` -- same schema as `GET /v1/api/memories`.
 
 **Error:** `400` with `{"error": "q is required"}` if `q` is empty.
 
@@ -2031,8 +1804,7 @@ Search memories by query. Requires `admin.memories` permission.
 
 ### `GET /v1/api/admin/memories/{memory_id}` (Console)
 
-Get a single memory body by ID and record an access. Requires
-`admin.memories` permission.
+Get a single memory by ID. Requires `admin.memories` permission.
 
 **Path parameters:**
 
@@ -2047,84 +1819,20 @@ Get a single memory body by ID and record an access. Requires
   "memory_id": "a1b2c3d4-e5f6-...",
   "name": "project_architecture",
   "description": "Core architecture patterns",
-  "type": "general",
+  "type": "project",
   "scope": "global",
   "scope_id": "",
-  "scope_label": "",
   "content": "The project uses...",
   "created": "2026-03-10T10:00:00",
-  "updated": "2026-03-12T14:30:00",
-  "last_accessed": "2026-03-12T14:31:00",
-  "access_count": 1
+  "updated": "2026-03-12T14:30:00"
 }
 ```
-
-The response is `AdminMemoryInfo` (`AdminMemorySummary` plus `content`), and
-the counters include the completed GET touch.
 
 **Error (not found):** `404`
 
 ```json
 {"error": "Memory not found"}
 ```
-
-Storage-operation failures return `500`; unavailable storage returns `503`.
-
----
-
-### `PATCH /v1/api/admin/memories/{memory_id}` (Console)
-
-Replace the authored one-line index hook (1-512 characters) without changing
-the memory body. Records `memory.description_update`. Existing immutable
-snapshots remain unchanged.
-
-```json
-{"description": "Updated retrieval hook"}
-```
-
-Returns the updated body-free `AdminMemorySummary`:
-
-```json
-{
-  "memory_id": "a1b2c3d4-e5f6-...",
-  "name": "project_architecture",
-  "description": "Updated retrieval hook",
-  "type": "general",
-  "scope": "global",
-  "scope_id": "",
-  "scope_label": "",
-  "created": "2026-03-10T10:00:00",
-  "updated": "2026-03-14T09:00:00",
-  "last_accessed": "",
-  "access_count": 0
-}
-```
-
-Invalid descriptions return `400`, missing memories return `404`, storage
-operation failures return `500`, and unavailable storage returns `503`.
-
----
-
-### `GET /v1/api/admin/memories/index-health` (Console)
-
-Return derived, persistent health for every visibility envelope possible in
-the live workstream/project topology. The result is independent of whether a
-snapshot row already exists and reports the configured character budget, worst
-complete live index, overage, and legacy descriptions that need editing.
-
-```json
-{
-  "budget_chars": 65536,
-  "over_budget": false,
-  "max_char_count": 18420,
-  "max_entry_count": 210,
-  "over_by_chars": 0,
-  "invalid_description_count": 0,
-  "envelope_count": 3
-}
-```
-
-Calculation failures return `500`; unavailable storage returns `503`.
 
 ---
 
@@ -2655,13 +2363,6 @@ This REST snapshot plus cursor/delta split prevents both missing turns and
 double-rendering across refreshes, ring eviction, and process restart. The
 global state stream has its own snapshot/replay floor rather than conversation
 history.
-
-`history_resync` is a stronger repair signal than `replay_truncated`: it means
-the one-shot token no longer names the accepted row prefix used for the rendered
-history. The server closes that stream. Clients retain the current transcript,
-fetch and render `/history` again, then reconnect with the new cursor/token pair;
-numeric replay alone is insufficient. If the repair read returns `503`, clients
-must keep the repair latched and must not open a cursorless or tokenless stream.
 
 ---
 

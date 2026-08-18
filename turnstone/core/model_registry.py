@@ -7,7 +7,6 @@ resilience when the primary model is unreachable.
 
 from __future__ import annotations
 
-import contextlib
 import re
 import threading
 from dataclasses import dataclass, field
@@ -15,9 +14,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
-
-    from turnstone.core.rerank import RerankLane, RerankRuntime
+    from collections.abc import Mapping
 
 from turnstone.core.admission import ModelAdmission
 from turnstone.core.config import load_config
@@ -25,20 +22,6 @@ from turnstone.core.log import get_logger
 from turnstone.core.providers import LLMProvider, create_client, create_provider
 
 log = get_logger(__name__)
-
-
-@contextlib.contextmanager
-def _deferred_close_actions(actions: list[Callable[[], None]]) -> Iterator[None]:
-    """Run collected transport closes after the enclosing registry lock exits."""
-    try:
-        yield
-    finally:
-        for close in actions:
-            try:
-                close()
-            except Exception:
-                log.warning("rerank.deferred_close_failed", exc_info=True)
-
 
 MODEL_AUTH_MODES = frozenset({"static", "entra_obo", "entra_app", "rfc8693_obo"})
 
@@ -465,47 +448,6 @@ def _validate_registry_args(
         raise ValueError(f"Task model '{task_model}' not found in registry")
 
 
-@dataclass(frozen=True)
-class _RerankRuntimeConfig:
-    """Relevant immutable configuration for one cached rerank runtime."""
-
-    base_url: str
-    api_key: str = field(repr=False)
-    model: str
-    provider: str
-    auth_mode: str
-    obo_audience: str
-    obo_scopes: str
-    rerank_mode: str
-    supports_rerank: bool
-    supports_prefill_rerank: bool
-    instruction: str
-
-
-def _rerank_runtime_config(cfg: ModelConfig, instruction: str) -> _RerankRuntimeConfig:
-    """Project a model definition onto fields that change rerank behavior."""
-    caps = cfg.capabilities
-    return _RerankRuntimeConfig(
-        base_url=cfg.base_url.strip(),
-        api_key=cfg.api_key,
-        model=cfg.model.strip(),
-        provider=cfg.provider,
-        auth_mode=cfg.auth_mode,
-        obo_audience=cfg.obo_audience,
-        obo_scopes=cfg.obo_scopes,
-        rerank_mode=str(caps.get("rerank_mode") or "endpoint"),
-        supports_rerank=bool(caps.get("supports_rerank")),
-        supports_prefill_rerank=bool(caps.get("supports_prefill_rerank")),
-        instruction=instruction.strip(),
-    )
-
-
-@dataclass(frozen=True)
-class _RerankRuntimeEntry:
-    runtime: RerankRuntime
-    config: _RerankRuntimeConfig = field(repr=False)
-
-
 class ModelRegistry:
     """Holds named model configurations with thread-safe lazy client creation.
 
@@ -540,7 +482,6 @@ class ModelRegistry:
         self.task_effort = task_effort
         self._clients: dict[str, Any] = {}
         self._providers: dict[str, LLMProvider] = {}
-        self._rerank_runtimes: dict[str, _RerankRuntimeEntry] = {}
         self._admissions = {
             alias: ModelAdmission(alias, int(getattr(cfg, "max_concurrency", 0)))
             for alias, cfg in self._models.items()
@@ -635,87 +576,6 @@ class ModelRegistry:
             if gate is None:
                 raise UnknownModelAliasError(alias)
             return gate
-
-    def resolve_rerank_lane(
-        self,
-        alias: str,
-        *,
-        instruction: str = "",
-        config_version: int = 0,
-    ) -> RerankLane:
-        """Resolve one coherent endpoint-backed rerank binding.
-
-        Unlike :meth:`resolve_binding`, this path deliberately constructs no
-        LLM provider or SDK client: a Cohere/Jina rerank route is not a chat
-        model surface. It shares only the alias's stable admission object and
-        registry generation with normal model lanes.
-        """
-        from turnstone.core.rerank import RerankLane, RerankRuntime, resolve_rerank_client
-
-        close_actions: list[Callable[[], None]] = []
-        instruction = instruction.strip()
-        with _deferred_close_actions(close_actions), self._client_lock:
-            cfg = self._models.get(alias)
-            if cfg is None:
-                raise UnknownModelAliasError(alias)
-            if not cfg.base_url.strip() or not cfg.capabilities.get("supports_rerank"):
-                raise ValueError(f"Model alias {alias!r} is not a configured reranker")
-
-            runtime_config = _rerank_runtime_config(cfg, instruction)
-            entry = self._rerank_runtimes.get(alias)
-            if entry is None or entry.config != runtime_config:
-                client = resolve_rerank_client(
-                    cfg.base_url,
-                    model=cfg.model,
-                    api_key=cfg.api_key,
-                    instruction=instruction,
-                )
-                if client is None:  # guarded above; retain a fail-closed boundary
-                    raise ValueError(f"Model alias {alias!r} has no rerank endpoint")
-                replacement = _RerankRuntimeEntry(
-                    runtime=RerankRuntime(client, alias=alias, model=cfg.model),
-                    config=runtime_config,
-                )
-                if entry is not None:
-                    close = entry.runtime.begin_retirement()
-                    if close is not None:
-                        close_actions.append(close)
-                    log.info("rerank.runtime_retired alias=%s reason=config", alias)
-                self._rerank_runtimes[alias] = replacement
-                entry = replacement
-
-            # The Reranker role selects one alias per process. Retire a
-            # previously selected alias when a settings change resolves its
-            # replacement; active calls drain on their old immutable lanes.
-            for other_alias, other in list(self._rerank_runtimes.items()):
-                if other_alias == alias:
-                    continue
-                close = other.runtime.begin_retirement()
-                if close is not None:
-                    close_actions.append(close)
-                del self._rerank_runtimes[other_alias]
-                log.info("rerank.runtime_retired alias=%s reason=role_change", other_alias)
-
-            lane = RerankLane(
-                runtime=entry.runtime,
-                alias=alias,
-                model=cfg.model,
-                admission=self._admissions[alias],
-                registry_generation=self._generation,
-                config_version=config_version,
-            )
-        return lane
-
-    def deactivate_rerank_runtime(self) -> None:
-        """Retire any selected rerank runtime after the role becomes empty/invalid."""
-        close_actions: list[Callable[[], None]] = []
-        with _deferred_close_actions(close_actions), self._client_lock:
-            for alias, entry in list(self._rerank_runtimes.items()):
-                close = entry.runtime.begin_retirement()
-                if close is not None:
-                    close_actions.append(close)
-                log.info("rerank.runtime_retired alias=%s reason=disabled", alias)
-            self._rerank_runtimes.clear()
 
     def has_alias(self, alias: str) -> bool:
         """Check if *alias* exists in the registry."""
@@ -868,8 +728,7 @@ class ModelRegistry:
             # refuses on this deployment — say so at every swap chokepoint.
             warn_profile_mismatched_aliases(models, app_state)
         _validate_registry_args(models, default, fallback, agent_model, task_model)
-        rerank_close_actions: list[Callable[[], None]] = []
-        with _deferred_close_actions(rerank_close_actions), self._client_lock:
+        with self._client_lock:
             # FIRST write inside the lock, deliberately BEFORE the map swap
             # and the client teardown. The per-send refresh reads the maps
             # lock-free and samples the generation AFTER them (see
@@ -902,22 +761,6 @@ class ModelRegistry:
                     self._admissions[alias] = ModelAdmission(alias, limit)
                 else:
                     gate.set_limit(limit)
-            # Rerank runtimes have their own transport and breaker state. A
-            # cap-only or unrelated model reload preserves them; any relevant
-            # endpoint/model/auth/capability change retires the old runtime now.
-            for alias, entry in list(self._rerank_runtimes.items()):
-                rerank_cfg = self._models.get(alias)
-                if (
-                    rerank_cfg is None
-                    or not rerank_cfg.base_url.strip()
-                    or not rerank_cfg.capabilities.get("supports_rerank")
-                    or entry.config != _rerank_runtime_config(rerank_cfg, entry.config.instruction)
-                ):
-                    close = entry.runtime.begin_retirement()
-                    if close is not None:
-                        rerank_close_actions.append(close)
-                    del self._rerank_runtimes[alias]
-                    log.info("rerank.runtime_retired alias=%s reason=registry_reload", alias)
             # Removed aliases remain as tombstones for this registry's
             # lifetime.  A stale lane may still hold or queue on that object;
             # re-adding the alias must reconfigure the same gate rather than
@@ -957,13 +800,7 @@ class ModelRegistry:
 
     def shutdown(self) -> None:
         """Close all cached client connections."""
-        rerank_close_actions: list[Callable[[], None]] = []
-        with _deferred_close_actions(rerank_close_actions), self._client_lock:
-            for entry in self._rerank_runtimes.values():
-                close = entry.runtime.begin_retirement()
-                if close is not None:
-                    rerank_close_actions.append(close)
-            self._rerank_runtimes.clear()
+        with self._client_lock:
             for client in self._clients.values():
                 if hasattr(client, "close"):
                     client.close()

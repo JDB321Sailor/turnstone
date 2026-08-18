@@ -21,7 +21,7 @@
     <link rel="stylesheet" href="/shared/cards.css" />
     <link rel="stylesheet" href="/static/style.css" />
     <link rel="stylesheet" href="/shared/shell.css" />
-    <link rel="stylesheet" href="/shared/katex-0.18.4/katex.min.css" />
+    <link rel="stylesheet" href="/shared/katex-0.18.1/katex.min.css" />
     <link rel="stylesheet" href="/static/coordinator/coordinator.css" />
     <link rel="stylesheet" href="/static/coordinator/coord-chrome.css" />
     <link rel="stylesheet" href="/shared/interactive.css" />
@@ -968,7 +968,7 @@
                   >
                     <option value="">All types</option>
                     <option value="user">user</option>
-                    <option value="general">general</option>
+                    <option value="project">project</option>
                     <option value="feedback">feedback</option>
                     <option value="reference">reference</option>
                   </select>
@@ -993,13 +993,6 @@
                   />
                 </div>
               </div>
-              <div
-                id="memory-index-warning"
-                class="sh-alert"
-                role="alert"
-                aria-live="polite"
-                style="display: none"
-              ></div>
               <div class="admin-colheaders" aria-hidden="true">
                 <span class="admin-col admin-col-mname">NAME</span>
                 <span class="admin-col admin-col-mtype">TYPE</span>
@@ -2962,8 +2955,8 @@
                   <input id="pr-memory" type="checkbox" checked />
                   <span class="toggle-track" aria-hidden="true"></span>
                   <span class="toggle-label"
-                    >Memory enabled (metadata index and pointers, nudges,
-                    memory tool)</span
+                    >Memory enabled (recall injection, nudges, memory
+                    tool)</span
                   >
                 </label>
               </div>
@@ -4123,15 +4116,14 @@
     <script type="module" src="/shared/models.js"></script>
     <script type="module" src="/shared/skills.js"></script>
     <script type="module" src="/shared/project_creator.js"></script>
-    <script type="module" src="/shared/composer_paste_text.js"></script>
     <script type="module" src="/shared/composer.js"></script>
     <!-- coordinator-pane deps (step 4): the controller builds its chrome + uses
          the shared composer/renderer stack; load before the shell module -->
     <script type="module" src="/shared/composer_attachments.js"></script>
     <script type="module" src="/shared/composer_queue.js"></script>
     <script type="module" src="/shared/status_bar.js"></script>
-    <script src="/shared/katex-0.18.4/katex.min.js"></script>
-    <script src="/shared/hljs-11.12.0/highlight.min.js"></script>
+    <script src="/shared/katex-0.18.1/katex.min.js"></script>
+    <script src="/shared/hljs-11.11.1/highlight.min.js"></script>
     <script type="module" src="/shared/renderer.js"></script>
 
     <!-- Token Created (show-once) Modal -->

@@ -4,160 +4,33 @@ All functions maintain their existing signatures for consumers (session.py,
 server.py, cli.py). The actual storage implementation lives in
 ``turnstone.core.storage``.
 
-The established best-effort contract is preserved for operational failures.
-Operations whose callers require positive durability return an explicit
-failure sentinel rather than swallowing an exception into an indistinguishable
-successful ``None``.  Typed invariant conflicts remain exceptions: callers
-must never mistake a different immutable commit for a transient storage blip.
+The no-raise contract is preserved — callers never see exceptions from this
+module.  All failures are logged so storage issues are visible in logs
+rather than silently swallowed.
 """
 
 from __future__ import annotations
 
-import re
-import unicodedata
-from bisect import bisect_left, bisect_right
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
-from turnstone.core.storage import (
-    AttachmentWrite,
-    ConversationCommitConflictError,
-    ConversationCommitWorkstreamGoneError,
-    get_storage,
-)
+from turnstone.core.storage import get_storage
 from turnstone.core.workstream import WorkstreamKind
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from contextlib import AbstractContextManager
 
     from turnstone.core.trajectory import Turn
 
 log = get_logger(__name__)
 
 
-MEMORY_NAME_PATTERN = r"[a-z0-9]+(?:_[a-z0-9]+)*"
-_MEMORY_NAME_RE = re.compile(rf"\A{MEMORY_NAME_PATTERN}\Z")
-_LATIN_FOLD_OVERRIDES = {
-    "æ": "ae",
-    "đ": "d",
-    "ð": "d",
-    "ħ": "h",
-    "ı": "i",
-    "ł": "l",
-    "ŋ": "n",
-    "œ": "oe",
-    "ø": "o",
-    "þ": "th",
-    "ŧ": "t",
-}
-
-
-def normalize_memory_name(name: object) -> str:
-    """Canonicalize one public memory name to an ASCII snake-case key.
-
-    Latin letters are case-folded and stripped of supported diacritics.
-    Spaces and Unicode hyphens become separators; underscores remain literal
-    so leading, trailing, or repeated underscores are rejected rather than
-    silently repaired. Unsupported scripts and punctuation fail closed.
-    """
-    if not isinstance(name, str):
-        raise ValueError("memory name is required")
-
-    # Trim only space separators. Tabs/newlines and other controls are invalid
-    # name content, even at an edge.
-    start = 0
-    end = len(name)
-    while start < end and unicodedata.category(name[start]) == "Zs":
-        start += 1
-    while end > start and unicodedata.category(name[end - 1]) == "Zs":
-        end -= 1
-    raw = name[start:end]
-    if not raw:
-        raise ValueError("memory name is required")
-
-    output: list[str] = []
-    in_separator_run = False
-    for char in raw.casefold():
-        category = unicodedata.category(char)
-        if char.isascii() and char.isalnum():
-            output.append(char)
-            in_separator_run = False
-            continue
-        if char == "_":
-            output.append(char)
-            in_separator_run = False
-            continue
-        if category in {"Zs", "Pd"}:
-            if not in_separator_run:
-                output.append("_")
-                in_separator_run = True
-            continue
-        replacement = _LATIN_FOLD_OVERRIDES.get(char)
-        if replacement is not None:
-            output.append(replacement)
-            in_separator_run = False
-            continue
-        if category.startswith("M") and output and output[-1][-1:].isalpha():
-            # Decomposed Latin diacritic attached to the preceding base.
-            continue
-        if category.startswith("L") and "LATIN" in unicodedata.name(char, ""):
-            decomposed = unicodedata.normalize("NFKD", char)
-            folded = "".join(part for part in decomposed if part.isascii() and part.isalpha())
-            if folded:
-                output.append(folded)
-                in_separator_run = False
-                continue
-        if category.startswith("L"):
-            raise ValueError(
-                "memory name contains unsupported characters; "
-                "choose an ASCII semantic key and keep native-language wording "
-                "in the description or content"
-            )
-        raise ValueError(
-            "memory name may contain only Latin letters, ASCII digits, spaces, "
-            "hyphens, and single underscores"
-        )
-
-    normalized = "".join(output)
-    if len(normalized) > 256:
-        raise ValueError("memory name exceeds 256 characters after normalization")
-    if not _MEMORY_NAME_RE.fullmatch(normalized):
-        raise ValueError(
-            "memory name must normalize to ASCII snake_case without leading, "
-            "trailing, or repeated underscores"
-        )
-    return normalized
-
-
 def normalize_key(key: str) -> str:
-    """Backward-compatible alias for the authoritative memory-name boundary."""
-    return normalize_memory_name(key)
+    """Normalize a memory key for consistent lookup."""
+    return key.lower().replace("-", "_").replace(" ", "_")
 
 
 # -- Core conversation operations ---------------------------------------------
-
-
-_TYPED_COMMIT_ERRORS = (ConversationCommitConflictError, ConversationCommitWorkstreamGoneError)
-
-
-def _keyed_save(operation: Callable[[], int], describe: str) -> int:
-    """Run one keyed save with the shared typed-passthrough frame.
-
-    Typed commit outcomes must reach the session journal un-coerced — the
-    next typed class belongs in ``_TYPED_COMMIT_ERRORS`` ONCE, for every
-    wrapper (a missed wrapper would convert a permanent invariant conflict
-    into a logged return-0 the journal retries forever). Operational
-    failures log and return ``0``; the journal classifies and retries them.
-    """
-    try:
-        return operation()
-    except _TYPED_COMMIT_ERRORS:
-        raise
-    except Exception:
-        log.warning("%s", describe, exc_info=True)
-        return 0
 
 
 def save_message(
@@ -173,14 +46,11 @@ def save_message(
     is_error: bool = False,
     producer: str | None = None,
     meta: str | None = None,
-    commit_key: str | None = None,
 ) -> int:
     """Log a message to the conversations table.
 
-    Returns the inserted row id, or ``0`` on an operational failure.  A keyed
-    retry whose immutable payload conflicts with the committed row raises
-    :class:`ConversationCommitConflictError` so the durability journal can
-    classify the permanent invariant failure without retrying it.
+    Returns the inserted row id, or ``0`` on failure (preserving the
+    module's no-raise contract).
 
     ``source`` is the persisted twin of the in-memory ``_source``
     side-channel (which producer synthesised the row); ``None`` for the
@@ -191,18 +61,15 @@ def save_message(
     passes ``self.ui._event_id`` so ``/history`` can return it as the
     ``Last-Event-ID`` resume cursor.  ``None`` for offline / bulk saves.
 
-    ``meta`` is pre-serialized role-specific conversation metadata: structured
-    operator context on system turns, effect/preview fields plus the acting
-    principal on tool turns, sender identity on shared-workstream user turns,
-    or the immutable model provenance envelope on accepted assistant turns.
-    It is opaque to the backend and decoded only at the row-to-Turn boundary.
-
-    ``commit_key`` is the per-workstream idempotency identity for one admitted
-    conversation row. Retrying the same non-NULL key returns the original row
-    id without appending a duplicate.
+    ``meta`` is the pre-serialized JSON of a first-class ``system`` turn's
+    structured per-kind operator-context fields (e.g. ``watch_triggered``'s
+    ``watch_name`` / ``command`` / poll counters) — the persisted twin of the
+    in-memory ``Turn.meta.extra["source_meta"]`` / ``_source_meta`` side
+    channel.  ``None`` for ordinary rows and operator turns with no extra
+    fields.  Opaque to storage (like ``tool_calls`` / ``provider_data``).
     """
-    return _keyed_save(
-        lambda: get_storage().save_message(
+    try:
+        return get_storage().save_message(
             ws_id,
             role,
             content,
@@ -215,79 +82,10 @@ def save_message(
             is_error=is_error,
             producer=producer,
             meta=meta,
-            commit_key=commit_key,
-        ),
-        f"Failed to save message for ws={ws_id} role={role}",
-    )
-
-
-def save_user_message_with_attachments(
-    ws_id: str,
-    content: str,
-    attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
-    *,
-    source: str | None = None,
-    event_id: int | None = None,
-    meta: str | None = None,
-    commit_key: str,
-) -> int:
-    """Atomically persist a keyed USER row and its attachment ownership.
-
-    Returns the positively acknowledged row id, or ``0`` on an operational
-    failure.  An immutable commit mismatch raises
-    :class:`ConversationCommitConflictError`.  The session handoff journal may
-    acknowledge the row only when the backend has confirmed the row, blobs,
-    exact refcount increments, and ordered ref-list as one transaction.
-    Retrying the same immutable commit is safe.
-    """
-    return _keyed_save(
-        lambda: get_storage().save_user_message_with_attachments(
-            ws_id,
-            content,
-            attachments,
-            source=source,
-            event_id=event_id,
-            meta=meta,
-            commit_key=commit_key,
-        ),
-        f"Failed atomic user attachment commit for ws={ws_id} commit_key={commit_key}",
-    )
-
-
-def save_tool_message_with_attachments(
-    ws_id: str,
-    content: str,
-    tool_name: str,
-    tool_call_id: str,
-    attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
-    *,
-    event_id: int | None = None,
-    is_error: bool = False,
-    meta: str | None = None,
-    commit_key: str,
-) -> int:
-    """Atomically persist a keyed TOOL row and its attachment ownership.
-
-    Returns the positively acknowledged row id, or ``0`` on an operational
-    failure.  An immutable commit mismatch raises
-    :class:`ConversationCommitConflictError`.  This is the storage seam for
-    ordinary tool-image rows and cancelled rows whose already-published preview
-    blob must survive with the synthesized result.
-    """
-    return _keyed_save(
-        lambda: get_storage().save_tool_message_with_attachments(
-            ws_id,
-            content,
-            tool_name,
-            tool_call_id,
-            attachments,
-            event_id=event_id,
-            is_error=is_error,
-            meta=meta,
-            commit_key=commit_key,
-        ),
-        f"Failed atomic tool attachment commit for ws={ws_id} commit_key={commit_key}",
-    )
+        )
+    except Exception:
+        log.warning("Failed to save message for ws=%s role=%s", ws_id, role, exc_info=True)
+        return 0
 
 
 def save_messages_bulk(rows: list[dict[str, Any]]) -> bool:
@@ -954,23 +752,13 @@ def search_history_recent(limit: int = 20, *, user_id: str | None = None) -> lis
 # -- Structured memories -------------------------------------------------------
 
 
-def _require_memory_description(description: str) -> str:
-    """Return a normalized description or raise the public validation error."""
-    from turnstone.core.memory_index import normalize_memory_description
-
-    return normalize_memory_description(description)
-
-
 def save_structured_memory(
     name: str,
     content: str,
-    description: str,
+    description: str | None = None,
     mem_type: str | None = None,
     scope: str = "global",
     scope_id: str = "",
-    *,
-    require_active_project: bool = False,
-    acting_principal_id: str = "",
 ) -> tuple[dict[str, str] | None, bool]:
     """Save a structured memory as a single atomic upsert by name+scope+scope_id.
 
@@ -980,129 +768,40 @@ def save_structured_memory(
     :meth:`StorageBackend.upsert_structured_memory`) -- no preceding read, no
     IntegrityError round-trip, no TOCTOU window.  ``(row, was_update)`` comes
     straight from that upsert (this passes a fresh ``memory_id``, so a differing
-    returned id means an existing row was updated in place). ``description``
-    is required and must contain non-whitespace text for both inserts and
-    updates. A ``None`` ``mem_type`` keeps the stored value on an update and
-    uses the column default on insert.
+    returned id means an existing row was updated in place).  A ``None``
+    description / ``mem_type`` means "leave unset" -- the column default applies
+    on insert and the stored value is kept on conflict.
     """
-    # Validate outside the best-effort storage boundary. Backend/driver
-    # ``ValueError`` instances remain operational failures; only this explicit
-    # caller-input check propagates.
-    normalized_description = _require_memory_description(description)
-    normalized_name = normalize_memory_name(name)
+    import uuid
+
+    name = normalize_key(name)
     try:
-        return save_structured_memory_strict(
-            normalized_name,
-            content,
-            description=normalized_description,
-            mem_type=mem_type,
-            scope=scope,
-            scope_id=scope_id,
-            require_active_project=require_active_project,
-            acting_principal_id=acting_principal_id,
+        row, was_update = get_storage().upsert_structured_memory(
+            str(uuid.uuid4()), name, description, mem_type, scope, scope_id, content
         )
+        return (row, was_update) if row else (None, False)
     except Exception:
         log.warning("Failed to save structured memory name=%s", name, exc_info=True)
         return None, False
 
 
-def save_structured_memory_strict(
-    name: str,
-    content: str,
-    description: str,
-    mem_type: str | None = None,
-    scope: str = "global",
-    scope_id: str = "",
-    *,
-    require_active_project: bool = False,
-    acting_principal_id: str = "",
-) -> tuple[dict[str, str], bool]:
-    """Strict structured-memory upsert for mutation-facing boundaries.
-
-    Unlike :func:`save_structured_memory`, storage failures propagate so an
-    API or tool cannot report a database outage as an ordinary failed/not-found
-    result. Best-effort internal callers keep using the facade.
-    """
-    import uuid
-
-    normalized = normalize_key(name)
-    normalized_description = _require_memory_description(description)
-    row, was_update = get_storage().upsert_structured_memory(
-        str(uuid.uuid4()),
-        normalized,
-        normalized_description,
-        mem_type,
-        scope,
-        scope_id,
-        content,
-        require_active_project=require_active_project,
-        acting_principal_id=acting_principal_id,
-    )
-    if not row:
-        raise RuntimeError("structured memory upsert returned no row")
-    return row, was_update
-
-
 def get_structured_memory_by_name(
-    name: str,
-    scope: str = "global",
-    scope_id: str = "",
+    name: str, scope: str = "global", scope_id: str = ""
 ) -> dict[str, str] | None:
     """Retrieve a single structured memory by name+scope. Returns full content."""
     name = normalize_key(name)
     try:
-        return get_storage().get_structured_memory_by_name(
-            name,
-            scope,
-            scope_id,
-        )
+        return get_storage().get_structured_memory_by_name(name, scope, scope_id)
     except Exception:
         log.warning("Failed to get structured memory name=%s", name, exc_info=True)
         return None
 
 
-def get_structured_memory_by_name_strict(
-    name: str,
-    scope: str = "global",
-    scope_id: str = "",
-) -> dict[str, str] | None:
-    """Strict scoped-name lookup; storage failures propagate."""
-    return get_storage().get_structured_memory_by_name(
-        normalize_key(name),
-        scope,
-        scope_id,
-    )
-
-
-def get_and_touch_structured_memory_by_name_strict(
-    name: str,
-    scope: str = "global",
-    scope_id: str = "",
-    *,
-    acting_principal_id: str = "",
-) -> dict[str, str] | None:
-    """Atomically fetch one full body and record exactly that row's access."""
-    return get_storage().get_and_touch_structured_memory_by_name(
-        normalize_key(name),
-        scope,
-        scope_id,
-        acting_principal_id=acting_principal_id,
-    )
-
-
-def delete_structured_memory(
-    name: str,
-    scope: str = "global",
-    scope_id: str = "",
-) -> bool:
+def delete_structured_memory(name: str, scope: str = "global", scope_id: str = "") -> bool:
     """Delete a structured memory by name+scope. Returns True if existed."""
     name = normalize_key(name)
     try:
-        return get_storage().delete_structured_memory(
-            name,
-            scope,
-            scope_id,
-        )
+        return get_storage().delete_structured_memory(name, scope, scope_id)
     except Exception:
         log.warning("Failed to delete structured memory name=%s", name, exc_info=True)
         return False
@@ -1117,51 +816,6 @@ def delete_structured_memory_by_id(memory_id: str) -> bool:
         return False
 
 
-def delete_structured_memory_returning_strict(
-    name: str,
-    scope: str = "global",
-    scope_id: str = "",
-    *,
-    acting_principal_id: str = "",
-) -> dict[str, str] | None:
-    """Atomically delete and return one scoped-name memory.
-
-    Storage failures propagate.  A ``None`` return therefore means only that
-    no matching row existed at the mutation point.
-    """
-    return get_storage().delete_structured_memory_returning(
-        normalize_key(name),
-        scope,
-        scope_id,
-        acting_principal_id=acting_principal_id,
-    )
-
-
-def delete_structured_memory_by_id_returning_strict(
-    memory_id: str,
-) -> dict[str, str] | None:
-    """Atomically delete and return one memory by id; failures propagate."""
-    return get_storage().delete_structured_memory_by_id_returning(memory_id)
-
-
-def find_structured_memory_scopes(
-    name: str,
-    scopes: list[tuple[str, str]],
-    *,
-    acting_principal_id: str = "",
-) -> list[tuple[str, str]]:
-    """Find visible same-name scope pairs in one metadata-only query."""
-    try:
-        return get_storage().find_structured_memory_scopes(
-            normalize_key(name),
-            scopes,
-            acting_principal_id=acting_principal_id,
-        )
-    except Exception:
-        log.warning("Failed to find structured memory scopes name=%s", name, exc_info=True)
-        return []
-
-
 def list_structured_memories(
     mem_type: str = "",
     scope: str = "",
@@ -1171,10 +825,7 @@ def list_structured_memories(
     """List structured memories with optional filters."""
     try:
         return get_storage().list_structured_memories(
-            mem_type=mem_type,
-            scope=scope,
-            scope_id=scope_id,
-            limit=limit,
+            mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
         )
     except Exception:
         log.warning("Failed to list structured memories", exc_info=True)
@@ -1191,11 +842,7 @@ def search_structured_memories(
     """Search structured memories by query."""
     try:
         return get_storage().search_structured_memories(
-            query,
-            mem_type=mem_type,
-            scope=scope,
-            scope_id=scope_id,
-            limit=limit,
+            query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
         )
     except Exception:
         log.warning("Failed to search structured memories", exc_info=True)
@@ -1206,16 +853,11 @@ def list_visible_structured_memories(
     scopes: list[tuple[str, str]],
     mem_type: str = "",
     limit: int = 100,
-    *,
-    acting_principal_id: str = "",
 ) -> list[dict[str, str]]:
     """Single-query union across visible (scope, scope_id) pairs."""
     try:
         return get_storage().list_visible_structured_memories(
-            scopes,
-            mem_type=mem_type,
-            limit=limit,
-            acting_principal_id=acting_principal_id,
+            scopes, mem_type=mem_type, limit=limit
         )
     except Exception:
         log.warning("Failed to list visible structured memories", exc_info=True)
@@ -1227,383 +869,43 @@ def search_visible_structured_memories(
     scopes: list[tuple[str, str]],
     mem_type: str = "",
     limit: int = 20,
-    *,
-    acting_principal_id: str = "",
 ) -> list[dict[str, str]]:
     """OR-of-terms search joined with a single visibility OR-group."""
     try:
         return get_storage().search_visible_structured_memories(
-            query,
-            scopes,
-            mem_type=mem_type,
-            limit=limit,
-            acting_principal_id=acting_principal_id,
+            query, scopes, mem_type=mem_type, limit=limit
         )
     except Exception:
         log.warning("Failed to search visible structured memories", exc_info=True)
         return []
 
 
-def update_structured_memory_description_strict(
-    memory_id: str,
-    description: str,
-    *,
-    storage: Any | None = None,
-) -> dict[str, str] | None:
-    """Update one authored index hook; validation and storage failures propagate."""
-    backend = storage or get_storage()
-    return backend.update_structured_memory_description(
-        memory_id,
-        _require_memory_description(description),
-    )
+def touch_structured_memories(keys: list[tuple[str, str, str]]) -> int:
+    """Batch-touch memories (bump last_accessed, increment access_count).
 
-
-def acquire_memory_index_snapshot(
-    ws_id: str,
-    principal_id: str,
-    *,
-    commit_context: Callable[[dict[str, Any]], AbstractContextManager[None]] | None = None,
-) -> dict[str, Any]:
-    """Atomically bind or load one workstream's immutable memory index.
-
-    This boundary is deliberately strict. A storage failure must stop model
-    admission rather than publish an empty block falsely described as complete.
-    The backend resolves the live visibility envelope inside the same database
-    transaction as its metadata read and first-writer insert.
-
-    When supplied, ``commit_context`` runs only for a concrete candidate. Its
-    pre-yield phase may reject, rolling back any newly inserted candidate; the
-    backend commit is the context body at yield; its post-yield phase therefore
-    runs after the commit and must be deterministic publication, not
-    rollback-dependent work.
+    Each key is ``(name, scope, scope_id)``.  Duplicates are removed so each
+    distinct memory is touched at most once.  Returns count of rows updated.
     """
-    storage = get_storage()
-    snapshot = storage.acquire_memory_index_snapshot(
-        ws_id,
-        principal_id,
-        commit_context=commit_context,
-    )
-    if snapshot is None:
-        raise RuntimeError("memory index workstream is no longer active")
-    return snapshot
+    if not keys:
+        return 0
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[tuple[str, str, str]] = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            unique.append(k)
+    try:
+        return get_storage().touch_structured_memories(unique)
+    except Exception:
+        log.warning("Failed to touch structured memories", exc_info=True)
+        return 0
 
 
-def prospective_memory_index(
-    scopes: list[tuple[str, str]],
-    *,
-    acting_principal_id: str = "",
-) -> dict[str, int]:
-    """Render the live metadata envelope for soft-cap/backpressure reporting."""
-    from turnstone.core.memory_index import render_memory_index
-
-    project_ids = sorted({scope_id for scope, scope_id in scopes if scope == "project"})
-    if len(project_ids) > 1:
-        raise ValueError("a memory index envelope may contain at most one project")
-    rendered = render_memory_index(
-        get_storage().list_visible_memory_index_entries(
-            scopes,
-            acting_principal_id=acting_principal_id,
-        ),
-        project_id=project_ids[0] if project_ids else "",
-    )
-    return {
-        "entry_count": rendered.entry_count,
-        "char_count": rendered.char_count,
-        "invalid_description_count": rendered.invalid_description_count,
-    }
-
-
-@dataclass(frozen=True)
-class _IndexBucket:
-    entry_count: int = 0
-    line_chars: int = 0
-
-    def __add__(self, other: _IndexBucket) -> _IndexBucket:
-        return _IndexBucket(
-            self.entry_count + other.entry_count,
-            self.line_chars + other.line_chars,
-        )
-
-
-class _PrincipalMetricSet:
-    """Range-max index for exact envelope maxima over many principals."""
-
-    def __init__(self, buckets: list[_IndexBucket]) -> None:
-        # Anonymous/no-principal is a real interactive envelope and also makes
-        # the empty-set behavior total for coordinator/project subsets.
-        best_by_count: dict[int, int] = {0: 0}
-        for bucket in buckets:
-            best_by_count[bucket.entry_count] = max(
-                best_by_count.get(bucket.entry_count, 0),
-                bucket.line_chars,
-            )
-        self.counts = sorted(best_by_count)
-        values = [best_by_count[count] for count in self.counts]
-        size = 1
-        while size < len(values):
-            size *= 2
-        self._size = size
-        self._tree = [-1] * (2 * size)
-        self._tree[size : size + len(values)] = values
-        for index in range(size - 1, 0, -1):
-            self._tree[index] = max(self._tree[2 * index], self._tree[2 * index + 1])
-
-    @property
-    def max_entries(self) -> int:
-        return self.counts[-1]
-
-    def _range_max(self, start: int, stop: int) -> int:
-        result = -1
-        left = start + self._size
-        right = stop + self._size
-        while left < right:
-            if left & 1:
-                result = max(result, self._tree[left])
-                left += 1
-            if right & 1:
-                right -= 1
-                result = max(result, self._tree[right])
-            left //= 2
-            right //= 2
-        return result
-
-    def max_rendered_chars(
-        self,
-        base: _IndexBucket,
-        *,
-        project_id: str = "",
-    ) -> int:
-        """Return the exact maximum without scanning every principal."""
-        from turnstone.core.memory_index import memory_index_base_char_count
-
-        maximum = 0
-        max_total = base.entry_count + self.max_entries
-        for digits in range(1, len(str(max_total)) + 1):
-            # Zero has one decimal digit too.  Including it is material for an
-            # empty project envelope because the project_id attribute still
-            # contributes characters even when there are no entry lines.
-            low = max(0, (0 if digits == 1 else 10 ** (digits - 1)) - base.entry_count)
-            high = 10**digits - 1 - base.entry_count
-            start = bisect_left(self.counts, low)
-            stop = bisect_right(self.counts, high)
-            if start == stop:
-                continue
-            line_chars = self._range_max(start, stop)
-            sample_count = self.counts[start]
-            maximum = max(
-                maximum,
-                base.line_chars
-                + line_chars
-                + memory_index_base_char_count(
-                    base.entry_count + sample_count,
-                    project_id=project_id,
-                ),
-            )
-        return maximum
-
-
-def memory_index_health(*, budget_chars: int, storage: Any | None = None) -> dict[str, Any]:
-    """Return derived health over possible envelopes in the live topology.
-
-    Memory rows are rendered to per-scope metrics once. Public projects reuse
-    one project-reader metric set; private projects intersect only their stored
-    memberships. The calculation never materializes a project-by-principal
-    matrix and does not depend on whether an old snapshot still exists.
-    """
-    from turnstone.core.memory_index import (
-        memory_index_base_char_count,
-        memory_index_entry_metrics,
-    )
-    from turnstone.core.project_access import fold_role_permissions
-
-    backend = storage or get_storage()
-    inputs = backend.get_memory_index_health_inputs()
-    buckets: dict[tuple[str, str], _IndexBucket] = {}
-    invalid_total = 0
-    principal_ids = {str(row.get("user_id") or "") for row in inputs["users"] if row.get("user_id")}
-    for row in inputs["entries"]:
-        scope = str(row.get("scope") or "")
-        scope_id = str(row.get("scope_id") or "")
-        chars, invalid = memory_index_entry_metrics(row)
-        current = buckets.get((scope, scope_id), _IndexBucket())
-        buckets[(scope, scope_id)] = _IndexBucket(
-            current.entry_count + 1,
-            current.line_chars + chars,
-        )
-        invalid_total += invalid
-        if scope in {"user", "coordinator"} and scope_id:
-            principal_ids.add(scope_id)
-
-    projects = {
-        str(row.get("project_id") or ""): row for row in inputs["projects"] if row.get("project_id")
-    }
-    project_members: dict[str, set[str]] = {}
-    for row in inputs["members"]:
-        project_id = str(row.get("project_id") or "")
-        user_id = str(row.get("user_id") or "")
-        if project_id and user_id:
-            project_members.setdefault(project_id, set()).add(user_id)
-            principal_ids.add(user_id)
-    for row in projects.values():
-        owner_id = str(row.get("owner_id") or "")
-        if owner_id:
-            principal_ids.add(owner_id)
-    for row in inputs["workstreams"]:
-        owner_id = str(row.get("user_id") or "")
-        if owner_id:
-            principal_ids.add(owner_id)
-
-    ordered_principals = sorted(principal_ids)
-
-    overrides: dict[str, tuple[set[str], set[str]]] = {}
-    for row in inputs["role_overrides"]:
-        role_id = str(row.get("role_id") or "")
-        permission = str(row.get("permission") or "")
-        action = str(row.get("action") or "")
-        grants, revokes = overrides.setdefault(role_id, (set(), set()))
-        if action == "grant":
-            grants.add(permission)
-        elif action == "revoke":
-            revokes.add(permission)
-    role_permissions: dict[str, set[str]] = {}
-    for row in inputs["roles"]:
-        role_id = str(row.get("role_id") or "")
-        grants, revokes = overrides.get(role_id, (set(), set()))
-        if not row.get("builtin"):
-            grants, revokes = set(), set()
-        role_permissions[role_id] = fold_role_permissions(
-            str(row.get("permissions") or ""),
-            grants=grants,
-            revokes=revokes,
-        )
-    permissions_by_principal: dict[str, set[str]] = {}
-    for row in inputs["user_roles"]:
-        user_id = str(row.get("user_id") or "")
-        role_id = str(row.get("role_id") or "")
-        if user_id:
-            permissions_by_principal.setdefault(user_id, set()).update(
-                role_permissions.get(role_id, set())
-            )
-
-    def _principal_metrics(scope: str, ids: set[str] | None = None) -> _PrincipalMetricSet:
-        selected = ordered_principals if ids is None else sorted(ids)
-        return _PrincipalMetricSet(
-            [buckets.get((scope, user_id), _IndexBucket()) for user_id in selected]
-        )
-
-    all_users = _principal_metrics("user")
-    all_coordinators = _principal_metrics("coordinator")
-    project_readers = {
-        principal_id
-        for principal_id in principal_ids
-        if "project.read" in permissions_by_principal.get(principal_id, set())
-    }
-    reader_metrics = {
-        "user": _principal_metrics("user", project_readers),
-        "coordinator": _principal_metrics("coordinator", project_readers),
-    }
-    member_metrics: dict[tuple[str, str], _PrincipalMetricSet] = {}
-    principal_metrics: dict[tuple[str, str], _PrincipalMetricSet] = {}
-    eligible_members_by_project: dict[str, set[str]] = {}
-
-    max_chars = memory_index_base_char_count(0)
-    max_entries = 0
-    envelope_count = 1  # Global-only remains meaningful with no snapshots/workstreams.
-    global_bucket = buckets.get(("global", ""), _IndexBucket())
-    max_chars = global_bucket.line_chars + memory_index_base_char_count(global_bucket.entry_count)
-    max_entries = global_bucket.entry_count
-
-    def _consider(base: _IndexBucket, metrics: _PrincipalMetricSet, project_id: str = "") -> None:
-        nonlocal max_chars, max_entries
-        max_chars = max(
-            max_chars,
-            metrics.max_rendered_chars(base, project_id=project_id),
-        )
-        max_entries = max(max_entries, base.entry_count + metrics.max_entries)
-
-    def _consider_project(base: _IndexBucket, scope: str, project_id: str) -> None:
-        """Consider the exact active-project reader envelopes without P x J sets."""
-        project = projects[project_id]
-        if str(project.get("state") or "active") != "active":
-            return
-        project_base = base + buckets.get(("project", project_id), _IndexBucket())
-        owner_id = str(project.get("owner_id") or "")
-        visibility = str(project.get("visibility") or "private")
-
-        # This is the set form of decide_project_access().can_read. The
-        # randomized brute-force test below compares this optimized path to
-        # that canonical single-principal policy across ACL/RBAC matrices.
-        if visibility == "public":
-            if project_readers:
-                _consider(project_base, reader_metrics[scope], project_id)
-            owner_is_included = owner_id in project_readers
-        else:
-            if project_id not in eligible_members_by_project:
-                eligible_members_by_project[project_id] = (
-                    project_members.get(project_id, set()) & project_readers
-                )
-            eligible_members = eligible_members_by_project[project_id]
-            if eligible_members:
-                key = (scope, project_id)
-                metrics = member_metrics.get(key)
-                if metrics is None:
-                    metrics = _principal_metrics(scope, eligible_members)
-                    member_metrics[key] = metrics
-                _consider(project_base, metrics, project_id)
-            owner_is_included = owner_id in eligible_members
-
-        if owner_id and not owner_is_included:
-            key = (scope, owner_id)
-            metrics = principal_metrics.get(key)
-            if metrics is None:
-                metrics = _principal_metrics(scope, {owner_id})
-                principal_metrics[key] = metrics
-            _consider(project_base, metrics, project_id)
-
-    for workstream in inputs["workstreams"]:
-        ws_id = str(workstream.get("ws_id") or "")
-        kind = str(workstream.get("kind") or WorkstreamKind.INTERACTIVE.value)
-        attached_project = str(workstream.get("project_id") or "")
-        live_project = attached_project if attached_project in projects else ""
-        if kind == WorkstreamKind.COORDINATOR.value:
-            _consider(_IndexBucket(), all_coordinators)
-            envelope_count += len(principal_ids)
-            if live_project:
-                _consider_project(_IndexBucket(), "coordinator", live_project)
-            continue
-
-        base = global_bucket + buckets.get(("workstream", ws_id), _IndexBucket())
-        _consider(base, all_users)
-        # One anonymous envelope plus one exact user scope per known principal.
-        envelope_count += len(principal_ids) + 1
-        if live_project:
-            _consider_project(base, "user", live_project)
-
-    return {
-        "budget_chars": budget_chars,
-        "over_budget": max_chars > budget_chars,
-        "max_char_count": max_chars,
-        "max_entry_count": max_entries,
-        "over_by_chars": max(0, max_chars - budget_chars),
-        "invalid_description_count": invalid_total,
-        "envelope_count": envelope_count,
-    }
-
-
-def count_structured_memories(
-    mem_type: str = "",
-    scope: str = "",
-    scope_id: str = "",
-    *,
-    acting_principal_id: str = "",
-) -> int:
+def count_structured_memories(mem_type: str = "", scope: str = "", scope_id: str = "") -> int:
     """Count structured memories with optional type/scope filter."""
     try:
         return get_storage().count_structured_memories(
-            mem_type=mem_type,
-            scope=scope,
-            scope_id=scope_id,
-            acting_principal_id=acting_principal_id,
+            mem_type=mem_type, scope=scope, scope_id=scope_id
         )
     except Exception:
         log.warning("Failed to count structured memories", exc_info=True)

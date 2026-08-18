@@ -298,12 +298,7 @@ def calibrate_model(
     )
     if client is None:
         raise ValueError("no rerank endpoint (base_url is empty)")
-    try:
-        return calibrate(client, model=model or base_url)
-    finally:
-        close = getattr(client, "close", None)
-        if callable(close):
-            close()
+    return calibrate(client, model=model or base_url)
 
 
 def _raw_scale(raw: list[float]) -> str:

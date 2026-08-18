@@ -1,92 +1,37 @@
 """Tests for turnstone.core.memory — structured memory facade functions."""
 
-import pytest
-
 from turnstone.core.memory import (
     count_structured_memories,
     delete_structured_memory,
     get_structured_memory_by_name,
     list_structured_memories,
     normalize_key,
-    normalize_memory_name,
     save_structured_memory,
-    save_structured_memory_strict,
     search_structured_memories,
 )
 
 
-def _save(name, content, **kwargs):
-    kwargs.setdefault("description", "test memory description")
-    return save_structured_memory(name, content, **kwargs)
-
-
-@pytest.fixture(autouse=True)
-def _registered_workstream_scopes(tmp_db):
-    """Workstream-scoped memories always have live durable parents."""
-    from turnstone.core.storage import get_storage
-
-    storage = get_storage()
-    storage.register_workstream("ws1")
-    storage.register_workstream("ws2")
-
-
 class TestSaveStructuredMemory:
-    @pytest.mark.parametrize("save", [save_structured_memory, save_structured_memory_strict])
-    @pytest.mark.parametrize("description", [None, "", "   "])
-    def test_description_is_required(self, tmp_db, description, save):
-        with pytest.raises(ValueError, match="description is required"):
-            save("test_key", "hello world", description=description)
-
-    def test_best_effort_save_still_swallows_storage_failures(self, tmp_db, monkeypatch):
-        from turnstone.core import memory as memory_mod
-
-        class _BoomStorage:
-            def upsert_structured_memory(self, *_args, **_kwargs):
-                raise RuntimeError("simulated storage failure")
-
-        monkeypatch.setattr(memory_mod, "get_storage", lambda: _BoomStorage())
-        assert save_structured_memory(
-            "test_key",
-            "hello world",
-            description="Test memory",
-        ) == (None, False)
-
-    def test_best_effort_save_does_not_misclassify_backend_value_error(self, tmp_db, monkeypatch):
-        from turnstone.core import memory as memory_mod
-
-        class _BoomStorage:
-            def upsert_structured_memory(self, *_args, **_kwargs):
-                raise ValueError("backend decode failure")
-
-        monkeypatch.setattr(memory_mod, "get_storage", lambda: _BoomStorage())
-        assert save_structured_memory(
-            "test_key",
-            "hello world",
-            description="Test memory",
-        ) == (None, False)
-
     def test_save_new(self, tmp_db):
-        row, was_update = _save("test_key", "hello world")
+        row, was_update = save_structured_memory("test_key", "hello world")
         assert row and row["memory_id"]
         assert was_update is False
 
     def test_save_upsert(self, tmp_db):
-        row1, was_update1 = _save("test_key", "first")
-        row2, was_update2 = _save("test_key", "second")
+        row1, was_update1 = save_structured_memory("test_key", "first")
+        row2, was_update2 = save_structured_memory("test_key", "second")
         assert was_update1 is False
         assert was_update2 is True
         assert row2 and row1 and row2["memory_id"] == row1["memory_id"]  # same row
-        assert "content" not in row2
-        stored = get_structured_memory_by_name("test_key", "global", "")
-        assert stored is not None and stored["content"] == "second"
+        assert row2["content"] == "second"
 
     def test_save_normalizes_key(self, tmp_db):
-        _save("My-Key", "value")
+        save_structured_memory("My-Key", "value")
         mems = list_structured_memories()
         assert any(m["name"] == "my_key" for m in mems)
 
     def test_save_with_type_and_scope(self, tmp_db):
-        _save("k", "v", mem_type="user", scope="workstream", scope_id="ws1")
+        save_structured_memory("k", "v", mem_type="user", scope="workstream", scope_id="ws1")
         mems = list_structured_memories(scope="workstream", scope_id="ws1")
         assert len(mems) == 1
         assert mems[0]["type"] == "user"
@@ -94,14 +39,14 @@ class TestSaveStructuredMemory:
 
 class TestDeleteStructuredMemory:
     def test_delete_existing(self, tmp_db):
-        _save("mykey", "val")
+        save_structured_memory("mykey", "val")
         assert delete_structured_memory("mykey")
 
     def test_delete_nonexistent(self, tmp_db):
         assert not delete_structured_memory("nope")
 
     def test_delete_normalizes_key(self, tmp_db):
-        _save("my_key", "val")
+        save_structured_memory("my_key", "val")
         assert delete_structured_memory("My-Key")
 
 
@@ -110,25 +55,25 @@ class TestListStructuredMemories:
         assert list_structured_memories() == []
 
     def test_list_returns_saved(self, tmp_db):
-        _save("a", "alpha")
-        _save("b", "beta")
+        save_structured_memory("a", "alpha")
+        save_structured_memory("b", "beta")
         mems = list_structured_memories()
         assert len(mems) == 2
 
 
 class TestSearchStructuredMemories:
     def test_search_finds_match(self, tmp_db):
-        _save("db_host", "localhost", description="database hostname")
-        _save("api_url", "http://example.com")
+        save_structured_memory("db_host", "localhost", description="database hostname")
+        save_structured_memory("api_url", "http://example.com")
         results = search_structured_memories("database")
         assert len(results) >= 1
         assert any(r["name"] == "db_host" for r in results)
 
     def test_multiword_or_matches_partial(self, tmp_db):
         """OR-of-terms: memory matching only 1 of 3 query terms is returned."""
-        _save("postgres_config", "host=localhost port=5432")
-        _save("redis_config", "host=redis port=6379")
-        _save("unrelated", "nothing relevant here")
+        save_structured_memory("postgres_config", "host=localhost port=5432")
+        save_structured_memory("redis_config", "host=redis port=6379")
+        save_structured_memory("unrelated", "nothing relevant here")
 
         # "postgres missing_word_a missing_word_b": only postgres_config matches "postgres"
         results = search_structured_memories("postgres missing_word_a missing_word_b")
@@ -138,9 +83,9 @@ class TestSearchStructuredMemories:
 
     def test_multiword_or_multiple_partial_matches(self, tmp_db):
         """Multiple memories each matching different terms are all returned."""
-        _save("key_alpha", "alpha content here")
-        _save("key_beta", "beta content here")
-        _save("key_other", "completely different")
+        save_structured_memory("key_alpha", "alpha content here")
+        save_structured_memory("key_beta", "beta content here")
+        save_structured_memory("key_other", "completely different")
 
         results = search_structured_memories("alpha beta")
         names = {r["name"] for r in results}
@@ -150,21 +95,9 @@ class TestSearchStructuredMemories:
 
     def test_search_scope_filtering_preserved(self, tmp_db):
         """Search with scope filter only returns memories in that scope."""
-        _save(
-            "ws1_fact",
-            "body one",
-            description="alpha info",
-            scope="workstream",
-            scope_id="ws1",
-        )
-        _save(
-            "ws2_fact",
-            "body two",
-            description="alpha info",
-            scope="workstream",
-            scope_id="ws2",
-        )
-        _save("global_fact", "body three", description="alpha info", scope="global")
+        save_structured_memory("ws1_fact", "alpha info", scope="workstream", scope_id="ws1")
+        save_structured_memory("ws2_fact", "alpha info", scope="workstream", scope_id="ws2")
+        save_structured_memory("global_fact", "alpha info", scope="global")
 
         results = search_structured_memories("alpha", scope="workstream", scope_id="ws1")
         names = {r["name"] for r in results}
@@ -175,7 +108,7 @@ class TestSearchStructuredMemories:
 
 class TestGetStructuredMemoryByName:
     def test_get_existing(self, tmp_db):
-        _save("my_mem", "full content here that is quite long")
+        save_structured_memory("my_mem", "full content here that is quite long")
         mem = get_structured_memory_by_name("my_mem", "global", "")
         assert mem is not None
         assert mem["content"] == "full content here that is quite long"
@@ -185,12 +118,12 @@ class TestGetStructuredMemoryByName:
         assert get_structured_memory_by_name("nope", "global", "") is None
 
     def test_get_wrong_scope(self, tmp_db):
-        _save("ws_mem", "data", scope="workstream", scope_id="ws1")
+        save_structured_memory("ws_mem", "data", scope="workstream", scope_id="ws1")
         assert get_structured_memory_by_name("ws_mem", "global", "") is None
         assert get_structured_memory_by_name("ws_mem", "workstream", "ws1") is not None
 
     def test_get_normalizes_key(self, tmp_db):
-        _save("My-Key", "value")
+        save_structured_memory("My-Key", "value")
         mem = get_structured_memory_by_name("My-Key", "global", "")
         assert mem is not None
         assert mem["name"] == "my_key"
@@ -201,51 +134,14 @@ class TestCountStructuredMemories:
         assert count_structured_memories() == 0
 
     def test_count_after_save(self, tmp_db):
-        _save("a", "1")
-        _save("b", "2")
+        save_structured_memory("a", "1")
+        save_structured_memory("b", "2")
         assert count_structured_memories() == 2
 
 
 class TestNormalizeKey:
     def test_basic(self):
         assert normalize_key("My-Key Name") == "my_key_name"
-
-    @pytest.mark.parametrize(
-        ("raw", "canonical"),
-        [
-            ("  Café Notes  ", "cafe_notes"),
-            ("Straße", "strasse"),
-            ("Ærø Guide", "aero_guide"),
-            ("release — checklist", "release_checklist"),
-            ("Cafe\N{COMBINING ACUTE ACCENT}", "cafe"),
-        ],
-    )
-    def test_canonical_latin_names(self, raw, canonical):
-        assert normalize_memory_name(raw) == canonical
-
-    @pytest.mark.parametrize(
-        "raw",
-        [
-            "_leading",
-            "trailing_",
-            "repeated__underscore",
-            "path/name",
-            "query?name",
-            "fragment#name",
-            "control\nname",
-            "ƿynn",
-            "中文名称",
-            "日本語",
-        ],
-    )
-    def test_invalid_names_are_rejected(self, raw):
-        with pytest.raises(ValueError, match="memory name"):
-            normalize_memory_name(raw)
-
-    @pytest.mark.parametrize("raw", ["ƿynn", "部署手順"])
-    def test_unsupported_character_error_is_retryable_guidance(self, raw):
-        with pytest.raises(ValueError, match="ASCII semantic key"):
-            normalize_memory_name(raw)
 
 
 class TestScopeIsolation:
@@ -258,35 +154,11 @@ class TestScopeIsolation:
 
     def _seed(self):
         """Create memories across multiple scopes."""
-        _save("global_note", "global body", description="visible to all", scope="global")
-        _save(
-            "ws1_note",
-            "workstream one body",
-            description="belongs to ws1",
-            scope="workstream",
-            scope_id="ws1",
-        )
-        _save(
-            "ws2_note",
-            "workstream two body",
-            description="belongs to ws2",
-            scope="workstream",
-            scope_id="ws2",
-        )
-        _save(
-            "u1_note",
-            "user one body",
-            description="belongs to user1",
-            scope="user",
-            scope_id="u1",
-        )
-        _save(
-            "u2_note",
-            "user two body",
-            description="belongs to user2",
-            scope="user",
-            scope_id="u2",
-        )
+        save_structured_memory("global_note", "visible to all", scope="global")
+        save_structured_memory("ws1_note", "belongs to ws1", scope="workstream", scope_id="ws1")
+        save_structured_memory("ws2_note", "belongs to ws2", scope="workstream", scope_id="ws2")
+        save_structured_memory("u1_note", "belongs to user1", scope="user", scope_id="u1")
+        save_structured_memory("u2_note", "belongs to user2", scope="user", scope_id="u2")
 
     @staticmethod
     def _list_visible(ws_id: str, user_id: str, mem_type: str = "", limit: int = 50):

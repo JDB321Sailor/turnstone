@@ -100,36 +100,6 @@ const STATE_DISPLAY = {
   error: { symbol: "\u2716", label: "err" },
 };
 
-const PERSISTENCE_DISPLAY = {
-  pending: {
-    label: "History save pending",
-    tooltip: "An accepted conversation turn has not reached durable history yet.",
-  },
-  retrying: {
-    label: "History save retrying",
-    tooltip:
-      "An accepted conversation turn has not reached durable history yet. Automatic recovery is in progress.",
-  },
-  conflict: {
-    label: "History save blocked",
-    tooltip:
-      "An accepted conversation turn cannot reach durable history automatically. Operator intervention is required.",
-  },
-};
-
-function appendPersistenceStatus(container, ws) {
-  const display = PERSISTENCE_DISPLAY[ws.persistence_state];
-  if (!display) return;
-  const badge = document.createElement("span");
-  badge.className = "dash-persistence-badge";
-  badge.dataset.state = ws.persistence_state;
-  badge.textContent = display.label;
-  badge.title = display.tooltip;
-  badge.setAttribute("role", "status");
-  badge.setAttribute("aria-label", display.label + ". " + display.tooltip);
-  container.appendChild(badge);
-}
-
 // --- Cluster State Model ---
 function applySnapshot(data) {
   clusterState = {
@@ -156,8 +126,6 @@ function patchClusterState(data) {
           if ("context_ratio" in data) ws.context_ratio = data.context_ratio;
           if ("activity" in data) ws.activity = data.activity;
           if ("activity_state" in data) ws.activity_state = data.activity_state;
-          if ("persistence_state" in data)
-            ws.persistence_state = data.persistence_state;
         }
       });
     }
@@ -177,7 +145,6 @@ function patchClusterState(data) {
         activity: "",
         activity_state: "",
         tool_calls: 0,
-        persistence_state: data.persistence_state || "healthy",
         // ws_created SSE events carry kind / parent_ws_id / user_id /
         // project_id / persona; preserve them on the in-memory ws so the
         // home-landing active-coordinators list and the tree grouping both
@@ -776,9 +743,6 @@ function _renderWsRow(ws, opts, container) {
   if (ws.tokens) ariaLabel += ", " + formatTokens(ws.tokens) + " tokens";
   if (ws.context_ratio > 0)
     ariaLabel += ", " + Math.round(ws.context_ratio * 100) + "% context";
-  const persistenceDisplay = PERSISTENCE_DISPLAY[ws.persistence_state];
-  if (persistenceDisplay)
-    ariaLabel += ", " + persistenceDisplay.label.toLowerCase();
   if (opts.isCoordinator && opts.childCount != null)
     ariaLabel += ", " + opts.childCount + " children";
   if (opts.isOrphan) ariaLabel += ", orphan";
@@ -949,11 +913,7 @@ function _renderWsRow(ws, opts, container) {
   const sub = document.createElement("div");
   sub.className = "dash-row-sub";
   if (ws.activity_state === "approval") sub.classList.add("sub-attention");
-  appendPersistenceStatus(sub, ws);
-  if (ws.activity) {
-    if (sub.childNodes.length) sub.append(" \u00b7 ");
-    sub.append(ws.activity);
-  }
+  sub.textContent = ws.activity || "";
   row.appendChild(sub);
 
   // Deep link: click opens proxied server UI at this workstream.
@@ -1491,20 +1451,12 @@ function _homeRenderChips() {
 }
 
 function _homeStageFile(file) {
-  if (!file) return false;
-  const paste = window.TurnstonePasteText;
-  if (
-    paste &&
-    paste.isDuplicatePastedTextFile &&
-    paste.isDuplicatePastedTextFile(file, _homeStagedFiles)
-  ) {
-    return true;
-  }
+  if (!file) return;
   if (_homeStagedFiles.length >= _HOME_MAX_FILES) {
     _homeShowError(
       "At most " + _HOME_MAX_FILES + " attachments per coordinator",
     );
-    return false;
+    return;
   }
   if (!_homeIsAttachmentAllowed(file)) {
     _homeShowError(
@@ -1512,18 +1464,17 @@ function _homeStageFile(file) {
         file.name +
         " (allowed: png/jpeg/gif/webp images, text)",
     );
-    return false;
+    return;
   }
   const isImage = (file.type || "").indexOf("image/") === 0;
   const cap = isImage ? _HOME_IMAGE_CAP : _HOME_TEXT_CAP;
   if (file.size > cap) {
     _homeShowError(file.name + " exceeds the " + _homeFormatSize(cap) + " cap");
-    return false;
+    return;
   }
   _homeShowError("");
   _homeStagedFiles.push(file);
   _homeRenderChips();
-  return true;
 }
 
 function _homeClearStagedFiles() {
@@ -1816,7 +1767,7 @@ function _mountHomeCoordComposer() {
     },
     attachments: {
       onAttach: function (file) {
-        return _homeStageFile(file);
+        _homeStageFile(file);
       },
     },
     dragDrop: { targetEl: mount, dropClass: "home-coord-drop" },
@@ -1971,7 +1922,9 @@ function submitHomeCoord(textFromComposer) {
   // pending storage rows until the GC sweep.  Require text whenever
   // attachments are staged so the first turn always picks them up.
   if (files.length > 0 && !(task || "").trim()) {
-    _homeShowError("Add a message to send with this attachment.");
+    _homeShowError(
+      "Add a task message — attachments need an initial turn to dispatch on.",
+    );
     return;
   }
   const shared = {

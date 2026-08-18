@@ -373,9 +373,7 @@ class TestCheckLlmBackendTool:
 
         fake = {"reachable": True, "available_models": ["m"], "error": None}
         with patch("turnstone.core.model_registry.probe_model_endpoint", return_value=fake):
-            # A resolvable host: the guard screens the RESOLVED address, and an
-            # unresolvable name is refused before the probe runs.
-            out = _tool_check_llm_backend({"provider": "openai", "base_url": "http://127.0.0.1/v1"})
+            out = _tool_check_llm_backend({"provider": "openai", "base_url": "http://x/v1"})
         assert "reachable" in out
 
     def test_rejects_metadata_base_url(self) -> None:
@@ -386,39 +384,6 @@ class TestCheckLlmBackendTool:
         with patch("turnstone.core.model_registry.probe_model_endpoint") as probe:
             out = _tool_check_llm_backend(
                 {"provider": "openai", "base_url": "http://169.254.169.254/v1"}
-            )
-        assert "Refused" in out
-        probe.assert_not_called()
-
-    def test_rejects_metadata_reached_indirectly(self) -> None:
-        """The guard RESOLVES, so a name or a wrapper cannot launder the address.
-
-        The previous ``host.startswith("169.254.")`` string test only ever saw
-        the literal, so any DNS name pointing at the metadata service — or any
-        IPv6 transition address wrapping it — walked straight through and the
-        response body came back to the model.
-        """
-        import socket
-
-        from turnstone.doctor import _tool_check_llm_backend
-
-        literals = ["http://[::ffff:169.254.169.254]/v1", "http://[64:ff9b::a9fe:a9fe]/v1"]
-        for base_url in literals:
-            with patch("turnstone.core.model_registry.probe_model_endpoint") as probe:
-                out = _tool_check_llm_backend({"provider": "openai", "base_url": base_url})
-            assert "Refused" in out, base_url
-            probe.assert_not_called()
-
-        # A perfectly ordinary hostname whose DNS answer is the metadata address.
-        infos = [
-            (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("169.254.169.254", 0))
-        ]
-        with (
-            patch("socket.getaddrinfo", return_value=infos),
-            patch("turnstone.core.model_registry.probe_model_endpoint") as probe,
-        ):
-            out = _tool_check_llm_backend(
-                {"provider": "openai", "base_url": "http://imds.attacker.example/v1"}
             )
         assert "Refused" in out
         probe.assert_not_called()
@@ -654,15 +619,10 @@ class TestPreflightHelpers:
 
     def test_relevant_env_redacts_secrets(self) -> None:
         out = _relevant_env(
-            {
-                "TURNSTONE_JWT_SECRET": "supersecret",
-                "TURNSTONE_HOST_IP": "10.0.0.1",
-                "TURNSTONE_ACME_EXTERNAL_URL": "http://ca.internal:8090/acme",
-            }
+            {"TURNSTONE_JWT_SECRET": "supersecret", "TURNSTONE_HOST_IP": "10.0.0.1"}
         )
         assert out["TURNSTONE_JWT_SECRET"] == "set (hidden)"
         assert out["TURNSTONE_HOST_IP"] == "10.0.0.1"
-        assert out["TURNSTONE_ACME_EXTERNAL_URL"] == "http://ca.internal:8090/acme"
 
     def test_relevant_env_redacts_db_url_creds(self) -> None:
         out = _relevant_env({"TURNSTONE_DB_URL": "postgresql://u:pw@h/db"})

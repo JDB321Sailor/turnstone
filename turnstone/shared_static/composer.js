@@ -12,8 +12,7 @@
  * Event surface (caller-provided callbacks):
  *   onSend(text)               — Enter / Send-button — required
  *   onStop()                   — Stop button click   — required iff stopBtn=true
- *   onAttach(file)             — file picker change OR paste image/text OR drop;
- *                                synchronous false preserves native text paste
+ *   onAttach(file)             — file picker change OR paste image OR drop
  *
  * Imperative API on the returned instance:
  *   value           — current textarea value (getter / setter)
@@ -35,8 +34,6 @@
  * whole pane) — broader than the composer itself so users can drop
  * anywhere onto the pane to attach.
  */
-import { pasteTextToFile } from "./composer_paste_text.js";
-
 var ATTACH_DEFAULT_ACCEPT =
   "image/png,image/jpeg,image/gif,image/webp,application/pdf,text/*," +
   "audio/wav,audio/mpeg,audio/ogg,audio/flac,audio/mp4,audio/aac,audio/webm," +
@@ -65,7 +62,7 @@ function makeButton(opts) {
  * @param {Object} opts — configuration:
  *   onSend: (text) => void
  *   onStop: () => void
- *   attachments: { onAttach: (file) => void|false, accept?: string } | null
+ *   attachments: { onAttach: (file) => void, accept?: string } | null
  *   stopBtn: boolean (default false)
  *   queueWhileBusy: boolean (default false) — busy state shows "Queue"
  *     instead of disabling the send button
@@ -487,21 +484,7 @@ Composer.prototype._wireEvents = function () {
           }
         }
       }
-      if (uploaded > 0) {
-        e.preventDefault();
-        return;
-      }
-      var text = e.clipboardData
-        ? e.clipboardData.getData("text/plain")
-        : "";
-      var textFile = pasteTextToFile(text);
-      if (textFile) {
-        // A synchronous false lets pre-create staging reject safely (for
-        // example, its file-count cap) and preserve the native inline paste.
-        // Immediate-upload controllers return undefined and remain accepted.
-        var accepted = opts.attachments.onAttach(textFile);
-        if (accepted !== false) e.preventDefault();
-      }
+      if (uploaded > 0) e.preventDefault();
     });
   }
 

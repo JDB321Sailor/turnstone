@@ -74,43 +74,11 @@ class TestServerSpec:
         assert "ws_id" in param_names
         assert "limit" in param_names
 
-    def test_history_handoff_and_failure_contract_is_public(self):
-        from turnstone.api.server_spec import build_server_spec
-
-        spec = build_server_spec()
-        history = spec["paths"]["/v1/api/workstreams/{ws_id}/history"]["get"]
-        events = spec["paths"]["/v1/api/workstreams/{ws_id}/events"]["get"]
-        close = spec["paths"]["/v1/api/workstreams/{ws_id}/close"]["post"]
-        history_schema = spec["components"]["schemas"]["WorkstreamHistoryResponse"]
-
-        assert "authoritative total accepted conversation-row prefix" in history["description"]
-        assert "History temporarily unavailable" in history["description"]
-        assert "history_resync" in events["description"]
-        assert "numeric event replay is not a substitute" in events["description"]
-        assert "accepted live conversation row" in close["description"]
-        assert "cancellation cleanup" in close["description"]
-        assert "503" in close["responses"]
-        assert "handoff_token" in history_schema["properties"]
-        assert (
-            "Admission of a later row changes the token"
-            in history_schema["properties"]["handoff_token"]["description"]
-        )
-
     def test_schemas_not_empty(self):
         from turnstone.api.server_spec import build_server_spec
 
         spec = build_server_spec()
         assert len(spec["components"]["schemas"]) > 0
-
-    def test_operator_workstream_schemas_publish_sanitized_persistence_state(self):
-        from turnstone.api.server_spec import build_server_spec
-
-        schemas = build_server_spec()["components"]["schemas"]
-        expected = ["healthy", "pending", "retrying", "conflict"]
-        for name in ("WorkstreamInfo", "WorkstreamDetailResponse", "DashboardWorkstream"):
-            field = schemas[name]["properties"]["persistence_state"]
-            assert field["enum"] == expected
-            assert field["default"] == "healthy"
 
     def test_json_serializable(self):
         from turnstone.api.server_spec import build_server_spec
@@ -127,41 +95,6 @@ class TestServerSpec:
         assert "requestBody" in send
         assert "application/json" in send["requestBody"]["content"]
 
-    def test_memory_name_contract_is_published_on_body_and_path(self):
-        from jsonschema import validate
-
-        from turnstone.api.server_schemas import MEMORY_NAME_INPUT_DESCRIPTION
-        from turnstone.api.server_spec import build_server_spec
-
-        spec = build_server_spec()
-        save_name = spec["components"]["schemas"]["SaveMemoryRequest"]["properties"]["name"]
-        assert save_name["description"] == MEMORY_NAME_INPUT_DESCRIPTION
-        assert "pattern" not in save_name
-        assert "maxLength" not in save_name
-        raw_aliases = ["Café Notes", "Release — Checklist", "Ærø_Guide"]
-        for alias in raw_aliases:
-            validate(alias, save_name)
-        for method in ("get", "delete"):
-            operation = spec["paths"]["/v1/api/memories/{name}"][method]
-            name = next(param for param in operation["parameters"] if param["name"] == "name")
-            assert name["description"] == MEMORY_NAME_INPUT_DESCRIPTION
-            assert "pattern" not in name["schema"]
-            assert "maxLength" not in name["schema"]
-            for alias in raw_aliases:
-                validate(alias, name["schema"])
-        for response_model in ("MemorySummary", "MemoryInfo"):
-            response_name = spec["components"]["schemas"][response_model]["properties"]["name"]
-            assert "pattern" not in response_name
-            assert "maxLength" not in response_name
-
-    def test_admin_verdict_contract_exposes_approval_principals(self):
-        from turnstone.api.console_spec import build_console_spec
-
-        spec = build_console_spec()
-        verdict = spec["components"]["schemas"]["VerdictInfo"]["properties"]
-        assert verdict["resolver_principal_id"]["type"] == "string"
-        assert verdict["execution_principal_id"]["type"] == "string"
-
     def test_approval_and_cancel_preserve_extended_response_contracts(self):
         from turnstone.api.server_spec import build_server_spec
 
@@ -177,7 +110,6 @@ class TestServerSpec:
         assert cancel["requestBody"]["required"] is False
         assert "cycle_id" in spec["components"]["schemas"]["ApproveResponse"]["properties"]
         assert "dropped" in spec["components"]["schemas"]["CancelResponse"]["properties"]
-        assert "400" in approve["responses"]
 
     def test_create_status_is_optional_but_never_advertised_as_null(self):
         from turnstone.api.server_spec import build_server_spec
@@ -227,15 +159,6 @@ class TestConsoleSpec:
         result = json.dumps(spec)
         assert len(result) > 100
 
-    def test_cluster_workstream_schema_publishes_sanitized_persistence_state(self):
-        from turnstone.api.console_spec import build_console_spec
-
-        field = build_console_spec()["components"]["schemas"]["ClusterWorkstreamInfo"][
-            "properties"
-        ]["persistence_state"]
-        assert field["enum"] == ["healthy", "pending", "retrying", "conflict"]
-        assert field["default"] == "healthy"
-
     def test_nodes_endpoint_has_query_params(self):
         from turnstone.api.console_spec import build_console_spec
 
@@ -275,22 +198,6 @@ class TestConsoleSpec:
         }
         assert expected.issubset(paths), f"Missing: {expected - paths}"
 
-    def test_coordinator_history_handoff_and_failure_contract_is_public(self):
-        from turnstone.api.console_spec import build_console_spec
-
-        spec = build_console_spec()
-        history = spec["paths"]["/v1/api/workstreams/{ws_id}/history"]["get"]
-        events = spec["paths"]["/v1/api/workstreams/{ws_id}/events"]["get"]
-        close = spec["paths"]["/v1/api/workstreams/{ws_id}/close"]["post"]
-
-        assert "authoritative total accepted conversation-row prefix" in history["description"]
-        assert "History temporarily unavailable" in history["description"]
-        assert "history_resync" in events["description"]
-        assert "numeric replay is not a substitute" in events["description"]
-        assert "accepted live conversation row" in close["description"]
-        assert "cancellation cleanup" in close["description"]
-        assert "503" in close["responses"]
-
     def test_routing_paths_and_extended_response_contracts(self):
         from turnstone.api.console_spec import build_console_spec
 
@@ -305,7 +212,6 @@ class TestConsoleSpec:
 
         coordinator_approve = paths["/v1/api/workstreams/{ws_id}/approve"]["post"]
         coordinator_cancel = paths["/v1/api/workstreams/{ws_id}/cancel"]["post"]
-        routed_close = paths["/v1/api/route/workstreams/{ws_id}/close"]["post"]
         assert coordinator_approve["responses"]["200"]["content"]["application/json"]["schema"] == {
             "$ref": "#/components/schemas/ApproveResponse"
         }
@@ -313,7 +219,6 @@ class TestConsoleSpec:
             "$ref": "#/components/schemas/CancelResponse"
         }
         assert coordinator_cancel["requestBody"]["required"] is False
-        assert "409" in routed_close["responses"]
 
     def test_route_create_and_live_contracts(self):
         from turnstone.api.console_spec import build_console_spec
@@ -352,31 +257,6 @@ class TestConsoleSpec:
 
         live = spec["paths"]["/v1/api/route/workstreams/{ws_id}/live"]["get"]
         assert set(live["responses"]) == {"200", "400", "502", "503"}
-
-    def test_admin_memory_get_and_patch_publish_storage_failures(self):
-        from turnstone.api.console_spec import build_console_spec
-
-        operations = build_console_spec()["paths"]["/v1/api/admin/memories/{memory_id}"]
-        assert set(operations["get"]["responses"]) == {"200", "404", "500", "503"}
-        assert set(operations["patch"]["responses"]) == {
-            "200",
-            "400",
-            "404",
-            "500",
-            "503",
-        }
-
-    def test_admin_memory_schemas_extend_public_metadata(self):
-        from turnstone.api.console_spec import build_console_spec
-        from turnstone.api.server_spec import build_server_spec
-
-        public = set(build_server_spec()["components"]["schemas"]["MemorySummary"]["properties"])
-        admin_schemas = build_console_spec()["components"]["schemas"]
-        admin_summary = set(admin_schemas["AdminMemorySummary"]["properties"])
-        admin_info = set(admin_schemas["AdminMemoryInfo"]["properties"])
-
-        assert admin_summary == public | {"scope_label"}
-        assert admin_info == admin_summary | {"content"}
 
     def test_coordinator_create_has_request_body_and_200(self):
         """Coordinator create returns 200 and accepts a body.

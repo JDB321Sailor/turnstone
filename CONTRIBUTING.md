@@ -16,20 +16,10 @@ transferring ownership.
 ## Getting Started
 
 1. Fork the repository
-2. Create a branch from the appropriate base branch
+2. Create a branch for your change
 3. Make your changes
 4. Run the tests: `pytest`
-5. Open a pull request back to that base branch
-
-## Choosing a Base Branch
-
-Most contributions should target `dev`, which integrates the next release.
-Target `main` only for a focused fix that should ship on the current stable
-line. If an issue explicitly affects a supported prior minor, target its
-`stable/X.Y` branch; maintainers will merge the fix forward through newer lines.
-
-See [the release process](docs/releasing.md) for the complete branch and
-synchronization policy.
+5. Open a pull request
 
 ## Development Setup
 

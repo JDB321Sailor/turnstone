@@ -1,6 +1,6 @@
 """Tests for :meth:`ChatSession._format_backend_error`.
 
-The helper turns bare backend-boundary exceptions (HTTPX/HTTPX2 ``ReadTimeout``,
+The helper turns bare backend-boundary exceptions (httpx ``ReadTimeout``,
 OpenAI SDK ``APITimeoutError`` / ``APIConnectionError`` /
 ``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``) into
 operator-actionable messages that include the provider, base URL, and
@@ -11,16 +11,12 @@ model. We bind the method to lightweight stubs carrying one coherent
 from __future__ import annotations
 
 import dataclasses
-import threading
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
 
 import pytest
 
-from tests._session_helpers import RecordingUI, make_session, provider_shell
 from turnstone.core.model_turn import ModelLane
-from turnstone.core.providers import ModelCapabilities
 from turnstone.core.session import ChatSession
 
 
@@ -114,23 +110,6 @@ class PermissionDeniedError(Exception):
 
 class RateLimitError(Exception):
     pass
-
-
-class APIError(Exception):
-    pass
-
-
-class BackendStatusError(Exception):
-    def __init__(self, message: str, *, status_code: int, reason_phrase: str) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.response = SimpleNamespace(reason_phrase=reason_phrase)
-
-
-class BadStatusAccessorError(Exception):
-    @property
-    def status_code(self) -> int:
-        raise RuntimeError("boom")
 
 
 class ReadError(Exception):  # noqa: N818
@@ -235,99 +214,6 @@ def test_rate_limit_with_overflow_phrasing_is_not_mislabeled_overflow():
     assert "Context window exceeded" not in msg
 
 
-@pytest.mark.parametrize(
-    ("error_name", "code", "error_type", "expected_message"),
-    [
-        (
-            "UpstreamRateLimitError",
-            "rate_limit_exceeded",
-            "rate_limit_error",
-            "Backend rate-limited",
-        ),
-        (
-            "UpstreamTransientError",
-            "server_error",
-            "server_error",
-            "Backend returned a transient application error",
-        ),
-    ],
-)
-def test_http_200_json_transient_errors_outrank_overflow_wording(
-    error_name: str, code: str, error_type: str, expected_message: str
-):
-    from turnstone.core.providers import _openai_common
-
-    error_class = getattr(_openai_common, error_name)
-    exc = error_class(
-        status_code=200,
-        content_type="application/json",
-        body="maximum number of tokens allowed per minute is temporarily unavailable",
-        code=code,
-        error_type=error_type,
-    )
-
-    msg = _format(_stub(), exc)
-
-    assert msg is not None
-    assert expected_message in msg
-    assert "Context window exceeded" not in msg
-
-
-def test_http_status_error_names_backend_status_model_and_raw_payload():
-    msg = _format(
-        _stub(model="gemma", model_alias="local-gemma"),
-        BackendStatusError(
-            '{"error":{"message":"payload too large"}}',
-            status_code=413,
-            reason_phrase="Payload Too Large",
-        ),
-    )
-    assert msg is not None
-    assert "Backend request failed (HTTP 413 Payload Too Large)" in msg
-    assert "openai-compatible" in msg
-    assert "http://192.168.0.5:8000/v1" in msg
-    assert "model=local-gemma (id=gemma)" in msg
-    assert 'raw=\'{"error":{"message":"payload too large"}}\'' in msg
-
-
-def test_in_band_api_error_is_enriched_but_overflow_keeps_specific_message():
-    generic = _format(_stub(), APIError("backend overloaded"))
-    assert generic is not None
-    assert "Backend returned an error instead of a usable stream (APIError)" in generic
-    assert "backend overloaded" in generic
-
-    overflow = _format(
-        _stub(),
-        APIError("request (9870 tokens) exceeds the available context size (4096 tokens)"),
-    )
-    assert overflow is not None
-    assert "Context window exceeded" in overflow
-    assert "Backend returned an error instead" not in overflow
-
-
-def test_http_200_json_error_is_rendered_as_context_overflow():
-    from turnstone.core.providers._openai_common import UpstreamResponseError
-
-    raw_body = (
-        '{"error":{"message":"request (9870 tokens) exceeds the available '
-        'context size (4096 tokens)"}}'
-    )
-    msg = _format(
-        _stub(model="Gemma-4-31B-it-GGUF", model_alias="gemma-4-amd-halo-one"),
-        UpstreamResponseError(
-            status_code=200,
-            content_type="application/json",
-            body=raw_body,
-        ),
-    )
-    assert msg is not None
-    assert "Context window exceeded" in msg
-    assert "model=gemma-4-amd-halo-one (id=Gemma-4-31B-it-GGUF)" in msg
-    assert "9870 tokens" in msg
-    assert "4096 tokens" in msg
-    assert "Backend stream died mid-response" not in msg
-
-
 # ---------------------------------------------------------------------------
 # Stream-death branch — the mid-response wire-failure wording (#937)
 # ---------------------------------------------------------------------------
@@ -335,7 +221,7 @@ def test_http_200_json_error_is_rendered_as_context_overflow():
 
 def _stream_death_exemplars() -> list[BaseException]:
     """One realistic instance per name in ``_BACKEND_STREAM_EXC_NAMES``:
-    the normalized shape the guarded iterators raise, plus the raw HTTPX-family
+    the normalized shape the guarded iterators raise, plus the raw httpx
     names for any future unguarded path."""
     from turnstone.core.providers import IncompleteStreamError
 
@@ -409,48 +295,6 @@ def test_stream_death_with_overflow_phrasing_stays_stream_death():
     assert "Context window exceeded" not in msg
 
 
-def test_terminal_fallback_stream_death_reports_actual_lane(tmp_db):
-    """Fatal formatting consumes the fallback lane that armed the stream.
-
-    The original exception object survives the retry wrapper, while its
-    side-table context contains no client, credential, principal, or query.
-    """
-    from turnstone.core.providers import IncompleteStreamError
-
-    ui = RecordingUI()  # type: ignore[no-untyped-call]
-    session = make_session(model_alias="primary", ui=ui)
-    provider = provider_shell("fallback-provider")
-    fallback_lane = ModelLane(
-        provider=provider,
-        client=SimpleNamespace(base_url="https://fallback.example/v1?api_key=terminal-secret"),
-        model="fallback-kernel",
-        alias="fallback-alias",
-        registry_generation=19,
-        capabilities=ModelCapabilities(),
-    )
-    death = IncompleteStreamError("peer closed the response")
-
-    def _fail_on_fallback(consumer, *_args, **_kwargs):
-        consumer.begin_attempt(SimpleNamespace(armed=True), None, fallback_lane)
-        raise death
-
-    session._MID_STREAM_RETRIES = 0
-    with (
-        patch.object(session, "_model_turn_with_fallback", side_effect=_fail_on_fallback),
-        pytest.raises(IncompleteStreamError) as raised,
-    ):
-        session._stream_response()
-
-    assert raised.value is death
-    session._record_fatal_error(raised.value)
-    message = ui.of("error")[-1]
-    assert "fallback-provider" in message
-    assert "https://fallback.example/v1" in message
-    assert "model=fallback-alias (id=fallback-kernel)" in message
-    assert "primary" not in message
-    assert "terminal-secret" not in message
-
-
 # ---------------------------------------------------------------------------
 # Fall-through + degradation behaviour
 # ---------------------------------------------------------------------------
@@ -462,10 +306,6 @@ def test_unknown_exception_returns_none():
 
 def test_unknown_exception_value_error_returns_none():
     assert _format(_stub(), ValueError("not a backend error")) is None
-
-
-def test_unknown_exception_with_bad_status_accessor_returns_none():
-    assert _format(_stub(), BadStatusAccessorError("original")) is None
 
 
 def test_trailing_slash_and_query_string_stripped():
@@ -535,12 +375,10 @@ def _record_fatal_stub(ui: Any, captured: dict[str, str]) -> Any:
     when ``self`` is a real instance of the class)."""
     stub = _stub()
     stub._ws_id = "ws-test"
-    stub._generation_lock = threading.RLock()
     stub._has_persisted_error = False
     stub.ui = ui
     stub._emit_state = lambda state, **_kwargs: captured.setdefault("state", state)
     stub._format_backend_error = lambda exc: ChatSession._format_backend_error(stub, exc)
-    stub._save_last_error = lambda ws_id, text: ChatSession._save_last_error(stub, ws_id, text)
     return stub
 
 
@@ -560,8 +398,10 @@ def test_record_fatal_uses_enriched_message_for_known(monkeypatch):
         # under test produces no credentials.
         return text
 
-    monkeypatch.setattr("turnstone.core.session.persist_last_error", fake_persist)
-    monkeypatch.setattr("turnstone.core.session.sanitize_error_text", fake_sanitize)
+    import turnstone.core.memory as memory_mod
+
+    monkeypatch.setattr(memory_mod, "persist_last_error", fake_persist)
+    monkeypatch.setattr(memory_mod, "sanitize_error_text", fake_sanitize)
 
     class _UI:
         def __init__(self) -> None:
@@ -596,8 +436,10 @@ def test_record_fatal_falls_back_for_unknown(monkeypatch):
     def fake_sanitize(text: str, *, max_len: int = 1024) -> str:
         return text
 
-    monkeypatch.setattr("turnstone.core.session.persist_last_error", fake_persist)
-    monkeypatch.setattr("turnstone.core.session.sanitize_error_text", fake_sanitize)
+    import turnstone.core.memory as memory_mod
+
+    monkeypatch.setattr(memory_mod, "persist_last_error", fake_persist)
+    monkeypatch.setattr(memory_mod, "sanitize_error_text", fake_sanitize)
 
     class _UI:
         def __init__(self) -> None:
@@ -631,8 +473,10 @@ def test_record_fatal_log_level_contract(
     not add an ERROR-level line per CLI interrupt."""
     import logging
 
-    monkeypatch.setattr("turnstone.core.session.persist_last_error", lambda ws_id, msg: None)
-    monkeypatch.setattr("turnstone.core.session.sanitize_error_text", lambda text, **kw: text)
+    import turnstone.core.memory as memory_mod
+
+    monkeypatch.setattr(memory_mod, "persist_last_error", lambda ws_id, msg: None)
+    monkeypatch.setattr(memory_mod, "sanitize_error_text", lambda text, **kw: text)
 
     class _UI:
         def on_error(self, msg: str) -> None:

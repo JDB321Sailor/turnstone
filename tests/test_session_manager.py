@@ -29,13 +29,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from turnstone.core.model_registry import ModelClientConstructionError, UnknownModelAliasError
-from turnstone.core.session_manager import CloseOutcome, SessionKindAdapter, SessionManager
+from turnstone.core.session_manager import SessionKindAdapter, SessionManager
 from turnstone.core.workstream import (
     BULK_CLOSE_STATE_VALUES,
     Workstream,
     WorkstreamKind,
     WorkstreamState,
-    concrete_method,
 )
 
 # ---------------------------------------------------------------------------
@@ -579,35 +578,6 @@ def test_create_persists_and_emits_created() -> None:
     assert [e.ws_id for e in adapter.events_of("created")] == [ws.id]
 
 
-def test_generated_id_collision_retries_with_a_fresh_id(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class CollisionOnceStorage(FakeStorage):
-        def __init__(self) -> None:
-            super().__init__()
-            self.registration_attempts: list[str] = []
-
-        def register_workstream(self, ws_id: str, **kwargs: Any) -> bool | None:
-            self.registration_attempts.append(ws_id)
-            if len(self.registration_attempts) == 1:
-                return False
-            super().register_workstream(ws_id, **kwargs)
-            return None
-
-    generated = iter(("a" * 32, "b" * 32, "c" * 32, "d" * 32))
-    monkeypatch.setattr(uuid, "uuid4", lambda: uuid.UUID(hex=next(generated)))
-    storage = CollisionOnceStorage()
-    mgr, adapter, _ = _make_manager(storage=storage)
-
-    ws = mgr.create(user_id="u1")
-
-    assert storage.registration_attempts == ["a" * 32, "c" * 32]
-    assert ws.id == "c" * 32
-    assert set(storage.rows) == {ws.id}
-    assert "a" * 32 in adapter.cleaned_up
-    assert [event.ws_id for event in adapter.events_of("created")] == [ws.id]
-
-
 def test_create_with_defer_emit_created_skips_emit() -> None:
     """``defer_emit_created=True`` returns the workstream but skips
     the ``emit_created`` call. The slot, storage row, and built
@@ -821,7 +791,7 @@ def test_create_rolls_back_slot_on_session_failure() -> None:
     assert storage.rows == {}
 
 
-def test_failed_deferred_create_deletes_exact_storage_reservation() -> None:
+def test_failed_pending_fork_create_deletes_exact_storage_reservation() -> None:
     adapter = FakeAdapter(build_session_raises=True)
     mgr, _, storage = _make_manager(adapter=adapter)
 
@@ -829,6 +799,7 @@ def test_failed_deferred_create_deletes_exact_storage_reservation() -> None:
         mgr.create(
             user_id="u1",
             defer_emit_created=True,
+            _fork_reservation=True,
         )
 
     assert mgr.count == 0
@@ -1524,11 +1495,12 @@ def test_cancel_falls_back_to_legacy_single_approval_api() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_close_deferred_create_deletes_its_reserved_storage_row() -> None:
+def test_close_pending_fork_deletes_its_reserved_storage_row() -> None:
     mgr, _, storage = _make_manager()
     ws = mgr.create(
         user_id="u1",
         defer_emit_created=True,
+        _fork_reservation=True,
     )
     assert ws._fork_reservation_token
     assert storage.fork_reservations[ws.id] == ws._fork_reservation_token
@@ -1540,11 +1512,12 @@ def test_close_deferred_create_deletes_its_reserved_storage_row() -> None:
     assert (ws.id, "closed") not in storage.state_updates
 
 
-def test_close_deferred_create_does_not_delete_foreign_reservation() -> None:
+def test_close_pending_fork_does_not_delete_replacement_reservation() -> None:
     mgr, _, storage = _make_manager()
     ws = mgr.create(
         user_id="u1",
         defer_emit_created=True,
+        _fork_reservation=True,
     )
     storage.rows[ws.id].name = "replacement"
     storage.fork_reservations[ws.id] = "replacement-incarnation"
@@ -1592,7 +1565,6 @@ def test_close_last_workstream_succeeds() -> None:
 
 def test_close_unknown_returns_false() -> None:
     mgr, _, _ = _make_manager()
-    assert mgr.close_with_outcome("not-there") is CloseOutcome.NOT_FOUND
     closed = mgr.close("not-there")
     assert closed is False
 
@@ -2571,65 +2543,3 @@ class TestStateSubscribers:
         fired.clear()
         mgr.set_state(ws.id, WorkstreamState.IDLE)
         assert fired == ["first:idle", "late:idle"]
-
-
-# ---------------------------------------------------------------------------
-# concrete_method — the shared optional-hook probe
-# ---------------------------------------------------------------------------
-
-
-class TestConcreteMethod:
-    """Both halves of the shared guard every optional-hook caller drives.
-
-    Manager persistence hooks, ``workstream_persistence_state``, the route
-    layer's cancel / history-handoff / cross-user probes, the nudge watcher's
-    interjection claim and the coordinator adapter's spawn gate all resolve
-    their hook through this one helper, so the two semantics below are pinned
-    once here rather than eleven times at the call sites.
-    """
-
-    def test_type_defined_method_is_concrete(self) -> None:
-        class Real:
-            def hook(self) -> str:
-                return "real"
-
-        found = concrete_method(Real(), "hook")
-        assert found is not None
-        assert found() == "real"
-
-    def test_missing_method_is_none(self) -> None:
-        assert concrete_method(object(), "hook") is None
-
-    def test_magicmock_auto_vivification_is_not_a_hook(self) -> None:
-        """An unconfigured mock answers every attribute with a callable child.
-
-        Treating that as a production hook is what the guard exists to stop:
-        it would make every optional seam look implemented under unit tests.
-        """
-        assert concrete_method(MagicMock(), "hook") is None
-
-    def test_instance_dict_hook_is_concrete(self) -> None:
-        """A deliberately installed per-instance hook still counts.
-
-        This is the half ``session_manager`` had and the route layer's
-        type-only copies had lost: an explicitly assigned attribute lands in
-        the instance ``__dict__``, unlike an auto-vivified mock child, so it
-        is distinguishable and must be honored.
-        """
-        target = MagicMock()
-        target.hook = lambda: "installed"
-        found = concrete_method(target, "hook")
-        assert found is not None
-        assert found() == "installed"
-
-    def test_non_callable_attribute_is_not_a_hook(self) -> None:
-        class Shadowed:
-            hook = "not callable"
-
-        assert concrete_method(Shadowed(), "hook") is None
-
-    def test_slots_object_without_dict_is_supported(self) -> None:
-        class Slotted:
-            __slots__ = ()
-
-        assert concrete_method(Slotted(), "hook") is None

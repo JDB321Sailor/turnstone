@@ -120,6 +120,7 @@ SYSTEM_TURN_SOURCES: Final = frozenset(
         "denial",
         "resume",
         "completion",
+        "start",
         "tool_error",
         "repeat",
         "compaction_pending",
@@ -131,7 +132,6 @@ SYSTEM_TURN_SOURCES: Final = frozenset(
         # ``exit_code`` / ``unread_lines`` metadata.
         "background_shell_exit",
         "participant_joined",
-        "memory_pointer",
     }
 )
 

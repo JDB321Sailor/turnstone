@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from turnstone.api.openapi import EndpointSpec, PathParam, QueryParam, build_openapi
+from turnstone.api.openapi import EndpointSpec, QueryParam, build_openapi
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
@@ -19,7 +19,6 @@ from turnstone.api.schemas import (
     StatusResponse,
 )
 from turnstone.api.server_schemas import (
-    MEMORY_NAME_INPUT_DESCRIPTION,
     ApproveRequest,
     ApproveResponse,
     AvailableModelInfo,
@@ -40,7 +39,6 @@ from turnstone.api.server_schemas import (
     ListSkillSummaryResponse,
     ListWorkstreamsResponse,
     MemoryInfo,
-    MemorySummary,
     PersonaChoice,
     RewindRequest,
     SaveMemoryRequest,
@@ -99,16 +97,9 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/workstreams/{ws_id}/close",
         "POST",
         "Close a workstream",
-        description=(
-            "Unloads the live workstream while preserving storage. Returns 409 "
-            "when any accepted live conversation row still requires persistence "
-            "reconciliation; the workstream remains loaded and its history journal "
-            "is retained. Returns 503 when cancellation cleanup has not yet "
-            "finished; retrying close is safe."
-        ),
         request_model=CloseWorkstreamRequest,
         response_model=StatusResponse,
-        error_codes=[400, 404, 409, 503],
+        error_codes=[400, 404],
         tags=["Workstreams"],
     ),
     # --- Chat ---
@@ -143,7 +134,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "Approve or deny a tool call",
         request_model=ApproveRequest,
         response_model=ApproveResponse,
-        error_codes=[400, 404, 409],
+        error_codes=[404, 409],
         tags=["Chat"],
     ),
     EndpointSpec(
@@ -172,27 +163,17 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "/v1/api/workstreams/{ws_id}/rewind",
         "POST",
         "Drop the last N conversation turns (emits clear_ui)",
-        description=(
-            "Claims the workstream mutation slot, durably truncates the requested "
-            "tail, then emits clear_ui. Concurrent sends are ordered after the "
-            "cut; a storage failure returns 503 without changing live history."
-        ),
         request_model=RewindRequest,
         response_model=StatusResponse,
-        error_codes=[400, 404, 503],
+        error_codes=[400, 404],
         tags=["Chat"],
     ),
     EndpointSpec(
         "/v1/api/workstreams/{ws_id}/retry",
         "POST",
         "Drop the last response and re-send the last user message",
-        description=(
-            "Uses one workstream worker claim for the durable truncation and the "
-            "replacement generation, so another send cannot enter between them. "
-            "A storage failure returns 503 without changing live history."
-        ),
         response_model=StatusResponse,
-        error_codes=[400, 404, 503],
+        error_codes=[400, 404],
         tags=["Chat"],
     ),
     # --- Streaming ---
@@ -201,37 +182,7 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "GET",
         "Per-workstream SSE event stream",
         description="Opens a Server-Sent Events stream scoped to a single workstream. "
-        "After rendering REST history, pass its opaque handoff_token once as "
-        "?history_token=; it names the exact accepted conversation-row prefix used "
-        "for that render. A history_resync event closes this stream and requires a "
-        "fresh history read; numeric event replay is not a substitute. Native "
-        "Last-Event-ID reconnects take priority. Pass ?user_turn=1 to opt into "
-        "typed accepted-user events; otherwise those rows become a backward-compatible "
-        "strong-repair frame. Pass ?tool_turn=1 to receive the final accepted tool row "
-        "as a typed tool_result with accepted=true; without it, accepted tool rows use "
-        "the same pre-row strong-repair projection. Returns "
-        "text/event-stream. See API reference for event types.",
-        query_params=[
-            QueryParam(
-                "last_event_id",
-                "Numeric per-workstream event cursor for manual reconnects.",
-                schema_type="integer",
-            ),
-            QueryParam(
-                "history_token",
-                "Opaque one-shot token naming the accepted prefix rendered from REST history.",
-            ),
-            QueryParam(
-                "user_turn",
-                "Set to 1 to receive typed user_turn events instead of history-repair frames.",
-                schema_type="integer",
-            ),
-            QueryParam(
-                "tool_turn",
-                "Set to 1 to receive final accepted tool_result projections.",
-                schema_type="integer",
-            ),
-        ],
+        "Returns text/event-stream. See API reference for event types.",
         error_codes=[404],
         tags=["Streaming"],
     ),
@@ -303,20 +254,10 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         description=(
             "Returns the tail of the conversation in OpenAI-like message "
             "format. Persisted-but-not-loaded workstreams (closed / "
-            "evicted) are rehydrated before history is served so every "
-            "successful response participates in the REST-to-SSE handoff. Lifted from "
+            "evicted) serve history without rehydrating. Lifted from "
             "the coord-only surface in the Stage 2 history/detail verb "
             "lift — interactive previously only exposed history through "
-            "the SSE replay on ``/events``. Messages are the "
-            "requested limit-bounded tail of one authoritative total accepted "
-            "conversation-row prefix: "
-            "user, assistant, tool, and system rows, including projected compaction "
-            "checkpoints and cancellation markers. The opaque handoff_token names "
-            "the exact prefix used for the render and is passed once on initial SSE "
-            "registration. Admission of a later row changes the token; durable "
-            "acknowledgement does not. If the durable prefix cannot be loaded, the "
-            "endpoint returns 503 with `History temporarily unavailable`; that "
-            "response is not authoritative and supplies no usable handoff token."
+            "the SSE replay on ``/events``."
         ),
         response_model=WorkstreamHistoryResponse,
         query_params=[
@@ -499,17 +440,16 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
     EndpointSpec(
         "/v1/api/memories",
         "GET",
-        "List structured memories. Without a scope, returns global plus the authenticated user's memories; workstream scope is owner-bound.",
+        "List structured memories",
         response_model=ListMemoriesResponse,
         query_params=[
             QueryParam("type", "Filter by memory type"),
-            QueryParam("scope", "Filter by public scope: global, workstream, or user"),
+            QueryParam("scope", "Filter by scope"),
             QueryParam("scope_id", "Filter by scope identifier"),
             QueryParam(
                 "limit", "Max results (default 100, max 200)", schema_type="integer", default=100
             ),
         ],
-        error_codes=[400, 403, 404, 500],
         tags=["Memories"],
     ),
     EndpointSpec(
@@ -517,35 +457,16 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "POST",
         "Save (upsert) a structured memory",
         request_model=SaveMemoryRequest,
-        response_model=MemorySummary,
-        error_codes=[400, 403, 404, 500],
+        response_model=MemoryInfo,
+        error_codes=[400],
         tags=["Memories"],
     ),
     EndpointSpec(
         "/v1/api/memories/search",
         "POST",
-        "Search structured memories by query. Without a scope, searches global plus the authenticated user's memories.",
+        "Search structured memories by query",
         request_model=SearchMemoriesRequest,
         response_model=ListMemoriesResponse,
-        error_codes=[400, 403, 404, 500],
-        tags=["Memories"],
-    ),
-    EndpointSpec(
-        "/v1/api/memories/{name}",
-        "GET",
-        "Fetch a structured memory body by exact name and scope",
-        response_model=MemoryInfo,
-        path_params=[
-            PathParam(
-                "name",
-                MEMORY_NAME_INPUT_DESCRIPTION,
-            )
-        ],
-        query_params=[
-            QueryParam("scope", "Scope (default: global)"),
-            QueryParam("scope_id", "Scope identifier"),
-        ],
-        error_codes=[400, 403, 404, 500],
         tags=["Memories"],
     ),
     EndpointSpec(
@@ -553,17 +474,11 @@ SERVER_ENDPOINTS: list[EndpointSpec] = [
         "DELETE",
         "Delete a structured memory by name and scope",
         response_model=StatusResponse,
-        path_params=[
-            PathParam(
-                "name",
-                MEMORY_NAME_INPUT_DESCRIPTION,
-            )
-        ],
         query_params=[
             QueryParam("scope", "Scope (default: global)"),
             QueryParam("scope_id", "Scope identifier"),
         ],
-        error_codes=[400, 403, 404, 500],
+        error_codes=[404],
         tags=["Memories"],
     ),
     # --- Admin settings ---

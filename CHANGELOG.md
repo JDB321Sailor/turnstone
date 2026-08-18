@@ -6,282 +6,543 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [PEP 440](https://peps.python.org/pep-0440/) for
 version numbers (`X.Y.Z`, with `X.Y.ZaN` / `bN` / `rcN` for pre-releases).
 
-Beginning with 1.8.0, `main` is the current stable line and `dev` is the next
-release line. A `stable/X.Y` branch is created only when `main` advances beyond
-that minor, so the current stable line never has two independently writable
-branches. Earlier stable lines (`stable/1.7`, `stable/1.6`, `stable/1.5`) are
-frozen.
+Two active release tracks are maintained — the current stable and the
+experimental line:
 
-## [1.8.0]
+- **`stable/1.7`** — patch-only (`v1.7.x`)
+- **`main`** — experimental (next major)
 
-Turnstone 1.8 focuses on dependable long-running workstreams: one model-call
-pipeline, lossless reconnect and history recovery, visible compaction, stronger
-memory boundaries, and expanded enterprise identity and deployment paths. This
-entry describes the change from 1.7.4; features already shipped on
-the 1.7 line are not repeated here.
+Earlier stable lines (`stable/1.6`, `stable/1.5`) are frozen.
 
-> **Before upgrading:** 1.8 advances the database schema from migration 066 to
-> 072. The migrations add encrypted OIDC credential storage, per-model
-> authentication and concurrency fields, idempotent conversation commit keys,
-> and immutable memory-index snapshots. Migration 072 also removes the obsolete
-> `memory.fetch_limit` setting and resets structured-memory access counters
-> because access now means an explicit full-body fetch. Migrations run
-> automatically, but back up the database before upgrading as usual.
+## [Unreleased]
 
 ### Added
 
-- **Immutable memory-index snapshots (#902).** At the first real model call, a
-  workstream captures the complete memory metadata visible to its acting user
-  and project. That index stays cache-stable for the life of the workstream;
-  later turns receive compact relevance pointers while memory bodies remain
-  behind an explicit `memory_get`. The console and SDKs expose snapshot health,
-  and project, persona, approval, and principal boundaries are enforced
-  throughout. Indexes over 65,536 characters raise an operator warning rather
-  than being truncated; task agents remain memory-disabled in this release.
-- **Single-sign-on passthrough for MCP servers (#551).** The new
-  `auth_type="oauth_obo"` can reuse an opt-in credential captured at Turnstone
-  OIDC login to mint short-lived, audience-scoped tokens for any configured MCP
-  server. It supports Entra and RFC 8693 exchange profiles, encrypted
-  credential storage, rotation, revocation, cache flushing, admin UI, and
-  operator documentation without changing existing `oauth_user` flows.
-- **Per-model gateway identity (#898, #950, #955).** A model alias can retain its
-  static key or explicitly use caller-delegated Entra OBO, RFC 8693 token
-  exchange, or shared app identity. Dynamic authentication is default-deny at
-  the admin boundary, uses audience and scope allow-lists, follows registry
-  reloads safely, and fails closed where no valid caller or fallback exists.
-  Existing aliases remain `static`.
-- **Visible, durable compaction.** Manual and automatic compaction now emit a
-  typed `compaction` lifecycle event and render a progress/result card in both
-  web viewers. The final token delta and summary survive reload through
-  history. Slash commands render as command chips, run on the workstream worker
-  slot, and defer concurrent sends in order instead of truncating or losing
-  them; Stop cancels an in-flight summary request.
-- **Coordinator MCP and unfinished-work recovery (#725, #913).** Coordinator
-  workstreams can use MCP tools, resources, and prompts under the same persona
-  and user gates as interactive sessions. Coordinators that go idle with
-  running children or open tasks receive bounded, factual nudges; tasks gain a
-  `needs_user` state and note, and task/child handles survive compaction.
-- **Optional project-required creation policy.** Enabling the default-off
-  `server.require_project` setting requires human-created interactive and
-  coordinator workstreams to be filed under a project. Forks inherit their
-  source project, while service automation and coordinator-spawned sessions
-  stay exempt. The console and direct API enforce the same tenancy-safe rule.
-- **Per-alias model concurrency limits (#917).** Operators can set
-  `max_concurrency` on a model alias. Admission is FIFO, covers the whole
-  stream, participates in request deadlines, and defaults to unlimited for
-  existing aliases.
-- **Large text pastes become attachments (#930).** Pasting more than 2,000
-  characters stages `pasted-text.txt` across every attachment-capable
-  composer. Clipboard files retain priority, text above the 512 KiB attachment
-  ceiling stays inline, duplicates collapse, and refused or queued sends keep
-  their staged content for retry.
-- **Copy actions across every chat surface.** Assistant messages copy their raw
-  Markdown, while code, Mermaid, and table blocks can be copied by pointer or
-  keyboard. The fallback works on plain-HTTP LAN deployments and preserves
-  focus and selection.
-- **Task-agent context meters (#982).** Running task-agent cards show normalized
-  used/total context after model turns that report usage, warn at 80%, recover
-  on reconnect, and clear on every terminal path. Python and TypeScript SDKs
-  gain the typed `agent_context` event.
-- **Claude Opus 5 support.** The Anthropic capability table includes its 1M
-  context window, 128K output, adaptive thinking, and full effort ladder.
-  Provider refusals now surface as content-filter stops instead of successful
-  empty answers.
-- **`server_parses_reasoning` model capability.** Models whose server already
-  separates reasoning can disable Turnstone's inline tag scanner on every lane,
-  preventing quoted `<think>` text from being mistaken for hidden reasoning.
-  Commercial provider defaults declare this capability automatically.
+- **`server_parses_reasoning` model capability.** Declare it on a model
+  definition whose backend segregates reasoning into its own channel (a
+  vLLM launched with a reasoning parser, a commercial provider): the
+  inline think-tag scan turns off on every lane — interactive and
+  drained alike — so content is trusted verbatim and prose that merely
+  quotes a tag can no longer be misrouted into the reasoning lane, and
+  the utility lanes stop suppressing reasoning they'd otherwise pin off.
+  Default off for local lanes, preserving the passthrough-server
+  behavior; the built-in capability tables declare it for every real
+  commercial endpoint (known models and table-miss defaults alike),
+  which also removes the quoted-tag false positive from those lanes.
+- **Per-model Entra gateway authentication.** Model definitions can bind either
+  a caller-delegated OBO token (`entra_obo`) or a shared app-identity token
+  (`entra_app`) through the provider SDK credential surface. Mints reuse the
+  encrypted cluster token cache, refresh-rotation CAS, and advisory locking;
+  add a host-local memo, failure cooldown, long-lived mint HTTP client, audience
+  allow-list/permission boundary, identity-unlink purge, and optional
+  `model.auth_fail_closed` refusal policy. Delegated identity now propagates
+  through judge, output-guard, and principal-scoped perception lanes, and
+  unattended watch restoration reacquires the persisted workstream owner.
+  Ownerless OBO calls and dynamic aliases without a real static fallback always
+  fail closed; grant modes are never silently switched. Static authentication
+  remains the default.
+
+- **Compaction is visible now: lifecycle events, a progress bar, and a
+  persistent transcript card.** Context compaction (manual `/compact` and
+  auto) emits a first-class `compaction` SSE event
+  (`start` / `progress` / `end` — see the API reference) instead of loose
+  info lines. The web UI renders an in-transcript card with a real progress
+  bar (determinate `part k of N` during chunked summarization, indeterminate
+  for single-call compactions) that settles into a result card — token delta
+  plus the summary behind a fold — in both the interactive pane and the
+  coordinator viewer. The result survives reloads: the persisted compaction
+  marker now projects through `/history` as a `role="system"`,
+  `source="compaction"` entry (resume/export/search unchanged), stamped with
+  the end event's id so repaint and SSE replay can't double-render. The
+  marker's `meta` additionally records `before_tokens` / `after_tokens` /
+  `trigger`. Python and TypeScript SDKs gain a typed `CompactionEvent`.
+
+- **One provider transport: every model call now streams (#831).**
+  The per-adapter non-streaming entry (`create_completion`) is retired;
+  single-shot lanes — judges, titles, compaction, web-fetch extraction,
+  perception, eval, optimizer — sample through the same streaming entry
+  the chat loop uses and accumulate via one shared drain, so request
+  shaping can no longer drift between the two consumption styles. Two
+  operator-visible consequences: long single-shot generations (a thinking
+  model composing a title, a slow local judge) no longer sit in a single
+  blocking read that can hit client read-timeouts — the same reason the
+  Anthropic adapter already streamed internally — and judge timeouts now
+  *abort* the underlying HTTP read instead of abandoning a worker thread
+  on a dead call. Because every call now streams, an alias pointed at a
+  model or org that cannot stream (OpenAI's verified-org streaming
+  entitlement, a gateway api-version predating `stream_options` — e.g.
+  older Azure OpenAI deployments) fails at request time where 1.7's
+  non-streaming single-shot call succeeded; remediation is on the
+  serving side (verify the org, bump the api-version/gateway) — there is
+  deliberately no per-model non-streaming fallback left to configure. These lanes are also complete-or-error now: a stream
+  that ends without any finish signal is treated as a generation that
+  died mid-response and retried, instead of storing the partial text as
+  a clean result (previously a half-generated compaction summary could
+  silently replace real history). Caveats: these lanes now carry the
+  same `stream_options: {include_usage: true}` the chat loop always
+  sent — OpenAI-compatible servers old enough to *ignore* it stop
+  producing usage rows on these lanes, and servers strict enough to
+  *reject* unknown fields (pre-2024 llama.cpp/proxy builds) will 400 —
+  such a server already couldn't serve turnstone's chat loop, but a
+  judge/utility alias pointed at one worked on 1.7 and needs to move to
+  a current server. Transient mid-stream deaths (connection drop, proxy
+  hiccup) are re-issued in place up to twice with exponential backoff —
+  the retry the SDK's request loop used to provide these lanes
+  invisibly. Each lane accepts its own terminal marker (Anthropic
+  `message_stop`, Responses terminal events); a lax server/gateway that
+  never sends any terminal signal needs
+  `{"finish_reason_optional": true}` in the model definition's
+  capabilities JSON, which restores 1.7's tolerance (clean end-of-stream
+  after output = completion) for that model on every lane — without it
+  such streams fail as died-mid-generation, because SSE gives no way to
+  tell the two apart and the default favors catching truncation. The
+  unread `supports_streaming` capability flag (and its admin tile) is
+  gone; the o-series models it described are dropped from the capability
+  table entirely (see Removed).
+
+- **One turn interface for every model call: `core/model_turn.py` (#827).**
+  Judges (intent + output guard), perception, title generation, compaction,
+  web-fetch extraction, the eval harness, the optimizer's meta lanes, and
+  task agents all advance a trajectory through the same plant-call
+  primitive the agent seam pioneered — Turn IR in, one shared lowering
+  (argument sanitize → minted-id restore → vLLM reasoning attach), one
+  shared re-ingest (blank-id repair → native-lane finalize). The judges'
+  hand-built OpenAI-dict path is gone, and with it the Gemini judge's
+  tool-blindness: evidence tools now work on Google models because the
+  native lane round-trips `thought_signature` (with pairwise repair for
+  blank-id compat responses). Provider adapters still take lowered wire
+  dicts — the transport collapse and main-loop migration are tracked as
+  #831 / #832.
+
+- **task_agent keeps its model's reasoning across its own tool loop — on
+  every provider lane.** A task agent's replayed turns now carry the
+  provider-native reasoning lane the model produced — Anthropic thinking
+  blocks with their signatures (commercial or an anthropic-compatible
+  server), OpenAI Responses reasoning items, Gemini `thought_signature`
+  fidelity blocks, and the reasoning text a vLLM `--reasoning-parser` /
+  llama.cpp `reasoning_format` surfaces on the Chat Completions lane —
+  instead of each turn being rebuilt from text + tool calls with the
+  reasoning dropped. On a thinking model this restores reasoning continuity
+  across the agent's own multi-turn tool use. On the wire the agent's
+  session-minted sub-tool ids are mapped back to the provider's own ids
+  (`restore_provider_tool_ids`), so the native block — replayed verbatim,
+  its signature never touched — the `tool_calls` mirror, and each tool
+  result always agree; internally the minted ids still key the live card,
+  recall, and the cancel ledger unchanged. Replay honors the same per-model
+  `replay_reasoning_to_model` flag the main loop uses on every lane: the
+  vLLM Chat-Completions field replay keeps its server-type gate, and
+  llama.cpp stays capture-only, matching main-loop behavior. The native
+  lane is finalized by the same shared builder as the main loop's, so the
+  two harnesses cannot drift.
+
+- **Background shells: `bash` gains `run_in_background`, plus `bash_output` /
+  `kill_shell`.** Setting `run_in_background=true` starts the command as a
+  detached shell and returns immediately with a `bash_N` handle — "start a dev
+  server, use it in a later call" is back as an explicit opt-in (the shape
+  follows the convention the major coding agents converged on). `bash_output`
+  returns only output produced since the previous read (optionally filtered by
+  a regex) plus status and exit code; `kill_shell` terminates the shell's
+  whole process group. Output is buffered per shell with a drop-oldest cap, so
+  a chatty server can't grow memory unbounded. When a background shell exits,
+  a system notice lands at the next seam (waking an idle workstream if
+  needed). Shells survive a generation cancel, die with the workstream, and
+  never outlive a task_agent that started them; anything a background shell
+  itself backgrounds is still reaped when that shell exits — the no-leak
+  guarantee below is unchanged.
 
 ### Changed
 
-- **All model calls use one turn and transport pipeline (#827, #831, #832,
-  #979).** Interactive turns, judges, titles, compaction, perception, web
-  extraction, evals, optimizers, and task agents now share `model_turn`,
-  provider-native replay, one lowering/re-ingest path, and the streaming
-  provider entry point. Utility calls are complete-or-error, cancellation closes
-  the underlying read, and transient stream failures retry at the shared
-  boundary.
-  - This is a compatibility boundary: every configured endpoint must support
-    streaming, and OpenAI-compatible endpoints must accept the current
-    `stream_options`. A gateway that cleanly ends a stream without a terminal
-    marker needs
-    `{"finish_reason_optional": true}` in that model's capabilities.
-  - The non-streaming `create_completion` adapter method and the unused
-    `supports_streaming` capability are gone.
-- **Sampling settings inherit instead of manufacturing defaults.** Temperature
-  and reasoning effort now resolve as alias override, then stored global
-  setting, then model-declared effort default, then omission. New workstreams
-  therefore inherit each backend's own defaults instead of silently sending
-  `temperature=0.5` and `reasoning_effort="medium"`. Use `none` to disable
-  reasoning explicitly; an empty effort now means inherit. Existing saved
-  workstreams retain their stamped values until their model or sampling
-  settings change.
-- **Compaction feedback is a typed event.** SSE and SDK consumers must handle
-  the `compaction` lifecycle event; 1.8 no longer dual-emits those updates as
-  generic `info` lines, which would double-render them in current clients.
-- **OpenAI SDK v3 and HTTPX2 are the supported provider stack (#1009).** Chat
-  Completions and Responses normalize HTTPX2 and legacy injected-HTTPX failures
-  through the same retry boundary. OpenAI's default client now uses the
-  operating-system trust store; installations that modified only `certifi`
-  must install their CA system-wide or set `SSL_CERT_FILE` /
-  `SSL_CERT_DIR`.
-- **lacme 1.2 and HTTPX2 back core mTLS (#1011).** Consoles can advertise a
-  routable `TURNSTONE_ACME_EXTERNAL_URL` for cross-host enrollment. Enrollment
-  uses purpose-confined rotating JWTs, managed identities are validated before
-  reuse, failed renewals keep the last usable certificate, and typed IPv4/IPv6
-  identifiers are issued as IP SANs. A complete multi-process cross-host
-  Compose smoke remains a manual deployment check.
-- **Retrieval and evaluation share bounded runtimes.** Reranking reuses a
-  lifecycle-owned HTTP client, the selected alias's admission limit, and a
-  circuit breaker that preserves native retrieval order during outages
-  (#1027). Intent-judge batch evaluations run in parallel rather than serially
-  (#946).
-- **File tools tell models where they operate (#857).** The `bash` and file
-  tool descriptions include the process working directory and, when present,
-  the user workspace directory. Stock Docker installs identify `/workspace`
-  without changing path permissions or the process cwd.
-- **Streaming log rename.** `drain_stream.post_finish_blip` is now
-  `stream.post_finish_blip`; the `usage_captured` field is unchanged.
-- **Frontend and SDK dependencies were refreshed.** The Anthropic SDK floor is
-  0.117, the bundled renderer now carries KaTeX 0.18.4, Highlight.js 11.12.0,
-  Mermaid 11.16.1, and HLS.js 1.7.0, and the TypeScript SDK moves to TypeScript
-  7.
+- **Log event rename: `drain_stream.post_finish_blip` is now
+  `stream.post_finish_blip`; its `usage_captured` field is retained.** The
+  single-shot drain normalizes mid-body transport deaths through the same
+  `transport_guarded` wrapper the interactive loop uses, so its
+  post-finish-blip tolerance logs under the wrapper's event name. Update
+  any external log filters pinned to the old name; the drained result's
+  possible `usage=None` on a post-finish blip is unchanged and documented
+  on `drain_stream`.
+
+- **Breaking (1.8): compaction feedback moved from `info` events to the
+  typed `compaction` SSE event.** Pre-1.8 SSE/SDK clients that ignore
+  unknown event types no longer see compaction lines (they are
+  deliberately not dual-emitted — dual emission would double-render on
+  every current client). Consume the `compaction` lifecycle event (see
+  the API reference and the `CompactionEvent` SDK type); embedders
+  driving `ChatSession` through a duck-typed `SessionUI` are unaffected
+  (the classic `on_info` lines are restored for them — see Fixed).
+
+- **Sampling knobs (temperature, reasoning effort) now ride one assignment
+  scheme: per-model alias value → operator-stored global setting → the
+  model definition's declared default (effort only) → field omitted.**
+  Turnstone previously manufactured values onto every unconfigured
+  request — a hidden `temperature: 0.5` and a `reasoning_effort: "medium"`
+  baked in at three layers — overriding serving-side defaults like a vLLM
+  model's `generation_config`. Unconfigured installs now send neither
+  field and the inference engine's own defaults rule; `model.temperature`
+  is blank by default ("inherit each model's own default") and
+  `model.reasoning_effort` defaults to the empty "inherit" choice. The
+  per-model → global resolution lives in one shared resolver used by the
+  session factories, the `/model` switch, and every `model_turn` lane, so
+  the same alias samples identically on every surface. CLI
+  `--temperature` / `--reasoning-effort` likewise default to inherit.
+
+  **Upgrade notes:**
+  - The empty (`""`) reasoning-effort choice changed meaning from
+    "explicitly disable thinking" to "inherit the model/serving default".
+    On local manual-thinking models (e.g. Qwen templates with
+    `enable_thinking`), a stored `""` previously sent
+    `enable_thinking: false`; it now sends nothing, so the template's own
+    default (often thinking ON) applies. Use **`none`** to actually
+    disable reasoning.
+  - Workstreams saved by earlier versions carry the old defaults
+    (`temperature=0.5`, `reasoning_effort=medium`) in their persisted
+    config and keep that exact behavior on resume; they pick up the new
+    inherit semantics the next time you change the model or a sampling
+    knob in that workstream. New workstreams inherit from the start.
 
 ### Removed
 
-- **Retired OpenAI capability rows.** Built-in rows for the o1/o3/o4 families
-  and GPT-5 through GPT-5.3 have been removed; the built-in floor is GPT-5.4.
-  Unlisted gateway models still use generic commercial defaults and can declare
-  an explicit capabilities JSON.
+- **O-series and pre-5.4 GPT-5 rows dropped from the OpenAI capability
+  table.** `o1`, `o1-mini`, `o3`, `o3-mini`, `o3-pro`, `o4-mini`,
+  `gpt-5`, `gpt-5-mini`, `gpt-5-nano`, `gpt-5-pro`, `gpt-5.1`,
+  `gpt-5.1-codex-max`, `gpt-5.2`, `gpt-5.2-pro`, and `gpt-5.3` no longer
+  have built-in capability rows — OpenAI has retired these model ids
+  from the API, so the rows described contracts no request can reach
+  anymore. The table floor is now `gpt-5.4`; the search-api and
+  audio/STT/TTS rows are unchanged. An alias still pinning a retired id
+  fails at OpenAI itself; any other unlisted commercial id resolves to
+  the generic commercial defaults (temperature sent, no declared
+  reasoning-effort vocabulary, 200K window) — declare the contract on
+  the model definition's capabilities JSON if you run one, or move to a
+  current model.
 
 ### Fixed
 
-- **Lossless SSE and history recovery.** Truncated replay now disconnects,
-  rebuilds history, adopts the returned cursor, and reconnects without dropping
-  an in-flight turn. Tool-output chunks are coalesced, restart-era global
-  cursors carry a boot epoch, concurrent `/history` reconstructions coalesce,
-  and both interactive and coordinator panes preserve their transcript across
-  failed refreshes, stale rewind windows, hidden-tab reconnects, and teardown.
-- **Durable history handoff and deletion safety (#981).** Conversation writes
-  carry idempotency keys, retry ambiguous acknowledgements without duplicates,
-  and refuse to cross a deleted-workstream boundary. History fails closed with
-  503 rather than painting an empty transcript when persistence is unresolved;
-  queued interjections remain partitioned by owner, and operator persistence
-  state no longer reports a tombstoned session as healthy.
-- **Provider failures are classified before they corrupt a turn.** Mid-body
-  transport deaths retry without double-rendering; HTTP-200 JSON error payloads
-  from OpenAI-compatible endpoints surface their real rate-limit/server
-  classification with bounded, cancellable, redacted reads (#995); Responses
-  truncations and refusals preserve usage and content; and a call cancelled
-  before dispatch no longer mints credentials or sends a request.
-- **Reasoning stays in the reasoning lane (#940, #965).** Inline
-  `<think>`/`<reasoning>` blocks are split once at the shared seam, split tags
-  reassemble across deltas, the active fallback model controls scanning, and
-  unmarked chain-of-thought is suppressed for titles, summaries, and web
-  extraction. Multi-block notification text is separated instead of fused.
-- **MCP catalogs remain live and honest.** Static `list_changed` notifications
-  no longer deadlock their own receive loop; pooled catalogs survive session
-  eviction; refreshes are serialized, bounded, retried, and reported accurately;
-  and either half of resource discovery may be unsupported without discarding
-  the other (#839, #993). Tool search now reports unavailable servers and the
-  full pre-limit match count rather than pretending a discovery failure was a
-  genuine no-match (#938).
-- **Workstream state cannot wedge behind lifecycle edges.** A failed worker
-  thread start releases its slot, first-message failures remain in the error
-  state, zero-budget truncation keeps tool results valid, force-cancel runs
-  abandonment before publishing idle, operator skill changes are recorded, and
-  soft close wakes pending web and background-CLI approvals before waiting for
-  cleanup (#1013).
-- **Frontend assets stay fresh across same-version deployments (#1014).**
-  First-party assets use content-derived ETags and revalidation, versioned
-  vendor files remain immutable, coordinator and proxied node responses preserve
-  cache policy, and encoded traversal paths are rejected. Composer project,
-  persona, model, and skill selectors paint immediately from their warm caches;
-  proxied node views also restore their back-to-console link.
-- **Memory authorization and storage parity.** Project-scoped memory operations
-  bind to the immutable acting principal, omitted-scope get/delete follows the
-  workstream's attached project, writes are atomic, and new memories require a
-  useful description. Fresh databases now create the same structured-memory
-  indexes as migrated databases (#1028).
-- **Helm and Docker deployment paths work as documented.** The chart can install
-  with bundled or external PostgreSQL, renders each credential independently,
-  gives every server replica a routable per-pod address, and exposes scheduling
-  controls. Docker Compose health checks work under WSL.
+- **A cancelled judge, guard, or compaction call can now stop before its
+  request goes out (#972).** Previously it could not: `model_turn` refused
+  to *re-issue* an abandoned call after a mid-stream death, but nothing
+  checked before a first dispatch, so a call whose caller had already gone
+  away still sent — and the reply was discarded unread after the endpoint
+  had accepted the work. It now checks immediately before sending, so a
+  Stop observed by that point costs no request, and again on entry, so a
+  call already cancelled when it arrives also skips credential resolution.
+  Cancellation is cooperative, which bounds what that buys: a Stop only
+  saves the request if it lands before dispatch — sending is a moment, the
+  response streaming back is the rest of the call, and an abort arriving
+  then still meets a request in flight, closed in place exactly as before.
+  The window that did widen usefully is a delegated-auth alias whose token
+  mint blocks; a Stop during that mint now costs no request (though a mint
+  already under way still completes). What a stopped call saves is the
+  request, its prompt-side billing, and — on a capacity-bounded
+  self-hosted endpoint — a slot a live request wanted. Unchanged: the
+  interactive turn, which has its own pre-send cancellation check on a
+  different path, and the lanes that thread no cancellation handle
+  (attachment perception, title generation, web-fetch extraction,
+  sub-agents, optimizer, eval) — and web-fetch extraction deliberately
+  never will, since it runs on parallel tool threads where registering one
+  would clobber the main stream's.
+- **Unmarked chain-of-thought no longer leaks into titles, summaries, or
+  web-fetch tool results (#940).** Some serving setups emit reasoning
+  inline with no tags and no `reasoning_content` at all — nothing any
+  parser can segregate. The bounded-artifact lanes (title, compaction,
+  web-fetch extraction) now ask the model for no reasoning instead:
+  the model definition's declared thinking toggle is pinned off for that
+  call — the same suppression transcription already used — and the
+  reasoning-effort channels (the relayed session knob, the definition's
+  default, the graded template key) are withheld with it, since an
+  effort value beside a pinned-off toggle re-requests the reasoning the
+  pin declined. A no-op on backends that segregate reasoning
+  server-side. Title generation additionally stopped trusting line
+  position: it takes the last line that reads as a title (within the
+  word cap and ending in a word character, so explanation sentences,
+  sign-offs, and reasoning headings lose in any script) rather than the
+  first non-empty line, which unmarked reasoning turned into titles
+  like "Thinking Process:".
+- **A think tag split across a reasoning delta now reassembles.** The
+  non-streaming drain closes content runs at interleaving signals; a
+  partial-tag tail is carried across reasoning-delta boundaries (a
+  reasoning delta cannot terminate a tag) so the tag is consumed instead
+  of its halves passing through as visible content. Tool-call boundaries
+  still flush — no tag spans a tool call.
+- **Streaming consumers follow the ACTIVE model's capabilities.** The
+  interactive tag-scan posture and the drain's scan gate now read the
+  capabilities of the lane that owns the stream being consumed (fallback
+  walks included) instead of the session's primary alias.
+- **Notification bodies no longer fuse multi-block answers.** `Turn.text`
+  joins text blocks with a newline; a final assistant turn stored as
+  multiple text blocks previously concatenated the last word of one
+  block to the first word of the next in completion notifications and
+  every other flattened read.
+- **String-typed boolean capability overrides coerce instead of
+  truthiness-flipping.** A hand-edited `"false"`/`"0"` in a model
+  definition's capabilities JSON now means false; unrecognized values
+  drop the key and keep the field's default.
+- **Inline `<think>`/`<reasoning>` blocks no longer leak into drained
+  results (#965, #940).** On servers without a reasoning parser
+  (parserless vLLM/llama.cpp, LM Studio, bare gateways), reasoning
+  arrives as literal tags inside content; segregation now happens once
+  at the drain seam, so web-fetch tool results, sub-agent syntheses,
+  judge verdicts, titles, summaries, and optimizer prompts receive
+  tag-free content and the extracted reasoning rides the native lane.
+  Two behavior notes: a web-fetch extraction whose whole response was
+  reasoning now returns an explicit `Error: extraction returned no
+  answer` tool result (previously the raw reasoning text persisted as a
+  successful result and was replayed every following turn), and a
+  mismatched-vocabulary close tag (`<think>…</reasoning>`) now closes
+  the block — matching the interactive lane's long-standing rule —
+  where the old per-lane strips treated it as unterminated.
 
-### Security
+- **A transport failure mid-generation no longer kills the interactive
+  turn (#937).** A wire death during body streaming (TLS record failure,
+  connection reset — `httpx.ReadError` and kin) surfaces after the
+  request has already returned its stream handle, so neither the SDK's
+  request retries nor the creation-time retry ladder ever saw it: the
+  turn died with a bare `ReadError: …`, the partial output was
+  discarded, and nothing was logged. The interactive loop now normalizes
+  mid-body transport deaths exactly like the single-shot lanes and
+  re-issues the turn (bounded, cancel-aware, exponential backoff),
+  finalizing the dead attempt across every UI surface first so retried
+  text never double-renders (web transcript, CLI markdown fences,
+  Slack/Discord streamed messages). Before re-creating the stream the
+  session re-resolves its registry binding, so a concurrent model-registry
+  reload that closed the old client cannot turn the retry into a
+  misleading closed-client error. On exhaustion the surfaced error names
+  the provider, endpoint, and model with a stream-death message instead
+  of a bare exception string, and every fatal turn now leaves a
+  `session.fatal.recorded` log line (INFO for a user Ctrl-C, ERROR
+  otherwise).
 
-- **Outbound URL guards classify the destination actually reached
-  (GHSA-wm4f-79pw-pfr9).** One shared policy now handles NAT64, 6to4, Teredo,
-  mapped IPv4, CGNAT, metadata endpoints, DNS failures, and every redirect hop.
-  Private-network opt-ins still permit home-lab addresses but never metadata,
-  link-local, multicast, unspecified, or reserved destinations.
-- **Untrusted channel fields cannot create mentions.** Discord mention
-  resolution is disabled for model-authored messages, and Slack fields are
-  escaped at their trust boundary.
-- **Dynamic model authentication is permission-gated and fail-closed.** Enabling
-  or changing an identity-bearing alias requires the dedicated admin authority,
-  validates its audience/scope posture, and never silently falls back between
-  delegated and app identities.
+- **A failed worker-thread spawn no longer wedges the workstream — at
+  either spawn site — and never masquerades as success.** If
+  `Thread.start()` itself raised (thread exhaustion, out-of-memory), the
+  dispatcher had already claimed the worker slot but the flag's only
+  clearer lived in the never-started thread — the workstream looked idle
+  forever while every subsequent message queued behind a worker that
+  didn't exist, until an operator force-cancel. The claim is now rolled
+  back under the lock and the error propagates, so the workstream is
+  dispatchable again as soon as resources recover. Affected every
+  dispatch path (sends, wakes, retries, deferred-send drain, init). The
+  same failure at the deferred-send drain's own spawn rolls back the
+  just-accepted entry and answers the retryable `queue_full` (previously
+  a 500 landed *after* the entry was registered — an invisible,
+  unretractable phantom that later dispatched as duplicate turns), and a
+  `/command` whose worker never spawned now answers **503**
+  `{"status": "error"}` instead of the generic 200 ok that told SDK
+  callers their `/clear` or `/resume` had applied.
 
-### Documentation and verification
+- **Manual `/compact` from the web UI: no phantom user turn, no frozen
+  server, cancellable.** A slash command typed into the web composer no
+  longer renders as a user chat bubble (it echoes as a distinct command
+  chip — commands aren't conversation turns and were never persisted as
+  such). `/compact` itself now dispatches onto the workstream's worker
+  slot instead of running inline on the server's event loop — previously a
+  long compaction froze every SSE stream on the node for its whole
+  duration, which is also why its own progress only ever arrived as one
+  burst after the fact. The manual path carries `send()`'s full generation
+  discipline (`compact_now()`): a force-abandoned compaction goes stale
+  instead of swapping history under a successor turn — and retires at its
+  next checkpoint instead of running out its remaining summary calls,
+  with its late lifecycle events fenced off (`compaction_id` on every
+  event, `superseded` on end events — both in the SDKs) so they can't
+  animate, tear down, re-title, or falsely narrate a successor's card or
+  activity pill; a cancel aimed at it is consumed on exit (previously it
+  bricked every `/compact` retry until the next message); a Stop click on
+  an idle session can't pre-abort the next compaction; a Stop that lands
+  in the completion tail — after the last cancel check, or during a retry
+  backoff (which now aborts immediately instead of sleeping it out) — is
+  honored rather than silently eaten; and Stop now aborts the in-flight
+  summary HTTP call itself (the compaction lane registers its stream in
+  the same abort seam the main loop uses), so cancelling a compaction is
+  immediate instead of waiting out a model call.
 
-- The API reference, SDK guides, architecture diagrams, MCP OBO guide, memory
-  guide, deployment docs, and TLS runbook were updated for the 1.8 contracts.
-- New opt-in harnesses exercise OBO minting, frontend asset revalidation, and
-  end-to-end SSE recovery. `scripts/recovery_e2e.py` covers interactive,
-  coordinator, restart, truncation, and teardown scenarios in a real browser.
-- Release development and GitHub's default pull-request base now use `dev`,
-  while `main` remains the current stable install source and prior `stable/X.Y`
-  fixes merge forward. CI, Renovate, the installer, the release helper, and
-  publication aliases enforce that topology.
-- The README now leads its harness explanation with an architecture diagram,
-  and the contributor roster includes the latest external contributors.
+- **Sends during a command window are deferred, ordered, bounded, and
+  honestly rendered — never silently truncated or lost.** Messages sent
+  while any slash command holds the worker slot are **deferred**: answered
+  `{"status": "queued", "msg_id"}` immediately and dispatched as ordinary
+  full-fidelity sends (attachments and sender identity included) when the
+  command finishes — never routed through the mid-turn interjection
+  queue, whose semantics are turn-shaped: previously a send during a
+  manual `/compact` was silently truncated to 2,000 characters, a second
+  participant in a shared workstream was locked out with a misleading
+  "another participant's turn" 409 for the whole compaction, and a
+  message queued across a `/resume`/`/new` could be answered into the
+  post-swap workstream. Because the response is immediate,
+  timeout-bounded callers — the coordinator's `send_message`, the console
+  proxy, SDKs, anything behind a stock reverse proxy — can no longer lose
+  a message to a multi-minute command window; the deferred send is
+  retractable until dispatch via the same `DELETE .../send` used for
+  queued interjections (node-local, in-memory — the API reference
+  documents the at-most-once durability contract). Deferred responses
+  carry `"deferred": true`; the pending list is the **order authority**
+  (a fresh send — or a coordinator dispatch, or a queued-nudge wake —
+  lines up behind acknowledged entries instead of overtaking them, with
+  the two-term barrier defined once on the workstream so the wake gate
+  also honors a claimed entry whose dispatch is mid-flight, and the gate
+  re-arms at the drain's exit even when everything pending was
+  retracted); acceptance is **bounded** (10 pending per workstream — the
+  interjection queue's own backpressure contract; the 11th answers the
+  retryable `queue_full` instead of pinning attachment bytes without
+  limit and then running one unattended turn per entry); a dispatch
+  crash re-queues the entry instead of eating an acknowledged message,
+  and a drain thread that fails to *start* rolls the acceptance back and
+  answers `queue_full` rather than parking a phantom the client can
+  neither see nor retract; each dispatch emits a pane-tier
+  `message_dispatched` event (`folded: true` for interjection fold-ins)
+  so queued-bubble UI keeps its retract affordance exactly until the
+  message truly leaves — including when the send was accepted by a pane
+  that believed the workstream idle, which now renders a real queued
+  chip instead of a sent-looking bubble, releases the composer (a
+  deferred send has no running worker to wait on), and cleans up fully
+  when the send is refused or the chip retracted instead of stranding
+  the pane in Stop mode. Dismissing a queued bubble — interjection or
+  deferred — is a server-confirmed `DELETE`, and retracting a deferred
+  send that carried attachments tells the user they were discarded
+  instead of silently expiring them.
 
-## [1.7.4]
+- **Slash commands hold the worker slot with a loud contract.**
+  A `/compact` raced against an in-flight turn is refused with an
+  explicit busy response. Every other slash command runs through the same
+  worker slot too — mutual exclusion against sends, a running compaction,
+  and each other, with a busy answer replacing the old silent interleave —
+  while the endpoint still awaits quick commands' completion off-loop
+  (without parking an executor thread per request); the post-command pane
+  refreshes (`clear_ui` after `/clear`/`/new`/`/resume`, the
+  workstream-name sync) ride the worker itself, so a command that
+  outlives the endpoint's 25s response backstop still refreshes every
+  pane on completion (the backstop sits under the console proxy's 30s
+  client timeout so the degraded `running` answer can actually traverse
+  a proxied pane, which now surfaces it instead of silence; the
+  `/command` response contract — `ok` / `running`, with busy refusals
+  answering a loud HTTP 409 rather than a silent 200 — is now documented
+  in the API reference and the OpenAPI spec).
 
-A feature-bearing patch for the 1.7 line, rolling up work that had stabilised
-on `main`. No schema migrations (head stays 066) and no new configuration knobs.
+- **Compaction status stays truthful across every UI surface.** Manual
+  compaction
+  success also refreshes the status line/context pill immediately (parity
+  with auto-compaction), compaction failures keep feeding the typed
+  `error` event and the node error counter (while a CLI Ctrl-C reports as
+  cancelled, not a failure), one Stop prints one notice (a cancelled
+  auto-compaction no longer stacks "Compaction cancelled." on top of
+  send's own "[Generation cancelled]"), the workstream activity pill
+  shows "Compacting context…" for the whole summarize phase, restores
+  cleanly afterwards, and can no longer be stranded by a force-stopped
+  compaction (a new turn's generation claim breaks a stale latch). Every
+  retry backoff on the session (stream retries, task agents, notify
+  delivery, compaction) now aborts immediately on Stop via one shared
+  cancel-aware helper instead of sleeping out its exponential delay.
 
-### Added
+- **Compaction failures report exactly once, to the right owner.** A
+  compaction failure reports
+  exactly once (auto-compaction errors defer to the turn's fatal handler
+  instead of doubling the red row and the error metric), failed-end
+  notice suppression is computed once by the emitter (a `notice` bool on
+  the end event — in the SDKs — replaces hand-synced client policy), and
+  a manual `/compact` failure no longer crashes the CLI REPL. `/compact`
+  on a workstream showing the `error` badge restores the badge on exit
+  instead of stamping `idle` over it (the compaction neither retried nor
+  resolved the failed turn). A force-cancelled initial send that
+  completes late still delivers its scheduled-run completion
+  notification (the only completion signal unattended workstreams have);
+  the other post-command pane refreshes and error notices remain
+  owner-guarded, so a force-cancelled wedged command that unwedges late
+  can't wipe panes or inject stray notices into a successor turn.
 
-- **Background shells for the `bash` tool** — `run_in_background=true` starts a
-  command as a detached shell and returns a `bash_N` handle; new `bash_output`
-  (delta output since last read, optional regex filter, status/exit code) and
-  `kill_shell` (terminates the shell's process group) tools manage it. Output is
-  buffered with a drop-oldest cap, a system notice lands when a shell exits, and
-  shells die with their workstream — never outliving a `task_agent` that started
-  them.
-- **`task_agent` carries the model's native reasoning across its own tool loop** —
-  a task agent's replayed turns now preserve the provider-native reasoning lane
-  (Anthropic thinking blocks with signatures, OpenAI reasoning items, Gemini
-  `thought_signature`, vLLM/llama.cpp reasoning text) instead of rebuilding each
-  turn from text alone, restoring reasoning continuity for thinking models.
-- **Model-shelf response controls** — the console model shelf exposes verbosity
-  and reasoning-mode controls per identity.
+- **Pre-1.8 embedder UIs keep their compaction lines.** Embedders
+  driving `ChatSession` with a pre-1.8 duck-typed `SessionUI`
+  (no `on_compaction` hook) get the classic `on_info` compaction lines
+  back — threshold notice, `part k/N`, retry waits, token delta +
+  summary box — instead of silent history swaps. (See the breaking
+  event-contract note under **Changed** for SSE/SDK clients.)
 
-### Changed
+- **Static MCP servers: a pushed catalog change no longer wedges the shared
+  session (#839).** The static-path `*/list_changed` handler awaited its
+  catalog refresh inline in the SDK's receive loop, but the refresh's own
+  request can only be answered by that (now parked) loop — the refresh never
+  completed, and every user's in-flight calls on the shared per-node session
+  stalled behind it, unbounded, until the health loop's ping timeout tore the
+  transport down (which was also the only way the changed catalog ever
+  landed). Push refreshes now run as spawned tasks — debounced, coalesced per
+  (server, kind), bounded by the connect timeout, and serialized on the
+  per-server connect lock — and the manual and post-reconnect refreshes
+  publish under that same lock, so a slower publisher can no longer land a
+  staler catalog over a fresher one. Every teardown path now also clears the
+  notification debounce stamp, so a reconnected server's first push refreshes
+  immediately. Push-refresh debouncing is now per (server, kind) on BOTH the
+  static and per-user pool paths — a tools push no longer swallows a prompts
+  push arriving in the same 5-second window. A change genuinely lost to the
+  debounce window (a same-kind push landing after the prior refresh finished,
+  which the server will never re-announce) is recovered by an automatic
+  health-tick retry rather than staying invisible until an unrelated push or
+  a reconnect. The resource-refresh fan-out on both paths no longer orphans
+  its sibling list call when one of the pair fails fast — the real error
+  surfaces immediately (not masked as a 30-second timeout) and the surviving
+  sibling is cancelled and reaped, under a bounded grace, inside the scope. A
+  push refresh that fails while the connection stays up is likewise retried on
+  the next health-loop tick until one completes — previously a single
+  transient blip left the shared catalog stale for every user on the node
+  until an operator intervened. An operator `/mcp refresh` no longer parks
+  behind a busy per-server connect lock (a slow reconnect attempt could eat
+  the whole 30-second refresh budget and fail the pass for every healthy
+  server behind it) — the busy server is skipped on both the connected and
+  disconnected branches, reported distinctly as "skipped" rather than as a
+  false "no changes", the skip arms the automatic retry, and a
+  force-reconnect drops the session up front so queued push refreshes can't
+  starve it. Static-path resource and prompt catalogs are now size-capped
+  like the pool path's (and like static tools) at discovery and on every
+  refresh, so a misbehaving server's push can't balloon the node's merged
+  catalogs. Deleting or reconfiguring a server can no longer leave it
+  half-removed: the config removal and all cleanup are serialized under the
+  connect lock (a cancelled removal completes its cleanup rather than
+  stranding a live session and published catalog with the config already
+  gone), and `reconcile_sync` retries a removal that timed out instead of
+  marking it done — previously a DB-driven delete of a busy server could be a
+  silent, permanent no-op until process restart. A refresh outcome now
+  threads consistently to every operator surface off one source of truth
+  (the per-server `last_refresh_outcome`): a busy-skip and a genuine failure
+  are each reported distinctly from a real "no changes" — `/mcp refresh`
+  prints "skipped" or "failed" rather than a false "no changes", and the
+  node-internal refresh endpoint returns `202 skipped` instead of a
+  misleading `200 ok` for a refresh that never ran. A single-kind push
+  refresh no longer paints the whole server healthy: because the
+  error/outcome state is server-scoped, a successful tools push while the
+  prompts catalog is still broken (or vice versa) no longer clears the
+  failure — only a full refresh pass declares "ok".
 
-- **GPT-5.6 aligned with the GA API surface** — the Responses provider matches
-  GPT-5.6's GA shape (typed `reasoning.mode`, `prompt_cache_options`,
-  cache-write accounting); the `openai` floor moves to `>=2.45`.
+- **OpenAI Responses streaming: truncated and refused responses no longer
+  vanish.** A response that hit `max_output_tokens` terminates the stream
+  with `response.incomplete`, which the stream consumer did not handle —
+  the turn was mislabeled `finish_reason: stop` and its final usage and
+  collected output items were dropped. Refusal parts had no streaming
+  handler at all, so a refusal rendered as empty content instead of the
+  `[Refused: …]` text the non-streaming path produced. Both now match:
+  truncation maps to `length` with usage/items intact, refusals render
+  in content. Applies to the chat loop and every drained single-shot
+  lane (#831).
 
-### Fixed
+- **task_agent: sub-tool ids no longer alias across a local model's reused
+  ids.** A local model that reissues per-response sequential tool-call ids
+  (`call_0` every turn) made two of a task agent's steps share one id — the
+  live card collapsed both onto one DOM row while `/history` recall kept them
+  apart, so the two views disagreed. Sub-tool ids are now minted
+  `{parent}::r{run}s{step}::{id}`, unique within the session (across an
+  agent's turns and across concurrent or sequential runs), and that one id
+  keys the nesting registry, the live rows, recall, and the cancel ledger.
+  On the wire the agent's self-built history carries the provider's own ids,
+  restored from the mint map (see the reasoning-lane entry under Added), and
+  malformed tool-call arguments are legalized the same way the main loop's
+  wire prep does.
 
-- **`bash` never hangs on a backgrounded child** — a command that left a
-  long-lived process running no longer wedges the workstream; the tool waits on
-  the tracked process (bounded by the timeout) and reaps its whole process group.
-- **`task_agent` sub-tool ids are session-unique** — ids are minted
-  `{parent}::r{run}s{step}::{id}` so a local model reissuing sequential ids
-  (`call_0` each turn) no longer aliases two steps onto one live-card row while
-  `/history` keeps them apart.
-- **Judge completions honour model-definition capabilities** — a judge's
-  completion now threads its model's declared capabilities instead of assuming a
-  default surface.
-- **`create-admin` CLI** — adds an explicit admin-creation command; `run.sh` no
-  longer onboards into a role-less user.
-- **Install script Docker handling** — installs Docker on distros
-  `get.docker.com` rejects, and gates that path by `$ID` instead of trapping all
-  failures.
+- **bash tool: never hang on a backgrounded child.** A command that left a
+  long-lived process running (`server &`, a daemon) could wedge the whole
+  workstream forever — the tool read stdout/stderr to EOF, which never arrived
+  because the child inherited the pipe, and the timeout watchdog bailed once the
+  foreground `bash` had exited. The tool now waits on the tracked process
+  (bounded by the tool timeout) and terminates its whole process group on
+  return, so the call always completes. Undecodable output is preserved
+  (`errors="replace"`) instead of being dropped as a spurious error.
+  - **Behavior change:** a process the command backgrounds no longer survives
+    the call — nothing persists across bash invocations. (First-class
+    "run this in the background" support landed separately — see
+    `run_in_background` under Added.)
 
 ## [1.7.3]
 

@@ -29,7 +29,6 @@ from turnstone.core.session import (
     _is_ctx_overflow,
     _SummaryResult,
 )
-from turnstone.core.storage import get_storage
 from turnstone.core.trajectory import dicts_from_turns, turns_from_dicts
 
 
@@ -42,19 +41,12 @@ def session(tmp_db, mock_openai_client):
     factory so the session shape stays in lockstep with the sibling
     truncation/compaction suites that read the same fullness measure.
     """
-    s = make_session(
+    return make_session(
         client=mock_openai_client,
         context_window=10_000,
         max_tokens=1_000,
         tool_timeout=10,
     )
-    get_storage().register_workstream(
-        s.ws_id,
-        user_id=s._user_id,
-        kind=s._kind,
-        parent_ws_id=s._parent_ws_id,
-    )
-    return s
 
 
 # ---------------------------------------------------------------------------
@@ -666,13 +658,7 @@ class TestCompactBeforeTruncate:
 
         def compact_then_terminal(*_args, **_kwargs):
             if terminal == "successor":
-                abandoned, persistence_error = session.force_abandon_generation(
-                    target_is_current=lambda: True,
-                    clear_target=lambda: True,
-                    publish_abandoned=lambda: None,
-                )
-                assert abandoned is True
-                assert persistence_error is None
+                session._claim_generation()
             else:
                 session.close()
             return True
@@ -708,16 +694,7 @@ class TestCompactBeforeTruncate:
         assert status.call_count == 1
         truncate.assert_not_called()
         midturn.assert_not_called()
-        tool_saves = [call for call in save.call_args_list if call.args[1] == "tool"]
-        if terminal == "successor":
-            # A force successor may retire an accepted assistant tool block
-            # only after synthesizing its matching TOOL receipt.  The old raw
-            # generation claim represented a structurally invalid state that
-            # production now correctly refuses.
-            assert len(tool_saves) == 1
-            assert "Force-cancelled" in tool_saves[0].args[2]
-        else:
-            assert not tool_saves
+        assert not [call for call in save.call_args_list if call.args[1] == "tool"]
 
 
 # ---------------------------------------------------------------------------
@@ -2232,7 +2209,7 @@ class TestCompactionLifecycleEvents:
         with (
             patch.object(session, "_utility_completion", return_value=summary),
             patch.object(session.ui, "on_compaction", return_value=99) as oc,
-            patch.object(get_storage(), "get_compaction_watermark", return_value=17),
+            patch("turnstone.core.session.get_compaction_watermark", return_value=17),
             patch("turnstone.core.session.save_message", side_effect=fake_save),
         ):
             assert session._compact_messages() is True
@@ -2278,7 +2255,7 @@ class TestCompactionLifecycleEvents:
         with (
             patch.object(session, "_summary_input_budget_chars", return_value=450),
             patch.object(session, "_summarize_once", side_effect=fake_once),
-            patch.object(get_storage(), "get_compaction_watermark", return_value=17),
+            patch("turnstone.core.session.get_compaction_watermark", return_value=17),
             patch("turnstone.core.session.save_message", side_effect=fake_save),
         ):
             assert session._compact_messages(auto=False) is True

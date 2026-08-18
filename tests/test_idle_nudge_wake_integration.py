@@ -30,6 +30,7 @@ import pytest
 
 from tests._helpers import wait_until as _wait_until
 from tests._session_helpers import make_result
+from tests.test_session_manager import FakeStorage
 from turnstone.core import session_worker
 from turnstone.core.idle_nudge_watcher import IdleNudgeWatcher, wake_workstream_if_pending
 from turnstone.core.metacognition import (
@@ -42,8 +43,9 @@ from turnstone.core.trajectory import dicts_from_turns, turn_from_dict
 from turnstone.core.workstream import Workstream, WorkstreamKind, WorkstreamState
 
 # ---------------------------------------------------------------------------
-# Minimal fake adapter / UI for this integration test. The session and
-# manager share the disposable backend supplied by the storage fixture.
+# Minimal fake adapter / UI for this integration test.  Storage reuses
+# the canonical FakeStorage from test_session_manager.py to avoid the
+# drift risk of a parallel fake.
 # ---------------------------------------------------------------------------
 
 
@@ -114,8 +116,7 @@ class _BuildRealSessionAdapter:
     that production ``WebUI`` / coord adapters expose.
     """
 
-    def __init__(self, storage: Any, kind: WorkstreamKind = WorkstreamKind.INTERACTIVE) -> None:
-        self.storage = storage
+    def __init__(self, kind: WorkstreamKind = WorkstreamKind.INTERACTIVE) -> None:
         self.kind = kind
         self.events: list[str] = []
         self.cleaned_up: list[str] = []
@@ -164,11 +165,6 @@ class _BuildRealSessionAdapter:
             temperature=0.5,
             max_tokens=4096,
             tool_timeout=30,
-            ws_id=ws.id,
-            user_id=ws.user_id,
-            kind=self.kind,
-            parent_ws_id=ws.parent_ws_id,
-            project_id=ws.project_id,
         )
 
 
@@ -178,17 +174,15 @@ class _BuildRealSessionAdapter:
 
 
 @pytest.fixture
-def real_mgr(tmp_db: str) -> tuple[SessionManager, _BuildRealSessionAdapter]:
+def real_mgr() -> tuple[SessionManager, _BuildRealSessionAdapter]:
     """Real SessionManager wired to an adapter that builds real ChatSessions.
 
     No StateWriter is wired so ``set_state`` writes directly to storage
     on the calling thread (we want subscriber dispatch to fire in the
     same thread the test invokes ``set_state`` on).
     """
-    from turnstone.core.storage import get_storage
-
-    storage = get_storage()
-    adapter = _BuildRealSessionAdapter(storage)
+    adapter = _BuildRealSessionAdapter()
+    storage = FakeStorage()
     mgr = SessionManager(
         adapter,
         storage=storage,
@@ -245,6 +239,7 @@ def test_idle_event_through_real_session_manager_drives_wake_send(real_mgr, tmp_
             patch.object(ws.session, "_update_token_table"),
             patch.object(ws.session, "_print_status_line"),
             patch.object(ws.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
         ):
             # Suppress the auto-title side-thread; orthogonal to wake.
             ws.session._title_generated = True
@@ -346,6 +341,7 @@ def test_watch_fire_on_already_idle_session_drives_wake_send(real_mgr, tmp_db):
         patch.object(ws.session, "_update_token_table"),
         patch.object(ws.session, "_print_status_line"),
         patch.object(ws.session, "_visible_memory_count", return_value=0),
+        patch("turnstone.core.session.save_message"),
     ):
         ws.session._title_generated = True
         # Idle all along — no worker, and no state transition coming.
@@ -372,16 +368,14 @@ def test_watch_fire_on_already_idle_session_drives_wake_send(real_mgr, tmp_db):
 
 
 @pytest.fixture
-def coord_mgr(tmp_db: str) -> tuple[SessionManager, _BuildRealSessionAdapter, Any]:
+def coord_mgr() -> tuple[SessionManager, _BuildRealSessionAdapter, FakeStorage]:
     """Real coord-side SessionManager with the adapter's kind set to
     COORDINATOR.  Same shape as ``real_mgr`` but for the coord half of
     the lifespan.  No StateWriter wired so subscriber dispatch fires
     synchronously on the test thread.
     """
-    from turnstone.core.storage import get_storage
-
-    storage = get_storage()
-    adapter = _BuildRealSessionAdapter(storage, kind=WorkstreamKind.COORDINATOR)
+    adapter = _BuildRealSessionAdapter(kind=WorkstreamKind.COORDINATOR)
+    storage = FakeStorage()
     mgr = SessionManager(
         adapter,
         storage=storage,
@@ -454,6 +448,7 @@ def test_coord_idle_with_active_children_emits_envelope_via_real_managers(coord_
             patch.object(coord.session, "_update_token_table"),
             patch.object(coord.session, "_print_status_line"),
             patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
         ):
             coord.session._title_generated = True
             mgr.set_state(coord.id, WorkstreamState.IDLE)
@@ -542,6 +537,7 @@ def test_coord_idle_with_children_and_open_tasks_delivers_both(coord_mgr, tmp_db
             patch.object(coord.session, "_update_token_table"),
             patch.object(coord.session, "_print_status_line"),
             patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
         ):
             coord.session._title_generated = True
             mgr.set_state(coord.id, WorkstreamState.IDLE)
@@ -643,6 +639,7 @@ def test_coord_idle_with_open_tasks_and_no_children_omits_children_content(coord
             patch.object(coord.session, "_update_token_table"),
             patch.object(coord.session, "_print_status_line"),
             patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
         ):
             coord.session._title_generated = True
             mgr.set_state(coord.id, WorkstreamState.IDLE)
@@ -749,6 +746,7 @@ def test_stop_latch_survives_the_liveness_wake(coord_mgr, tmp_db):
             patch.object(coord.session, "_update_token_table"),
             patch.object(coord.session, "_print_status_line"),
             patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
         ):
             coord.session._title_generated = True
 
@@ -848,6 +846,7 @@ def test_coord_idle_emitted_from_worker_thread_still_wakes(coord_mgr, tmp_db):
             patch.object(coord.session, "_update_token_table"),
             patch.object(coord.session, "_print_status_line"),
             patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
         ):
             coord.session._title_generated = True
 
@@ -924,6 +923,7 @@ def _patch_llm_surface(session: Any) -> tuple[Any, ...]:
         patch.object(session, "_update_token_table"),
         patch.object(session, "_print_status_line"),
         patch.object(session, "_visible_memory_count", return_value=0),
+        patch("turnstone.core.session.save_message"),
     )
 
 
@@ -940,7 +940,7 @@ def test_wake_channel_survives_real_seam_drains_and_delivers_via_wake(tmp_db):
     session._nudge_queue.enqueue("idle_children", "kids waiting", "wake")
 
     p = _patch_llm_surface(session)
-    with p[0], p[1], p[2], p[3]:
+    with p[0], p[1], p[2], p[3], p[4]:
         # Real user-seam drain: appends any drained entry as a system
         # turn — a wake-channel entry must neither drain nor render.
         session._emit_pending_user_nudges()
@@ -1026,7 +1026,7 @@ def test_quiet_ride_along_still_delivers_when_wake_proceeds(tmp_db):
     session._nudge_queue.enqueue("idle_children", "kids waiting", "wake")
 
     p = _patch_llm_surface(session)
-    with p[0], p[1], p[2], p[3]:
+    with p[0], p[1], p[2], p[3], p[4]:
         session.deliver_wake_nudge_from_queue()
 
     msgs = dicts_from_turns(session.messages)
@@ -1062,7 +1062,7 @@ def test_interjection_handoff_delivers_externals_and_drops_only_idle_nudges(tmp_
     session.queue_message("pivot: focus on the flaky login test")
 
     p = _patch_llm_surface(session)
-    with p[0], p[1], p[2], p[3]:
+    with p[0], p[1], p[2], p[3], p[4]:
         session.deliver_wake_nudge_from_queue()
 
     msgs = dicts_from_turns(session.messages)
@@ -1140,6 +1140,7 @@ def test_queued_interjection_owns_the_idle_seam(coord_mgr, tmp_db):
             patch.object(coord.session, "_update_token_table"),
             patch.object(coord.session, "_print_status_line"),
             patch.object(coord.session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
         ):
             coord.session._title_generated = True
 
@@ -1224,30 +1225,6 @@ def test_interjection_handoff_dispatches_exactly_one_real_send(tmp_db):
     assert session._wake_source_tag == ""
 
 
-def test_interjection_handoff_forwards_nonempty_client_send_ids(tmp_db):
-    """Correlated queued rows retain every browser token in queue order."""
-    from tests._helpers import make_chat_session
-
-    session = make_chat_session()
-    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
-    session.queue_message("first", client_send_id="browser-first")
-    session.queue_message("second", client_send_id="browser-second")
-    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
-
-    def _recording_send(*args: Any, **kwargs: Any) -> None:
-        calls.append((args, kwargs))
-
-    session.send = _recording_send  # type: ignore[method-assign]
-    session.deliver_wake_nudge_from_queue()
-
-    assert calls == [
-        (
-            ("first\n\nsecond",),
-            {"client_send_ids": ("browser-first", "browser-second")},
-        )
-    ]
-
-
 def test_interjection_handoff_contains_generation_cancelled(tmp_db):
     """A Stop landing inside the handed-off interjection send must not
     escape the wake worker: ``GenerationCancelled`` is a BaseException
@@ -1293,7 +1270,7 @@ def test_interjection_handoff_restores_the_queue_when_send_raises(tmp_db):
 
     # Restored verbatim: same id, same cleaned text, same priority.
     assert msg_id in session._queued_messages
-    text, priority = session._queued_messages[msg_id][:2]
+    text, priority = session._queued_messages[msg_id]
     assert text == "do not lose this"
     assert priority == "important"
 
@@ -1371,33 +1348,6 @@ def test_interjection_handoff_skips_the_pop_when_budget_exhausted(tmp_db):
     assert msg_id in session._queued_messages
     assert all(args != ("held message",) for args, _k in sends)
     assert any(a == ("",) for a, _k in sends)
-
-
-def test_interjection_handoff_skips_the_pop_on_a_gone_workstream(tmp_db):
-    """The delivery-site gate must be at least as strong as the claim gate:
-    a nudge-driven wake reaches this method without ever consulting
-    ``claim_pending_interjection_wake``, and under the gone latch send's
-    admission refusal is converged INTERNALLY (no re-raise), so a pop here
-    would destroy the user's words with no restore arm running.  No pop,
-    rows retained — their disposition on a deleted workstream is #1001's."""
-    from tests._helpers import make_chat_session
-
-    session = make_chat_session()
-    session._nudge_queue.enqueue("idle_tasks", "open tasks remain", "wake")
-    _c, _p, msg_id = session.queue_message("held message")
-    session._workstream_gone_ws = session._ws_id
-
-    sends: list[tuple[Any, ...]] = []
-
-    def _recording_send(*a: Any, **k: Any) -> None:
-        sends.append((a, k))
-
-    session.send = _recording_send  # type: ignore[method-assign]
-    session.deliver_wake_nudge_from_queue()
-
-    assert msg_id in session._queued_messages
-    assert session._popped_in_flight == set()
-    assert all(args != ("held message",) for args, _k in sends)
 
 
 def test_interjection_handoff_falls_through_on_content_free_items(tmp_db):

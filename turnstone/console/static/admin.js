@@ -240,10 +240,7 @@ function switchAdminTab(tab) {
     _populateAuditUserFilter();
     loadGovAudit();
   }
-  if (tab === "memories") {
-    loadAdminMemories();
-    loadMemoryIndexHealth();
-  }
+  if (tab === "memories") loadAdminMemories();
   if (tab === "models") loadAdminModels();
   if (tab === "node-metadata") loadAdminNodeMetadata();
   if (tab === "settings") loadSettings();
@@ -3890,31 +3887,24 @@ function loadTlsCerts() {
 
         const colActions = document.createElement("span");
         colActions.className = "admin-col admin-col-actions";
-        const actions = [];
-        if (c.renewable) {
-          actions.push({
+        const kebab = _kebabMenuEl([
+          {
             label: "Renew",
             attrs: {
               "data-tls-renew": c.domain,
               "aria-label": "Renew certificate for " + c.domain,
             },
-          });
-        }
-        if (c.deletable) {
-          actions.push({
+          },
+          {
             label: "Delete",
             kind: "danger",
             attrs: {
               "data-tls-delete": c.domain,
               "aria-label": "Delete certificate for " + c.domain,
             },
-          });
-        }
-        if (actions.length > 0) {
-          colActions.appendChild(_kebabMenuEl(actions));
-        } else {
-          colActions.textContent = "Managed by node";
-        }
+          },
+        ]);
+        colActions.appendChild(kebab);
 
         row.appendChild(colDomain);
         row.appendChild(colSans);
@@ -6745,7 +6735,7 @@ const MODEL_ROLES = [
   {
     label: "Reranker",
     description:
-      "Reranks web_search results. Point at a model whose base_url is a Cohere/Jina-compatible /rerank endpoint and whose capabilities include supports_rerank. Empty disables reranking. Enabling a reranker sends web_search results and BM25 candidate metadata (tool/skill descriptions plus memory names/descriptions, never memory bodies) to this endpoint; self-hosted endpoints keep it on your infrastructure.",
+      "Reranks web_search results. Point at a model whose base_url is a Cohere/Jina-compatible /rerank endpoint and whose capabilities include supports_rerank. Empty disables reranking. Enabling a reranker sends web_search results AND BM25 retrieval candidates (tool/skill descriptions and memory content) to this endpoint; self-hosted endpoints keep it on your infrastructure.",
     aliasKey: "tools.reranker_alias",
     fallbackKind: "disabled",
     disabledLabel: "(disabled — reranking off)",

@@ -12,8 +12,7 @@ the lifted ``approve`` and ``close`` handlers from
 from __future__ import annotations
 
 import hashlib
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import cast
 from unittest.mock import MagicMock
 
 import httpx
@@ -74,9 +73,6 @@ from turnstone.core.session_routes import (
     make_set_title_handler,
 )
 from turnstone.core.workstream import WorkstreamKind
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -164,7 +160,6 @@ def _make_client(
     coord_mgr=None,
     alias="my-model",
     registry=None,
-    raise_server_exceptions: bool = True,
 ) -> TestClient:
     """Build a TestClient exposing just the coordinator routes."""
     coord_attachments = make_attachment_handlers(_coord_endpoint_config)
@@ -297,7 +292,7 @@ def _make_client(
     app.state.coord_registry_error = "" if coord_mgr else "registry missing"
     app.state.auth_storage = storage
     app.state.jwt_secret = "x" * 64
-    return TestClient(app, raise_server_exceptions=raise_server_exceptions)
+    return TestClient(app)
 
 
 # ---------------------------------------------------------------------------
@@ -540,7 +535,6 @@ def test_active_list_row_shape_includes_unified_fields(storage):
         "user_id",
         "project_id",
         "persona",
-        "persistence_state",
     }
     assert row["name"] == "lifted-coord"
     assert row["kind"] == "coordinator"
@@ -573,29 +567,6 @@ def test_create_returns_ws_id_and_records_audit(storage):
     events = storage.list_audit_events(user_id="user-1", limit=10)
     actions = [e["action"] for e in events]
     assert "coordinator.create" in actions
-
-
-def test_create_unreadable_project_refuses_without_partial_create(storage):
-    storage.create_project(
-        "public-without-read",
-        "Public Without Read",
-        "project-owner",
-        visibility="public",
-    )
-    mgr = _build_mgr(storage)
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-
-    resp = client.post(
-        "/v1/api/workstreams/new",
-        json={"name": "must-not-exist", "project_id": "public-without-read"},
-        headers=_COORD_HEADERS,
-    )
-
-    assert resp.status_code == 403
-    assert resp.json() == {"error": "project is not available for workstream attachment"}
-    assert mgr.list_all() == []
-    assert storage.list_workstreams() == []
-    assert storage.list_audit_events(action="coordinator.create") == []
 
 
 def _capture_factory_pair():
@@ -1141,38 +1112,6 @@ def test_close_records_audit_and_removes_from_mgr(storage):
     assert "coordinator.close" in actions
 
 
-def test_close_returns_409_when_unresolved_persistence_refuses_unload(storage):
-    mgr = _build_mgr(storage)
-    ws = mgr.create(user_id="user-1")
-    ws.session.prepare_soft_close = MagicMock(return_value=False)
-    ws.session.has_unresolved_conversation_persistence = MagicMock(return_value=True)
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-
-    resp = client.post(f"/v1/api/workstreams/{ws.id}/close", headers=_COORD_HEADERS)
-
-    assert resp.status_code == 409
-    assert resp.json() == {"error": "workstream has unresolved persistence"}
-    assert mgr.get(ws.id) is ws
-
-
-def test_close_returns_503_when_structural_cleanup_refuses_unload(storage, caplog):
-    mgr = _build_mgr(storage)
-    ws = mgr.create(user_id="user-1")
-    ws.session.prepare_soft_close = MagicMock(return_value=False)
-    ws.session.has_tool_structural_debt = MagicMock(return_value=True)
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-
-    resp = client.post(f"/v1/api/workstreams/{ws.id}/close", headers=_COORD_HEADERS)
-
-    assert resp.status_code == 503
-    assert resp.json() == {"error": "workstream cleanup is still in progress; try again shortly"}
-    assert mgr.get(ws.id) is ws
-    assert any(
-        "session_mgr.close_refused" in record.message and "cleanup_pending" in record.message
-        for record in caplog.records
-    )
-
-
 def test_approve_resolves_ui_event(storage):
     mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
@@ -1188,42 +1127,7 @@ def test_approve_resolves_ui_event(storage):
     assert resp.json()["cycle_id"] == cycle.cycle_id
     assert cycle.event.is_set()
     assert cycle.result == (True, None)
-    assert ws.ui._always_approve_tools_by_principal["user-1"] == {"spawn_workstream"}
-
-
-def test_peer_approval_is_binary_only_and_keeps_execution_principal(storage):
-    mgr = _build_mgr(storage)
-    ws = mgr.create(user_id="user-1")
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-    peer_headers = {"X-Test-User": "user-2", "X-Test-Perms": "admin.coordinator"}
-
-    feedback_cycle = _seed_pending(ws, "c-feedback")
-    response = client.post(
-        f"/v1/api/workstreams/{ws.id}/approve",
-        json={"approved": False, "feedback": "change this", "call_id": "c-feedback"},
-        headers=peer_headers,
-    )
-    assert response.status_code == 409
-    assert not feedback_cycle.resolved
-
-    always_cycle = _seed_pending(ws, "c-always")
-    response = client.post(
-        f"/v1/api/workstreams/{ws.id}/approve",
-        json={"approved": True, "always": True, "call_id": "c-always"},
-        headers=peer_headers,
-    )
-    assert response.status_code == 409
-    assert not always_cycle.resolved
-
-    response = client.post(
-        f"/v1/api/workstreams/{ws.id}/approve",
-        json={"approved": True, "call_id": "c-feedback"},
-        headers=peer_headers,
-    )
-    assert response.status_code == 200
-    assert feedback_cycle.resolver_principal_id == "user-2"
-    assert feedback_cycle.execution_principal_id == "user-1"
-    assert feedback_cycle.result == (True, None)
+    assert "spawn_workstream" in ws.ui.auto_approve_tools
 
 
 def _seed_pending(ws, *call_ids: str, func_name: str = "spawn_workstream"):
@@ -1239,7 +1143,6 @@ def _seed_pending(ws, *call_ids: str, func_name: str = "spawn_workstream"):
             "func_name": func_name,
             "approval_label": func_name,
             "needs_approval": True,
-            "_principal_id": ws.user_id,
         }
         for cid in call_ids
     ]
@@ -1348,114 +1251,6 @@ def test_approve_call_id_matches_any_item_in_multi_envelope(storage):
     assert cycle.event.is_set()
 
 
-def test_approve_invokes_modern_handler_once_with_pinned_identity(storage):
-    mgr = _build_mgr(storage)
-    ws = mgr.create(user_id="user-1")
-    cycle = _seed_pending(ws, "c-modern")
-    real_find = ws.ui.find_approval_cycle
-    real_resolve = ws.ui.resolve_approval
-    ws.ui.find_approval_cycle = MagicMock(wraps=real_find)
-    ws.ui.resolve_approval = MagicMock(wraps=real_resolve)
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-
-    resp = client.post(
-        f"/v1/api/workstreams/{ws.id}/approve",
-        json={"approved": True, "feedback": "ship it", "call_id": "c-modern"},
-        headers=_COORD_HEADERS,
-    )
-
-    assert resp.status_code == 200
-    ws.ui.find_approval_cycle.assert_called_once_with(cycle_id=None, call_id="c-modern")
-    ws.ui.resolve_approval.assert_called_once_with(
-        True,
-        "ship it",
-        always=False,
-        cycle_id=cycle.cycle_id,
-        resolver_principal_id="user-1",
-    )
-
-
-@pytest.mark.parametrize(
-    ("body", "field"),
-    [
-        ({}, "approved"),
-        ({"approved": "false"}, "approved"),
-        ({"approved": True, "always": "false"}, "always"),
-        ({"approved": True, "feedback": ["no"]}, "feedback"),
-        ({"approved": True, "call_id": 123}, "call_id"),
-        ({"approved": True, "cycle_id": ["cycle"]}, "cycle_id"),
-    ],
-)
-def test_approve_rejects_malformed_fields_without_resolving(storage, body, field):
-    mgr = _build_mgr(storage)
-    ws = mgr.create(user_id="user-1")
-    cycle = _seed_pending(ws, "c-malformed")
-    ws.ui.find_approval_cycle = MagicMock(wraps=ws.ui.find_approval_cycle)
-    ws.ui.resolve_approval = MagicMock(wraps=ws.ui.resolve_approval)
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-
-    resp = client.post(
-        f"/v1/api/workstreams/{ws.id}/approve",
-        json=body,
-        headers=_COORD_HEADERS,
-    )
-
-    assert resp.status_code == 400
-    assert field in resp.json()["error"]
-    ws.ui.find_approval_cycle.assert_not_called()
-    ws.ui.resolve_approval.assert_not_called()
-    assert not cycle.event.is_set()
-
-
-def test_approve_rejects_ui_without_cycle_routing(storage):
-    class _LegacyApprovalUI:
-        def resolve_approval(self, *_args, **_kwargs):
-            raise AssertionError("legacy resolver must not be called")
-
-    mgr = _build_mgr(storage)
-    ws = mgr.create(user_id="user-1")
-    ws.ui = _LegacyApprovalUI()
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-
-    resp = client.post(
-        f"/v1/api/workstreams/{ws.id}/approve",
-        json={"approved": True},
-        headers=_COORD_HEADERS,
-    )
-
-    assert resp.status_code == 409
-    assert resp.json() == {"error": "session UI does not support principal-aware approval"}
-
-
-def test_approve_callback_type_error_is_not_retried(storage):
-    mgr = _build_mgr(storage)
-    ws = mgr.create(user_id="user-1")
-    cycle = _seed_pending(ws, "c-bug")
-    ws.ui.resolve_approval = MagicMock(side_effect=TypeError("callback implementation bug"))
-    client = _make_client(
-        storage,
-        coord_mgr=mgr,
-        registry=_fake_registry(),
-        raise_server_exceptions=False,
-    )
-
-    resp = client.post(
-        f"/v1/api/workstreams/{ws.id}/approve",
-        json={"approved": False, "call_id": "c-bug"},
-        headers=_COORD_HEADERS,
-    )
-
-    assert resp.status_code == 500
-    ws.ui.resolve_approval.assert_called_once_with(
-        False,
-        None,
-        always=False,
-        cycle_id=cycle.cycle_id,
-        resolver_principal_id="user-1",
-    )
-    assert not cycle.event.is_set()
-
-
 def test_selectorless_always_whitelists_only_the_resolved_oldest_cycle(storage):
     """sweep-3 regression: with several live cycles, a selector-less
     "Approve + Always" must whitelist the tools of the cycle it
@@ -1474,9 +1269,8 @@ def test_selectorless_always_whitelists_only_the_resolved_oldest_cycle(storage):
     assert resp.json()["cycle_id"] == oldest.cycle_id
     assert oldest.event.is_set()
     assert not newer.event.is_set()
-    grants = ws.ui._always_approve_tools_by_principal["user-1"]
-    assert "spawn_workstream" in grants
-    assert "send_message" not in grants
+    assert "spawn_workstream" in ws.ui.auto_approve_tools
+    assert "send_message" not in ws.ui.auto_approve_tools
 
 
 def test_approve_always_skips_whitelist_when_pinned_cycle_lost_the_race(storage):
@@ -1508,7 +1302,7 @@ def test_approve_always_skips_whitelist_when_pinned_cycle_lost_the_race(storage)
     )
     assert resp.status_code == 200
     assert resp.json()["cycle_id"] is None
-    assert "spawn_workstream" not in ws.ui._always_approve_tools_by_principal.get("user-1", set())
+    assert "spawn_workstream" not in ws.ui.auto_approve_tools
 
 
 # ---------------------------------------------------------------------------
@@ -1599,36 +1393,8 @@ def test_detail_correlation_id_on_unexpected_rehydrate_failure(storage):
 # ---------------------------------------------------------------------------
 
 
-class _HistoryHandoffSession:
-    """Minimal concrete session for token-bearing history endpoint tests."""
-
-    def __init__(self) -> None:
-        self._history_generation = 0
-
-    def capture_history_handoff(
-        self,
-        load_messages: Callable[[int], list[dict[str, Any]]],
-    ) -> tuple[list[dict[str, Any]], str]:
-        return load_messages(0), f"test-history.{self._history_generation}"
-
-    def resume(self, _ws_id: str) -> None:
-        return None
-
-
-def _build_history_mgr(storage: Any):
-    def session_factory(
-        _ui: Any,
-        _model_alias: str | None = None,
-        _ws_id: str | None = None,
-        **_kwargs: Any,
-    ) -> _HistoryHandoffSession:
-        return _HistoryHandoffSession()
-
-    return _build_mgr_with_factory(storage, session_factory)
-
-
 def test_history_returns_messages(storage):
-    mgr = _build_history_mgr(storage)
+    mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
     # Seed a message in storage.
     storage.save_message(ws.id, "user", "hello")
@@ -1637,14 +1403,13 @@ def test_history_returns_messages(storage):
     assert resp.status_code == 200
     body = resp.json()
     assert body["ws_id"] == ws.id
-    assert body["handoff_token"]
     assert any(m.get("role") == "user" and m.get("content") == "hello" for m in body["messages"])
 
 
 def test_history_any_admin_coordinator_caller_can_read(storage):
     # Trusted-team visibility: history is readable by any
     # ``admin.coordinator`` caller.
-    mgr = _build_history_mgr(storage)
+    mgr = _build_mgr(storage)
     ws = mgr.create(user_id="owner")
     storage.save_message(ws.id, "user", "hello")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
@@ -1680,8 +1445,7 @@ def test_history_private_project_visible_to_member(storage):
         "c" * 32, kind="coordinator", user_id="alice", project_id="proj-secret"
     )
     storage.save_message("c" * 32, "user", "secret plan")
-    mgr = _build_history_mgr(storage)
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
+    client = _make_client(storage, coord_mgr=_build_mgr(storage), registry=_fake_registry())
     resp = client.get(
         f"/v1/api/workstreams/{'c' * 32}/history",
         headers={"X-Test-User": "member-bob", "X-Test-Perms": "admin.coordinator"},
@@ -1762,15 +1526,11 @@ def test_coord_attachments_private_project_visible_to_member(storage):
 
 
 def test_history_serves_storage_only_workstream(storage):
-    """Closed coordinators are still readable via /history without rehydrating.
-
-    Deliberate pin update (back to the pre-handoff assertion, plus the token
-    contract): a cold row has no live writer and no splice to witness, so the
-    read is storage-only and tokenless — never constructing a session into
-    the bounded pool. The tokenless 200 seeds a render plus the tokenless
-    stream bootstrap.
-    """
-    mgr = _build_history_mgr(storage)
+    """Persisted-but-not-loaded coordinators (closed / evicted) are still
+    readable via /history without rehydrating. Mirrors the pre-lift
+    ``_resolve_coordinator_or_404`` ladder: storage-row + kind check
+    is sufficient when ``mgr.get`` returns None."""
+    mgr = _build_mgr(storage)
     storage.register_workstream("storage-only-coord", kind="coordinator", user_id="user-1")
     storage.save_message("storage-only-coord", "user", "from cold storage")
     # Confirm precondition: row is in storage, NOT in the manager's pool.
@@ -1782,10 +1542,8 @@ def test_history_serves_storage_only_workstream(storage):
         headers=_COORD_HEADERS,
     )
     assert resp.status_code == 200
-    body = resp.json()
-    assert any(m.get("content") == "from cold storage" for m in body["messages"])
-    assert body["handoff_token"] is None
-    # The read verb leaves the pool untouched.
+    assert any(m.get("content") == "from cold storage" for m in resp.json()["messages"])
+    # History does NOT rehydrate (unlike detail) — pool stays cold.
     assert mgr.get("storage-only-coord") is None
 
 
@@ -1804,24 +1562,25 @@ def test_history_404_when_kind_interactive(storage):
     assert "interactive content" not in resp.text
 
 
-def test_history_load_messages_exception_returns_non_authoritative_503(storage):
-    """A transient history-load failure must not masquerade as empty truth.
-
-    The browser retains its prior transcript and repair latch on a non-2xx.
-    The failure body therefore carries neither projected messages nor a
-    handoff token that could authorize an SSE connection from an incomplete
-    durable prefix.
-    """
+def test_history_swallows_load_messages_exception_returns_empty(storage):
+    """``storage.load_messages`` raising mid-call (transient DB outage,
+    corrupted row, etc.) must not 5xx the page-load handshake — coord
+    pre-lift logged at debug and returned 200 with ``messages == []``.
+    The lifted body preserves that contract on both kinds; pin it
+    explicitly so a future reader doesn't remove the bare-except as
+    dead code."""
     from unittest.mock import patch
 
-    mgr = _build_history_mgr(storage)
+    mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
     client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
 
     with patch.object(storage, "load_messages", side_effect=RuntimeError("db gone")):
         resp = client.get(f"/v1/api/workstreams/{ws.id}/history", headers=_COORD_HEADERS)
-    assert resp.status_code == 503
-    assert resp.json() == {"error": "History temporarily unavailable"}
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ws_id"] == ws.id
+    assert body["messages"] == []
 
 
 def test_history_clamps_limit_query_param(storage):
@@ -1829,7 +1588,7 @@ def test_history_clamps_limit_query_param(storage):
     preserves the same bounds. Out-of-range / unparseable values
     fall back to defaults instead of erroring — coord's page-load
     handshake should never 4xx on a malformed limit param."""
-    mgr = _build_history_mgr(storage)
+    mgr = _build_mgr(storage)
     ws = mgr.create(user_id="user-1")
     # Seed enough messages to exercise the upper bound. SQLite's INSERT
     # is fast enough that 6 inserts in a tight loop is fine.
@@ -1968,22 +1727,6 @@ def test_cancel_resolves_pending_approval(storage):
     assert first.event.is_set()
     assert second.event.is_set()
     assert first.result == (False, "Cancelled by user")
-    assert first.resolver_principal_id == "user-1"
-    assert second.resolver_principal_id == "user-1"
-
-
-def test_cancel_does_not_fallback_to_single_cycle_approval_api(storage):
-    """An incompatible UI cannot bypass the attributed all-cycle sweep."""
-    mgr = _build_mgr(storage)
-    ws = mgr.create(user_id="user-1")
-    single_cycle_resolver = MagicMock()
-    ws.ui = SimpleNamespace(resolve_approval=single_cycle_resolver)
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-
-    resp = client.post(f"/v1/api/workstreams/{ws.id}/cancel", headers=_COORD_HEADERS)
-
-    assert resp.status_code == 200
-    single_cycle_resolver.assert_not_called()
 
 
 def test_cancel_response_always_includes_dropped_key(storage):
@@ -2307,35 +2050,39 @@ def test_coord_cancel_cascade_failure_does_not_fail_owner_cancel(storage):
 from tests._replay_helpers import make_replay_mocks as _make_coord_replay_mocks  # noqa: E402
 
 
-def test_coord_shared_preamble_yields_connected_first():
-    """The shared preamble gives coordinator streams the same bootstrap."""
-    from turnstone.core.session_replay import session_replay_preamble
+def test_coord_events_replay_yields_connected_first():
+    """Pre-status-bar coord replay only re-injected pending_approval +
+    pending_plan_review. Post-status-bar parity with interactive
+    yields ``connected`` first so the dashboard's status bar populates
+    the model cell before any history arrives — mirrors the
+    interactive replay (turnstone/server.py:_interactive_events_replay)."""
+    from turnstone.console.server import _coord_events_replay
 
-    ws, ui, _request = _make_coord_replay_mocks()
-    out = list(session_replay_preamble(ws.session, ui))
+    ws, ui, request = _make_coord_replay_mocks()
+    out = list(_coord_events_replay(ws, ui, request))
     assert out[0]["type"] == "connected"
     assert out[0]["model"] == "gpt-5"
     assert out[0]["model_alias"] == "default"
     assert out[0]["skip_permissions"] is False
 
 
-def test_coord_shared_preamble_includes_status_only_when_last_usage_present():
+def test_coord_events_replay_includes_status_only_when_last_usage_present():
     """The ``status`` event populates the per-tab token-usage bar on
     resume. Skipped when ``session._last_usage`` is None (a freshly-
     created coordinator that hasn't completed a turn) — matches
     interactive behaviour."""
-    from turnstone.core.session_replay import session_replay_preamble
+    from turnstone.console.server import _coord_events_replay
 
-    ws, ui, _request = _make_coord_replay_mocks()
-    out = list(session_replay_preamble(ws.session, ui))
+    ws, ui, request = _make_coord_replay_mocks()
+    out = list(_coord_events_replay(ws, ui, request))
     assert "status" not in {ev["type"] for ev in out}
 
 
-def test_coord_shared_preamble_status_payload_shape():
+def test_coord_events_replay_status_payload_shape():
     """When ``last_usage`` exists, the replayed ``status`` event carries
     every field the dashboard's updateStatusBar() reads — same shape
     SessionUI.on_status emits live."""
-    from turnstone.core.session_replay import session_replay_preamble
+    from turnstone.console.server import _coord_events_replay
 
     ws, ui, request = _make_coord_replay_mocks(
         last_usage={
@@ -2347,7 +2094,7 @@ def test_coord_shared_preamble_status_payload_shape():
         _ws_turn_tool_calls=3,
         _ws_messages=7,
     )
-    out = list(session_replay_preamble(ws.session, ui))
+    out = list(_coord_events_replay(ws, ui, request))
     status = next(ev for ev in out if ev["type"] == "status")
     assert status["prompt_tokens"] == 40000
     assert status["completion_tokens"] == 6310
@@ -2375,7 +2122,12 @@ def test_coord_events_replay_skips_session_block_when_no_session():
 
 
 def test_coord_events_replay_yields_pending_approval():
-    """The coord replay tail yields pending approval without mutation."""
+    """The lifted coord ``events_replay`` callback yields, after the
+    connected preamble, the pending approval (if any). Pre-lift coord
+    pushed it onto the listener queue via ``put_nowait``; the lift
+    restructures as a generator the lifted body iterates and yields as
+    ``data:`` lines, but the payload identity is preserved. Pure-read —
+    never mutates ``ui``."""
     from turnstone.console.server import _coord_events_replay
 
     ws, ui, request = _make_coord_replay_mocks(
@@ -2384,6 +2136,8 @@ def test_coord_events_replay_yields_pending_approval():
 
     out = list(_coord_events_replay(ws, ui, request))
     types = [ev["type"] for ev in out]
+    # Status preamble is yielded first (no last_usage → no status); the
+    # pending-approval re-injection then matches the pre-lift body.
     assert types[0] == "connected"
     assert "approve_request" in types
 
@@ -2440,7 +2194,9 @@ def test_coord_events_replay_skips_verdict_replay_without_pending_approval():
 
 
 def test_coord_events_replay_yields_only_connected_when_no_pending():
-    """Without controls or usage, replay contains only the preamble."""
+    """A workstream with a session but no pending approval / plan
+    review and no last_usage yields just the ``connected`` preamble.
+    The lifted body falls through to the live loop immediately after."""
     from turnstone.console.server import _coord_events_replay
 
     ws, ui, request = _make_coord_replay_mocks()
@@ -2778,42 +2534,6 @@ def test_cluster_inspect_coordinator_self_path(storage):
     assert body["live"]["pending_approval"] is False
     assert body["live"]["activity_state"] == ""
     assert isinstance(body["messages"], list)
-
-
-def test_cluster_inspect_scrubs_private_assistant_provenance(storage):
-    """Cluster inspection never exposes the durable audit principal."""
-    import json
-
-    mgr = _build_mgr(storage)
-    ws = mgr.create(user_id="user-1")
-    storage.save_message(
-        ws.id,
-        "assistant",
-        "accepted",
-        meta=json.dumps(
-            {
-                "provenance": {
-                    "model_alias": "main",
-                    "backend_model_id": "kernel",
-                    "registry_generation": 8,
-                    "acting_principal_id": "private-user-id",
-                }
-            }
-        ),
-        commit_key="private-commit-key",
-    )
-    client = _make_client(storage, coord_mgr=mgr, registry=_fake_registry())
-
-    response = client.get(f"/v1/api/cluster/ws/{ws.id}/detail", headers=_CLUSTER_HEADERS)
-
-    assert response.status_code == 200
-    [message] = response.json()["messages"]
-    assert message["role"] == "assistant"
-    assert message["content"] == "accepted"
-    assert "_provenance" not in message
-    assert "_commit_key" not in message
-    assert "private-user-id" not in response.text
-    assert "private-commit-key" not in response.text
 
 
 def test_cluster_inspect_unloaded_coordinator_live_null(storage):

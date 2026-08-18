@@ -1,6 +1,5 @@
 import { BaseClient, type ClientOptions } from "./base.js";
 import type { ServerEvent } from "./events.js";
-import { normalizeMemoryDescription } from "./memory_description.js";
 import type {
   AttachmentContent,
   AttachmentUpload,
@@ -13,7 +12,6 @@ import type {
   CreateWorkstreamResponse,
   DashboardResponse,
   DeleteMemoryOptions,
-  GetMemoryOptions,
   HealthResponse,
   ListAttachmentsResponse,
   ListMemoriesOptions,
@@ -21,17 +19,14 @@ import type {
   ListSavedWorkstreamsResponse,
   ListWorkstreamsResponse,
   MemoryInfo,
-  MemorySummary,
   SaveMemoryRequest,
   SearchMemoriesRequest,
   SendAndWaitOptions,
   SendResponse,
   SkillSummary,
   StatusResponse,
-  StreamEventsOptions,
   TurnResult,
   UploadAttachmentResponse,
-  WorkstreamHistoryResponse,
 } from "./types.js";
 
 function generateWsId(): string {
@@ -118,14 +113,11 @@ export class TurnstoneServer extends BaseClient {
   async send(
     message: string,
     wsId: string,
-    opts?: { attachmentIds?: string[]; clientSendId?: string },
+    opts?: { attachmentIds?: string[] },
   ): Promise<SendResponse> {
     const body: Record<string, unknown> = { message };
     if (opts?.attachmentIds !== undefined) {
       body.attachment_ids = opts.attachmentIds;
-    }
-    if (opts?.clientSendId !== undefined) {
-      body.client_send_id = opts.clientSendId;
     }
     return this.request(
       "POST",
@@ -239,45 +231,11 @@ export class TurnstoneServer extends BaseClient {
     );
   }
 
-  // -- History ---------------------------------------------------------------
-
-  /**
-   * Return the requested tail of the authoritative total accepted row prefix.
-   * A 503 is non-authoritative and must not replace an existing transcript.
-   */
-  async getHistory(
-    wsId: string,
-    opts?: { limit?: number },
-  ): Promise<WorkstreamHistoryResponse> {
-    return this.request(
-      "GET",
-      `/v1/api/workstreams/${encodeURIComponent(wsId)}/history`,
-      { params: { limit: opts?.limit ?? 100 } },
-    );
-  }
-
   // -- Streaming ------------------------------------------------------------
 
-  /**
-   * Open one caller-managed event stream. Pass history hints only after fully
-   * rendering the corresponding `getHistory()` response. On `history_resync`,
-   * stop this iterator, refetch and render history, then open a new stream with
-   * the new hints. No automatic reconnect or transcript repair is performed.
-   */
-  async *streamEvents(
-    wsId: string,
-    opts?: StreamEventsOptions,
-  ): AsyncIterableIterator<ServerEvent> {
-    const params: Record<string, string | number> = { user_turn: 1 };
-    if (opts?.lastEventId !== undefined) {
-      params.last_event_id = opts.lastEventId;
-    }
-    if (opts?.historyToken) {
-      params.history_token = opts.historyToken;
-    }
+  async *streamEvents(wsId: string): AsyncIterableIterator<ServerEvent> {
     yield* this.streamSSE<ServerEvent>(
       `/v1/api/workstreams/${encodeURIComponent(wsId)}/events`,
-      params,
     );
   }
 
@@ -319,7 +277,7 @@ export class TurnstoneServer extends BaseClient {
       // Start consuming the per-workstream SSE stream first
       const events = this.streamSSE<ServerEvent>(
         `/v1/api/workstreams/${encodeURIComponent(wsId)}/events`,
-        { user_turn: 1 },
+        undefined,
         controller.signal,
       );
 
@@ -396,27 +354,14 @@ export class TurnstoneServer extends BaseClient {
     return this.request("GET", "/v1/api/memories", { params });
   }
 
-  async saveMemory(opts: SaveMemoryRequest): Promise<MemorySummary> {
-    const description = normalizeMemoryDescription(opts.description);
-    return this.request("POST", "/v1/api/memories", {
-      json: { ...opts, description },
-    });
+  async saveMemory(opts: SaveMemoryRequest): Promise<MemoryInfo> {
+    return this.request("POST", "/v1/api/memories", { json: opts });
   }
 
   async searchMemories(
     opts: SearchMemoriesRequest,
   ): Promise<ListMemoriesResponse> {
     return this.request("POST", "/v1/api/memories/search", { json: opts });
-  }
-
-  async getMemory(
-    name: string,
-    opts?: GetMemoryOptions,
-  ): Promise<MemoryInfo> {
-    const params: Record<string, string> = {};
-    if (opts?.scope) params.scope = opts.scope;
-    if (opts?.scope_id) params.scope_id = opts.scope_id;
-    return this.request("GET", `/v1/api/memories/${encodeURIComponent(name)}`, { params });
   }
 
   async deleteMemory(
@@ -426,7 +371,7 @@ export class TurnstoneServer extends BaseClient {
     const params: Record<string, string> = {};
     if (opts?.scope) params.scope = opts.scope;
     if (opts?.scope_id) params.scope_id = opts.scope_id;
-    return this.request("DELETE", `/v1/api/memories/${encodeURIComponent(name)}`, { params });
+    return this.request("DELETE", `/v1/api/memories/${name}`, { params });
   }
 
   // -- Auth -----------------------------------------------------------------

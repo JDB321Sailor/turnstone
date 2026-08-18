@@ -49,10 +49,6 @@ from turnstone.core.oidc import (
     provision_oidc_user,
     validate_id_token,
 )
-from turnstone.core.project_access import (
-    decide_project_access,
-    decide_project_management_access,
-)
 
 log = get_logger(__name__)
 
@@ -75,7 +71,6 @@ JWT_ISSUER = "turnstone"
 JWT_AUD_SERVER = "turnstone-server"
 JWT_AUD_CONSOLE = "turnstone-console"
 JWT_AUD_CHANNEL = "turnstone-channel"
-TLS_ACME_TOKEN_SOURCE = "tls-acme-enrollment"
 _MIN_SECRET_LENGTH = 32  # 256 bits minimum for HMAC-SHA256
 
 VALID_SCOPES: frozenset[str] = frozenset({"read", "write", "approve", "service"})
@@ -210,81 +205,13 @@ class ProjectAccess(NamedTuple):
 _PROJECT_DENY = ProjectAccess(False, False, "", "")
 
 
-def _evaluate_project_row_access(
-    user_id: str,
-    project: dict[str, Any],
-    *,
-    storage: Any,
-    management: bool,
-) -> ProjectAccess:
-    """Apply one named project policy to an already-fetched project row."""
-    if not user_id or storage is None:
-        return _PROJECT_DENY
-    project_id = str(project.get("project_id") or "")
-    if not project_id:
-        return _PROJECT_DENY
-    name = project.get("name", "") or ""
-    state = project.get("state", "active") or "active"
-    is_member = bool(storage.is_project_member(project_id, user_id))
-    permissions = _load_user_permissions(storage, user_id)
-    if management:
-        decision = decide_project_management_access(
-            principal_id=user_id,
-            owner_id=str(project.get("owner_id") or ""),
-            visibility=str(project.get("visibility") or "private"),
-            is_member=is_member,
-            permissions=permissions,
-        )
-    else:
-        decision = decide_project_access(
-            principal_id=user_id,
-            owner_id=str(project.get("owner_id") or ""),
-            visibility=str(project.get("visibility") or "private"),
-            state=str(state),
-            is_member=is_member,
-            permissions=permissions,
-        )
-    return ProjectAccess(decision.can_read, decision.can_write, name, state)
-
-
-def _resolve_project_access(
-    user_id: str,
-    project_id: str,
-    *,
-    storage: Any = None,
-    management: bool,
-) -> ProjectAccess:
-    """Resolve project facts once, then apply the selected named policy."""
-    if not user_id or not project_id:
-        return _PROJECT_DENY
-    if storage is None:
-        from turnstone.core.storage._registry import get_storage
-
-        storage = get_storage()
-    if storage is None:
-        return _PROJECT_DENY
-    try:
-        project = storage.get_project(project_id)
-        if project is None:
-            return _PROJECT_DENY
-        return _evaluate_project_row_access(
-            user_id,
-            project,
-            storage=storage,
-            management=management,
-        )
-    except Exception:
-        log.warning("project access check failed for user=%s project=%s", user_id, project_id)
-        return _PROJECT_DENY
-
-
 def resolve_project_access(
     user_id: str,
     project_id: str,
     *,
     storage: Any = None,
 ) -> ProjectAccess:
-    """Resolve active-runtime access + name/state for *project_id* in one fetch.
+    """Resolve read/write access + name/state for *project_id* in ONE fetch.
 
     The single-fetch core behind :func:`user_can_access_project`.  The session
     constructor calls this directly to avoid three redundant ``get_project``
@@ -302,17 +229,34 @@ def resolve_project_access(
     Fail-closed: empty ids, a missing/unknown project, or a storage failure all
     return :data:`_PROJECT_DENY`.
     """
-    return _resolve_project_access(user_id, project_id, storage=storage, management=False)
+    if not user_id or not project_id:
+        return _PROJECT_DENY
+    if storage is None:
+        from turnstone.core.storage._registry import get_storage
 
-
-def resolve_project_management_access(
-    user_id: str,
-    project_id: str,
-    *,
-    storage: Any = None,
-) -> ProjectAccess:
-    """Resolve lifecycle-independent project management access in one fetch."""
-    return _resolve_project_access(user_id, project_id, storage=storage, management=True)
+        storage = get_storage()
+    if storage is None:
+        return _PROJECT_DENY
+    try:
+        project = storage.get_project(project_id)
+        if project is None:
+            return _PROJECT_DENY
+        name = project.get("name", "") or ""
+        state = project.get("state", "active") or "active"
+        if project.get("owner_id") == user_id:
+            return ProjectAccess(True, True, name, state)
+        # One membership lookup + the capability checks, then derive both access
+        # bits from the single project row (vs three get_project round-trips).
+        is_member = bool(storage.is_project_member(project_id, user_id))
+        is_public = project.get("visibility") == "public"
+        can_read = user_has_permission(user_id, "project.read", storage=storage) and (
+            is_member or is_public
+        )
+        can_write = user_has_permission(user_id, "project.write", storage=storage) and is_member
+        return ProjectAccess(can_read, can_write, name, state)
+    except Exception:
+        log.warning("project access check failed for user=%s project=%s", user_id, project_id)
+        return _PROJECT_DENY
 
 
 def user_can_access_project(
@@ -326,22 +270,11 @@ def user_can_access_project(
 
     Thin boolean wrapper over :func:`resolve_project_access` — composes the RBAC
     capability gate with the per-project ACL, safe to call from contexts with no
-    HTTP permission middleware (memory recall and session admission). Fail-closed
-    via the resolver.
+    HTTP permission middleware (memory recall, the management route ACL check).
+    Fail-closed via the resolver.  HTTP handlers still gate on
+    :func:`require_permission` first; this adds the per-resource ACL.
     """
     acc = resolve_project_access(user_id, project_id, storage=storage)
-    return acc.can_write if write else acc.can_read
-
-
-def user_can_manage_project(
-    user_id: str,
-    project_id: str,
-    *,
-    write: bool,
-    storage: Any = None,
-) -> bool:
-    """Return whether a principal may manage a project in any lifecycle state."""
-    acc = resolve_project_management_access(user_id, project_id, storage=storage)
     return acc.can_write if write else acc.can_read
 
 
@@ -351,8 +284,8 @@ class WorkstreamProjectVisibility:
     Answers "may *user_id* see a workstream attached to *project_id*?" for
     listing filters and the row-access gate. Distinct from
     :func:`user_can_access_project` on purpose: that composes the RBAC
-    capability (``project.read``, admin-default) with the ACL and gates active
-    project *runtime* use, whereas workstream visibility is a
+    capability (``project.read``, admin-default) with the ACL and gates the
+    project *management* surfaces, whereas workstream visibility is a
     tenancy question — an explicit ``project_members`` row (or ownership)
     IS the grant, no capability required, or members without ``project.read``
     would lose sight of their own shared workstreams.
@@ -434,9 +367,9 @@ class WorkstreamProjectVisibility:
     def _project_grants(self, project: dict[str, Any]) -> bool:
         """The tenancy rule for one already-fetched project row.
 
-        This deliberately governs existing-row visibility only. Fresh project
-        attachment uses canonical active-project RBAC in
-        :func:`ensure_project_attachable`.
+        THE single statement of who may see a project's workstreams —
+        :meth:`ws_visibility` and :func:`ensure_project_attachable` both
+        route through here so the security decision cannot diverge.
         """
         if (project.get("visibility") or "private") != "private":
             return True
@@ -503,41 +436,37 @@ def ensure_project_attachable(
     :meth:`WorkstreamProjectVisibility.ws_visible` in one way — a
     nonexistent project is a 400 (a dangling link on an EXISTING row is
     tolerated because project deletion leaves links behind, but minting
-    a fresh dangling link is a caller error). Existing projects use the
-    canonical active-runtime policy: owners retain access, while members and
-    public principals need ``project.read``. Project-memory writes remain
-    independently gated by ``can_write`` at the session layer.
+    a fresh dangling link is a caller error) — and shares its tenancy
+    rule: private projects accept workstreams only from their owner or
+    members; public/active-or-archived projects accept from anyone
+    (memory writes stay member-gated at the session layer).
 
     Fail-closed: empty ``user_id`` or a storage failure denies with 403.
     """
     pid = (project_id or "").strip()
     if not pid:
         return None
-    denied = (403, "project is not available for workstream attachment")
-    if not user_id:
-        return denied
-    try:
-        if storage is None:
-            from turnstone.core.storage._registry import get_storage
+    if storage is None:
+        from turnstone.core.storage._registry import get_storage
 
-            storage = get_storage()
-        if storage is None:
-            return denied
+        storage = get_storage()
+    if storage is None:
+        return (403, "project access could not be verified")
+    try:
         project = storage.get_project(pid)
         if project is None:
             return (400, "unknown project_id")
-        access = _evaluate_project_row_access(
-            user_id,
-            project,
-            storage=storage,
-            management=False,
-        )
-        if access.can_read:
+        # One tenancy rule, one place: reuse the visibility predicate's
+        # core (same-module private access; the fetched row is seeded
+        # into the memo so this costs no second get_project).
+        vis = WorkstreamProjectVisibility(user_id, storage=storage)
+        vis._projects[pid] = project
+        if vis._project_grants(project):
             return None
-        return denied
+        return (403, "cannot attach a workstream to a private project you don't belong to")
     except Exception:
         log.warning("project attach check failed user=%s project=%s — failing closed", user_id, pid)
-        return denied
+        return (403, "project access could not be verified")
 
 
 # ---------------------------------------------------------------------------
@@ -756,19 +685,7 @@ PUBLIC_PATHS: frozenset[str] = frozenset(
         "/api/auth/oidc/callback",
     }
 )
-PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/shared/")
-
-# ACME discovery/bootstrap material is public because a node does not have a
-# cluster identity yet.  Everything capable of creating or changing an order
-# is authenticated separately below: lacme's lightweight responder deliberately
-# does not validate ACME JWS signatures or nonces itself.
-ACME_PUBLIC_PATHS: frozenset[str] = frozenset(
-    {
-        "/acme/directory",
-        "/acme/new-nonce",
-        "/acme/ca.pem",
-    }
-)
+PUBLIC_PREFIXES: tuple[str, ...] = ("/static/", "/shared/", "/acme/")
 
 WRITE_PATHS: frozenset[str] = frozenset(
     {
@@ -800,14 +717,6 @@ def _strip_version_prefix(path: str) -> str:
     if path.startswith("/v1/"):
         return path[3:]
     return path
-
-
-def _is_protected_acme_path(path: str) -> bool:
-    """Return whether *path* is an authenticated ACME responder resource."""
-    normalized = _strip_version_prefix(path)
-    return (
-        normalized == "/acme" or normalized.startswith("/acme/")
-    ) and normalized not in ACME_PUBLIC_PATHS
 
 
 # ---------------------------------------------------------------------------
@@ -1102,7 +1011,7 @@ def validate_jwt(token: str, secret: str, audience: str = "") -> AuthResult | No
 def is_public_path(path: str) -> bool:
     """Return *True* if the path should be accessible without authentication."""
     normalized = _strip_version_prefix(path)
-    if normalized in PUBLIC_PATHS or normalized in ACME_PUBLIC_PATHS:
+    if normalized in PUBLIC_PATHS:
         return True
     if any(normalized.startswith(prefix) for prefix in PUBLIC_PREFIXES):
         return True
@@ -1129,13 +1038,6 @@ def required_scope(method: str, path: str) -> str:
     """
     normalized = _strip_version_prefix(path)
     normalized = normalized.rstrip("/") if normalized != "/" else normalized
-
-    # The responder auto-approves challenges, so every non-bootstrap ACME route
-    # is a cluster-CA signing surface.  ``service`` cannot be granted through
-    # user-facing token mints; check_request additionally pins the token source
-    # to the dedicated enrollment identity.
-    if normalized == "/acme" or normalized.startswith("/acme/"):
-        return "service"
 
     # Admin endpoints require approve scope
     if normalized.startswith(ADMIN_PREFIX):
@@ -1326,13 +1228,6 @@ def check_request(
     )
     if result is None:
         return False, 401, "Unauthorized: missing or invalid token", None
-
-    is_protected_acme = _is_protected_acme_path(path)
-    is_enrollment_token = result.token_source == TLS_ACME_TOKEN_SOURCE
-    if is_protected_acme and not is_enrollment_token:
-        return False, 403, "Forbidden: token is not valid for ACME enrollment", None
-    if is_enrollment_token and not is_protected_acme:
-        return False, 403, "Forbidden: ACME enrollment token is not valid for this resource", None
 
     # Version gate — reject tokens minted by a different major.minor.
     # Tokens without a ``ver`` claim are accepted (backward compat).
@@ -1736,11 +1631,6 @@ async def handle_auth_login(request: Request, audience: str, cookie_name: str) -
             jwt_audience=audience,
             storage=storage,
         )
-        # Enrollment JWTs are capabilities for the protected ACME responder,
-        # not general service credentials.  In particular, never let the
-        # legacy token-exchange path extend one into a fresh 24-hour session.
-        if result is not None and result.token_source == TLS_ACME_TOKEN_SOURCE:
-            result = None
 
     if result is None:
         # Record failed attempt for rate limiting

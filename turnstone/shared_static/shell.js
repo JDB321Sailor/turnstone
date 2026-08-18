@@ -755,13 +755,7 @@ async function mountShell() {
                     // 404 = nothing left to stop (closed under us / node lost
                     // it) — the user's intent is satisfied; drop the tab.
                     if (r.ok || r.status === 404) pm.close(pane.id);
-                    else if (r.status === 409) {
-                      if (typeof window.showToast === "function")
-                        window.showToast(
-                          "Conversation history is still being saved. Try ending the session again shortly.",
-                          "warning",
-                        );
-                    } else failToast();
+                    else failToast();
                   })
                   .catch(failToast);
               };

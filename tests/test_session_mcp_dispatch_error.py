@@ -129,7 +129,6 @@ class TestExecMcpToolDispatchError:
             "call_id": "tc_1",
             "mcp_func_name": "mcp__srv-oauth__do",
             "mcp_args": {},
-            "_principal_id": "",
         }
         session._exec_mcp_tool(item)
 
@@ -150,7 +149,6 @@ class TestExecMcpToolDispatchError:
             "call_id": "tc_2",
             "mcp_func_name": "mcp__srv-oauth__do",
             "mcp_args": {},
-            "_principal_id": "",
         }
         session._exec_mcp_tool(item)
 
@@ -170,7 +168,6 @@ class TestExecReadResourceDispatchError:
         item = {
             "call_id": "rc_1",
             "resource_uri": "https://example.com/r",
-            "_principal_id": "",
         }
         # The exec site emits a ``log.warning`` (no ``exc_info`` — bearer-leak
         # invariant) on failure. Patch the logger so the test doesn't emit
@@ -194,7 +191,6 @@ class TestExecReadResourceDispatchError:
         item = {
             "call_id": "rc_2",
             "resource_uri": "https://example.com/r",
-            "_principal_id": "",
         }
         with patch("turnstone.core.session.log"):
             session._exec_read_resource(item)
@@ -216,7 +212,6 @@ class TestExecUsePromptDispatchError:
             "call_id": "pc_1",
             "prompt_name": "mcp__srv-oauth__greet",
             "prompt_arguments": {},
-            "_principal_id": "",
         }
         with patch("turnstone.core.session.log"):
             session._exec_use_prompt(item)
@@ -237,7 +232,6 @@ class TestExecUsePromptDispatchError:
             "call_id": "pc_2",
             "prompt_name": "mcp__srv-oauth__greet",
             "prompt_arguments": {},
-            "_principal_id": "",
         }
         with patch("turnstone.core.session.log"):
             session._exec_use_prompt(item)

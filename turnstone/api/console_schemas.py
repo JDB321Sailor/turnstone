@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, TypeAlias
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 # TC002 suppressed deliberately: pydantic resolves the stringified annotation
 # at class-build time, so SkipJsonSchema must exist at runtime — under
@@ -15,9 +15,6 @@ from turnstone.api.server_schemas import CreateWorkstreamRequest, CreateWorkstre
 from turnstone.core.model_registry import MAX_MODEL_CONCURRENCY
 from turnstone.core.skill_kind import SkillKind
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
-
-# Pydantic resolves this annotation while constructing the model schema.
-from turnstone.core.workstream import ConversationPersistenceState  # noqa: TC001
 
 # ---------------------------------------------------------------------------
 # Cluster overview
@@ -88,13 +85,6 @@ class ClusterWorkstreamInfo(BaseModel):
     activity: str = ""
     activity_state: str = ""
     tool_calls: int = 0
-    persistence_state: ConversationPersistenceState = Field(
-        default="healthy",
-        description=(
-            "Sanitized durable-history status for a live row. Older nodes and "
-            "unloaded persisted-only rows default to healthy."
-        ),
-    )
 
 
 class ClusterWorkstreamsResponse(BaseModel):
@@ -616,8 +606,6 @@ class VerdictInfo(BaseModel):
     tier: str
     judge_model: str = ""
     user_decision: str = ""
-    resolver_principal_id: str = ""
-    execution_principal_id: str = ""
     latency_ms: int = 0
     created: str
 
@@ -691,48 +679,23 @@ class CreateChannelUserRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class AdminMemorySummary(BaseModel):
+class AdminMemoryInfo(BaseModel):
     memory_id: str
     name: str
     description: str = ""
     type: str
     scope: str
     scope_id: str = ""
-    scope_label: str = ""
+    content: str
     created: str
     updated: str
     last_accessed: str = ""
     access_count: int = 0
 
 
-class AdminMemoryInfo(AdminMemorySummary):
-    content: str
-
-
 class ListAdminMemoriesResponse(BaseModel):
-    memories: list[AdminMemorySummary]
+    memories: list[AdminMemoryInfo]
     total: int = 0
-
-
-class UpdateMemoryDescriptionRequest(BaseModel):
-    description: str = Field(min_length=1, max_length=512)
-
-    @field_validator("description", mode="before")
-    @classmethod
-    def _normalize_description(cls, value: object) -> str:
-        from turnstone.core.memory_index import normalize_memory_description
-
-        return normalize_memory_description(value)
-
-
-class MemoryIndexHealthResponse(BaseModel):
-    budget_chars: int
-    over_budget: bool
-    max_char_count: int
-    max_entry_count: int
-    over_by_chars: int
-    invalid_description_count: int
-    envelope_count: int
 
 
 # ---------------------------------------------------------------------------
@@ -1545,16 +1508,6 @@ class CoordinatorSendRequest(BaseModel):
     """Body for POST /v1/api/workstreams/{ws_id}/send."""
 
     message: str = Field(description="User message to queue onto the coordinator's worker.")
-    client_send_id: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=128,
-        pattern=r"^[A-Za-z0-9_-]+$",
-        description=(
-            "Opaque browser correlation token echoed in the accepted `user_turn` "
-            "event and history row. It is not an idempotency key."
-        ),
-    )
     attachment_ids: list[str] | None = Field(
         default=None,
         description=(
@@ -1605,16 +1558,13 @@ class CoordinatorApproveRequest(BaseModel):
     approved: bool = Field(description="True approves the pending tool call(s); False denies.")
     feedback: str | None = Field(
         default=None,
-        description=(
-            "Optional feedback forwarded under the initiating execution principal; "
-            "authorized peer resolvers must omit it."
-        ),
+        description="Optional human feedback string forwarded to the model.",
     )
     always: bool = Field(
         default=False,
         description=(
-            "For a same-principal approval, adds the pending tool name(s) to that "
-            "execution principal's auto-approve set. Authorized peers cannot set it."
+            "When approved=True, also adds the pending tool name(s) to the session's "
+            "auto-approve set so subsequent calls of the same tool skip the prompt."
         ),
     )
     cycle_id: str | None = Field(
@@ -1786,8 +1736,7 @@ class ClusterWsDetailResponse(BaseModel):
     live: dict[str, Any] | None = Field(
         default=None,
         description=(
-            "Live in-flight counters and sanitized durable-history status "
-            "(state, tokens, activity, pending_approval, persistence_state) when "
+            "Live in-flight counters (state, tokens, activity, pending_approval) when "
             "the owning node returns them; null on degrade."
         ),
     )

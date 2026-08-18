@@ -95,7 +95,6 @@ NUDGE_CELLS: list[dict[str, Any]] = [
             "memory": [
                 {
                     "name": "acme-api-project",
-                    "description": "Acme API repository and deployment context",
                     "type": "reference",
                     "content": (
                         "acme-api: FastAPI service. Repo layout: "
@@ -106,7 +105,6 @@ NUDGE_CELLS: list[dict[str, Any]] = [
                 },
                 {
                     "name": "auth-backend-migration-status",
-                    "description": "Current authentication migration status",
                     "content": (
                         "migrations/007_auth_backend.sql applied on the "
                         "staging replica; auth service suite green "

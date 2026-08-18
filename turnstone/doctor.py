@@ -86,7 +86,6 @@ _RELEVANT_ENV_VARS: tuple[str, ...] = (
     "MODEL",
     "TURNSTONE_HOST_IP",
     "TURNSTONE_CONSOLE_URL",
-    "TURNSTONE_ACME_EXTERNAL_URL",
     "TURNSTONE_SERVER_URL",
     "TURNSTONE_ADVERTISE_URL",
     "TURNSTONE_NODE_ID",
@@ -240,37 +239,20 @@ def _reject_option(value: str) -> str | None:
 def _assert_safe_http_url(url: str) -> None:
     """Reject a model-supplied URL that isn't safe to fetch from this host.
 
-    Restricts the scheme to http/https (no ``file://``/``ftp://``) and refuses
-    the NEVER lane — cloud metadata and link-local/multicast/reserved space —
+    Restricts the scheme to http/https (no ``file://``/``ftp://``) and blocks the
+    cloud link-local metadata range (``169.254.0.0/16`` / ``metadata.google.internal``)
     so an LLM-driven probe can't be steered at the instance-metadata service.
-    Loopback and private cluster IPs stay allowed: probing
-    ``http://localhost:PORT/health`` and private node URLs is the job, so this
-    guard accepts the PRIVATE lane where the fetch tools gate it behind an
-    operator opt-in. Raises ``ValueError`` when the URL is unsafe. Shared by
-    every tool that fetches a model-supplied URL (``http_health``,
-    ``node_health``, ``check_llm_backend``).
-
-    Classification goes through :mod:`turnstone.core.ip_classify`, which
-    RESOLVES the hostname. The previous ``host.startswith("169.254.")`` string
-    test never resolved, so any DNS name pointing at the metadata service — or
-    any IPv6 transition address wrapping it, e.g.
-    ``::ffff:169.254.169.254`` — walked straight through.
+    Loopback and private cluster IPs stay allowed — probing
+    ``http://localhost:PORT/health`` and private node URLs is the job. Raises
+    ``ValueError`` when the URL is unsafe. Shared by every tool that fetches a
+    model-supplied URL (``http_health``, ``node_health``, ``check_llm_backend``).
     """
-    from turnstone.core.ip_classify import AddressLane
-    from turnstone.core.web import screen_url
-
-    try:
-        parts = urllib.parse.urlsplit(url)
-    except ValueError as exc:
-        raise ValueError(f"refusing malformed URL: {url!r}") from exc
+    parts = urllib.parse.urlsplit(url)
     if parts.scheme not in ("http", "https"):
         raise ValueError(f"refusing non-http(s) URL: {url!r}")
-    # One screen, shared with the fetch tools: parse, resolve, classify, fold.
-    # This guard accepts the PRIVATE lane where they gate it behind an operator
-    # opt-in — probing a private node URL is the job — so only NEVER refuses.
-    screen = screen_url(url)
-    if screen.lane is AddressLane.NEVER:
-        raise ValueError(f"refusing unsafe URL: {screen.error}")
+    host = (parts.hostname or "").lower()
+    if host.startswith("169.254.") or host == "metadata.google.internal":
+        raise ValueError(f"refusing link-local/metadata host: {host!r}")
 
 
 def _http_get_json(url: str, timeout: float = 5.0) -> Any:

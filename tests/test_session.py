@@ -8,7 +8,7 @@ import threading
 import time
 from types import SimpleNamespace
 from typing import Any, ClassVar
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -16,7 +16,6 @@ from tests._oidc_test_helpers import keyed_app_state
 from tests._session_helpers import (
     FakeAnthropicBlock,
     as_stream,
-    make_registered_session,
     make_result,
     make_session,
     mock_completion_result,
@@ -30,13 +29,7 @@ from turnstone.core.model_turn import (
     provider_extra_params,
     serialized_tool_chars,
 )
-from turnstone.core.session import (
-    _IMAGE_EXTENSIONS,
-    _IMAGE_SIZE_CAP,
-    _MEMORY_MIXED_BATCH_ERROR,
-    ChatSession,
-)
-from turnstone.core.storage import get_storage
+from turnstone.core.session import _IMAGE_EXTENSIONS, _IMAGE_SIZE_CAP, ChatSession
 from turnstone.core.trajectory import (
     Role,
     Turn,
@@ -128,38 +121,6 @@ def _make_session(
     return make_session(
         client=mock_openai_client or MagicMock(), instructions=instructions, **kwargs
     )
-
-
-def _make_registered_session(
-    mock_openai_client=None,
-    instructions=None,
-    **kwargs,
-):
-    """Build the durable variant for first-request admission tests."""
-    kwargs.setdefault("ui", NullUI())
-    return make_registered_session(
-        client=mock_openai_client or MagicMock(), instructions=instructions, **kwargs
-    )
-
-
-def _bind_mock_storage(session: ChatSession) -> MagicMock:
-    """Install a mocked process-global backend for storage-boundary tests."""
-    from turnstone.core.storage import _registry
-
-    storage = MagicMock()
-    storage.list_default_templates.return_value = []
-    storage.get_memory_index_snapshot.return_value = None
-    _registry._storage = storage
-    return storage
-
-
-def _execute_prepared_tool(
-    session: ChatSession,
-    item: dict[str, Any],
-) -> tuple[str, str | list[dict[str, Any]]]:
-    """Mirror the dispatch boundary for tests that call a preparer directly."""
-    item.setdefault("_principal_id", session._tool_prepare_principal_id())
-    return item["execute"](item)
 
 
 @contextlib.contextmanager
@@ -306,9 +267,6 @@ class TestSkillCommand:
     ):
         session = ChatSession.__new__(ChatSession)
         session._skill_name = "alpha"
-        session._acting_user_id = ""
-        session._mcp_user_id = ""
-        session._user_id = ""
         session.messages = [turn_from_dict({"role": "user", "content": "prior work"})]
         session._msg_tokens = [2]
         session._chars_per_token = 4.0
@@ -316,32 +274,12 @@ class TestSkillCommand:
         session.ui = MagicMock()
         session.ui.on_system_turn.return_value = None
         session._ui_event_id = MagicMock(return_value=None)
-        session._history_handoff_lock = threading.RLock()
-        session._history_visibility_lock = threading.RLock()
-        session._generation_lock = threading.RLock()
-        # Lifecycle admission fields, seeded exactly as ``__init__`` builds
-        # them: the commit/publish guards read them directly, so a double
-        # missing them would fail the admission rather than skip it.
-        session._history_truncation_condition = threading.Condition(session._generation_lock)
-        session._history_truncation_active = False
-        session._soft_close_preparing = False
-        session._tool_structural_debt = None
-        session._publication_shutdown = False
-        session._cancel_event = threading.Event()
-        session._durability_cond = threading.Condition(threading.Lock())
-        session._durability_next_ticket = 0
-        session._durability_serving_ticket = 0
-        session._pending_conversation_commits = {}
-        session._history_handoff_revision = 0
-        session._conversation_persistence_error = None
-        session._conversation_persistence_failure_kind = None
-        session._conversation_persistence_next_retry_at = None
         session.set_skill = MagicMock(
             side_effect=lambda name: setattr(session, "_skill_name", name)
         )
 
         with (
-            patch.object(session, "_get_skill_by_name", return_value=skill),
+            patch("turnstone.core.session.get_skill_by_name", return_value=skill),
             patch("turnstone.core.session.save_message") as save_message,
         ):
             session.handle_command(command)
@@ -494,20 +432,12 @@ class TestTaskExec:
             "func_name": "task_agent",
             "needs_approval": True,
             "execute": execute,
-            "_needs_origin_context": True,
-            "_requires_fresh_system_prefix": True,
         }
-
-        def prepare(_tool_call):
-            seen["prepare"] = session._tool_prepare_principal_id()
-            return item
-
         judge = MagicMock(side_effect=evaluate_intent)
         with (
-            patch.object(session, "_safe_prepare_tool", side_effect=prepare),
+            patch.object(session, "_safe_prepare_tool", return_value=item),
             patch.object(session, "_evaluate_intent", judge),
             patch.object(session.ui, "approve_tools", side_effect=approve_tools),
-            patch.object(session, "_ensure_system_prefix_fresh") as ensure_system_prefix,
         ):
             session._execute_tools(
                 [{"id": "c1", "function": {"name": "task_agent", "arguments": "{}"}}],
@@ -515,14 +445,9 @@ class TestTaskExec:
                 my_generation=generation,
             )
 
-        assert seen["prepare"] == "user-a"
         assert seen["worker"] == "user-a"
         assert seen["generation"] == generation
         assert seen["event"] is generation_event
-        ensure_system_prefix.assert_called_once_with(
-            principal_id="user-a",
-            origin_generation=generation,
-        )
         assert judge.call_args.kwargs["principal_id"] == "user-a"
         assert seen["execution_item"] is not item
         approval_witness = seen["approval_item"]["_approval_cancel_witness"]
@@ -547,7 +472,7 @@ class TestTaskExec:
             "name": "research",
             "content": "# Research Skill\nws={{ws_id}} model={{model}} node={{node_id}}",
         }
-        with patch.object(session, "_get_skill_by_name", return_value=skill):
+        with patch("turnstone.core.session.get_skill_by_name", return_value=skill):
             item = session._prepare_task("c1", {"prompt": "investigate X", "skill": "research"})
 
         # Item carries the minimized projection — name/content/risk_level only.
@@ -598,39 +523,6 @@ class TestTaskExec:
         assert len(turns) == 2
         assert turns[-1].text == "do x"
 
-    def test_default_production_task_lane_suppresses_parent_memory_index(self, tmp_db) -> None:
-        from turnstone.core.memory import save_structured_memory_strict
-
-        session = _make_registered_session(ws_id="task-no-memory", user_id="owner")
-        save_structured_memory_strict(
-            "parent_only_fact",
-            "body",
-            description="Parent-only metadata",
-        )
-        generation = session._claim_generation(principal_id="owner")
-        session._memory_index_admission_generation = generation
-        session._admit_memory_index_request(
-            session._primary_lane(),
-            my_generation=generation,
-            principal_id="owner",
-        )
-        assert "parent_only_fact" in session.system_messages[0]["content"]
-
-        item = session._prepare_task("c1", {"prompt": "do x"})
-        captured: dict[str, Any] = {}
-
-        def fake_run_agent(messages, **kwargs):
-            captured["messages"] = list(messages)
-            captured["tools"] = kwargs["tools"]
-            return "done"
-
-        with patch.object(session, "_run_agent", side_effect=fake_run_agent):
-            session._exec_task(item)
-
-        assert "memory" not in {tool["function"]["name"] for tool in captured["tools"]}
-        assert "parent_only_fact" not in str(captured["messages"])
-        assert "<memory-index" not in str(captured["messages"])
-
     def test_persona_sets_identity_skill_stays_capability(self, tmp_db) -> None:
         """persona= sets the sub-agent identity (base prompt) in place of the
         default; a skill passed alongside stays a capability turn."""
@@ -647,9 +539,10 @@ class TestTaskExec:
         }
         skill = {"name": "research", "content": "# Research Skill"}
         with (
-            patch.object(session, "_get_skill_by_name", return_value=skill),
-            patch.object(get_storage(), "get_persona_by_name", return_value=persona_row),
+            patch("turnstone.core.session.get_skill_by_name", return_value=skill),
+            patch("turnstone.core.session.get_storage") as gs,
         ):
+            gs.return_value.get_persona_by_name.return_value = persona_row
             item = session._prepare_task(
                 "c1", {"prompt": "do x", "skill": "research", "persona": "engineer"}
             )
@@ -673,7 +566,8 @@ class TestTaskExec:
     def test_unknown_persona_returns_error(self, tmp_db) -> None:
         """Unknown persona name → clean error item, no approval."""
         session = _make_session()
-        with patch.object(get_storage(), "get_persona_by_name", return_value=None):
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_persona_by_name.return_value = None
             item = session._prepare_task("c1", {"prompt": "do x", "persona": "ghost"})
         assert item.get("needs_approval") is False
         assert "ghost" in item["error"]
@@ -692,7 +586,8 @@ class TestTaskExec:
             "enabled": True,
             "applies_to_kinds": ["coordinator"],
         }
-        with patch.object(get_storage(), "get_persona_by_name", return_value=coord_row):
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_persona_by_name.return_value = coord_row
             item = session._prepare_task("c1", {"prompt": "do x", "persona": "orchestrator"})
         assert item.get("needs_approval") is False
         assert "interactive" in item["error"]
@@ -717,7 +612,8 @@ class TestTaskExec:
             "enabled": True,
             "applies_to_kinds": ["interactive"],
         }
-        with patch.object(get_storage(), "get_persona_by_name", return_value=persona_row):
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_persona_by_name.return_value = persona_row
             item = session._prepare_task("c1", {"prompt": "edit auth", "persona": "readonly"})
         assert item["persona_tools"] == frozenset({"read_file", "search"})
 
@@ -805,7 +701,8 @@ class TestTaskExec:
             "enabled": True,
             "applies_to_kinds": ["interactive"],
         }
-        with patch.object(get_storage(), "get_persona_by_name", return_value=persona_row):
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_persona_by_name.return_value = persona_row
             item = session._prepare_task("c1", {"prompt": "do x", "persona": "sandboxed"})
         assert item["persona_mcp"] is False
         assert item["persona_tools"] is None
@@ -821,70 +718,40 @@ class TestTaskExec:
         # MCP tools shed; native read_file kept.
         assert {t["function"]["name"] for t in captured["tools"]} == {"read_file"}
 
-    @pytest.mark.parametrize("persona_memory", [False, True])
-    def test_task_agent_never_receives_parent_memory_capability(
-        self, tmp_db, persona_memory
-    ) -> None:
-        """The production task lane has no memory in 1.8. A child persona
-        cannot add it by enabling memory or naming it in an exact allowlist,
-        and prompt rendering follows that final envelope."""
-        from turnstone.core.memory import save_structured_memory_strict
-        from turnstone.core.storage import get_storage
-
-        get_storage().create_project("child-project", "Child Project", "owner")
-        session = _make_registered_session(
-            user_id="owner",
-            project_id="child-project",
-        )
+    def test_child_persona_memory_off_drops_memory_tool(self, tmp_db) -> None:
+        """A child persona with memory_enabled=False drops the memory tool from
+        the sub-agent's hands (lever 4), matching a main session under the same
+        persona (whole-PR review fix)."""
+        session = _make_session()
         session._tool_search = None
-        assert "memory" not in {tool["function"]["name"] for tool in session._task_tools}
-        save_structured_memory_strict(
-            "private_parent_hook",
-            "body",
-            description="Parent memory metadata",
-            scope="global",
-        )
-        generation = session._claim_generation(principal_id="owner")
-        session._memory_index_admission_generation = generation
-        session._admit_memory_index_request(
-            session._primary_lane(),
-            my_generation=generation,
-            principal_id="owner",
-        )
-        assert "private_parent_hook" in str(
-            session._agent_system_messages_for_capabilities(frozenset({"memory"}))
-        )
+        session._task_tools = [
+            {"function": {"name": "read_file"}},
+            {"function": {"name": "memory"}},
+        ]
         persona_row = {
             "name": "nomem",
             "base_prompt": "# No memory",
             "base_prompt_file": None,
-            "tool_allowlist": ["read_file", "memory"],
+            "tool_allowlist": None,
             "mcp_enabled": True,
-            "memory_enabled": persona_memory,
+            "memory_enabled": False,
             "enabled": True,
             "applies_to_kinds": ["interactive"],
         }
-        with patch.object(get_storage(), "get_persona_by_name", return_value=persona_row):
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_persona_by_name.return_value = persona_row
             item = session._prepare_task("c1", {"prompt": "do x", "persona": "nomem"})
-        assert item["persona_memory"] is persona_memory
+        assert item["persona_memory"] is False
 
         captured: dict = {}
 
         def fake_run_agent(messages, **kwargs):
-            captured["messages"] = messages
             captured.update(kwargs)
             return "done"
 
         with patch.object(session, "_run_agent", side_effect=fake_run_agent):
             session._exec_task(item)
-        tool_names = {t["function"]["name"] for t in captured["tools"]}
-        assert tool_names <= {"read_file"}
-        assert "memory" not in tool_names
-        assert "private_parent_hook" not in str(captured["messages"])
-        assert "<memory-index" not in str(captured["messages"])
-        assert "Live memory pointers" not in str(captured["messages"])
-        assert "memory(action='get')" not in str(captured["messages"])
-        assert "Child Project (id: child-project)" in str(captured["messages"])
+        assert {t["function"]["name"] for t in captured["tools"]} == {"read_file"}
 
     def test_evaluate_intent_projects_persona_for_task_agent(self, tmp_db, monkeypatch) -> None:
         """Judge/audit projection includes the persona name (review fix): a
@@ -908,7 +775,8 @@ class TestTaskExec:
             "enabled": True,
             "applies_to_kinds": ["interactive"],
         }
-        with patch.object(get_storage(), "get_persona_by_name", return_value=persona_row):
+        with patch("turnstone.core.session.get_storage") as gs:
+            gs.return_value.get_persona_by_name.return_value = persona_row
             item = session._prepare_task("c1", {"prompt": "do x", "persona": "engineer"})
         session._evaluate_intent([item])
         assert item["func_args"]["persona"] == "engineer"
@@ -934,7 +802,7 @@ class TestTaskExec:
         Skill validation lives in _prepare_task so an LLM passing a
         bogus name fails fast at approval time rather than at exec."""
         session = _make_session()
-        with patch.object(session, "_get_skill_by_name", return_value=None):
+        with patch("turnstone.core.session.get_skill_by_name", return_value=None):
             item = session._prepare_task("c1", {"prompt": "do x", "skill": "ghost"})
         assert item.get("needs_approval") is False
         assert "unknown skill 'ghost'" in item["error"]
@@ -951,7 +819,7 @@ class TestTaskExec:
             "content": "# Retired",
             "enabled": False,
         }
-        with patch.object(session, "_get_skill_by_name", return_value=disabled_skill):
+        with patch("turnstone.core.session.get_skill_by_name", return_value=disabled_skill):
             item = session._prepare_task("c1", {"prompt": "do x", "skill": "retired"})
         assert item.get("needs_approval") is False
         assert "is disabled" in item["error"]
@@ -971,7 +839,7 @@ class TestTaskExec:
             "enabled": True,
             "risk_level": "critical",
         }
-        with patch.object(session, "_get_skill_by_name", return_value=risky_skill):
+        with patch("turnstone.core.session.get_skill_by_name", return_value=risky_skill):
             item = session._prepare_task("c1", {"prompt": "do x", "skill": "danger"})
         assert item.get("needs_approval") is False
         assert "principal-load-only" in item["header"]
@@ -991,7 +859,7 @@ class TestTaskExec:
             "enabled": True,
             "risk_level": "low",
         }
-        with patch.object(session, "_get_skill_by_name", return_value=ok_skill):
+        with patch("turnstone.core.session.get_skill_by_name", return_value=ok_skill):
             item = session._prepare_task("c1", {"prompt": "do x", "skill": "research"})
         assert "skill: research" in item["header"]
         assert "risk:" not in item["header"]
@@ -1012,7 +880,7 @@ class TestTaskExec:
         monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
 
         skill = {"name": "research", "content": "# Research", "enabled": True}
-        with patch.object(session, "_get_skill_by_name", return_value=skill):
+        with patch("turnstone.core.session.get_skill_by_name", return_value=skill):
             item = session._prepare_task("c1", {"prompt": "investigate X", "skill": "research"})
         session._evaluate_intent([item])
 
@@ -1075,37 +943,6 @@ class TestTaskExec:
         callback_b(fake_verdict)
         session.ui.on_intent_verdict.assert_called_once()
         session.ui.on_superseded_intent_verdict.assert_called_once()  # unchanged
-
-    def test_evaluate_intent_stamps_execution_principal_on_judge_verdict(
-        self, tmp_db, monkeypatch
-    ) -> None:
-        session = _make_session(user_id="owner")
-        session.ui.on_intent_verdict = MagicMock()
-        fake_verdict = MagicMock()
-        fake_verdict.to_dict.return_value = {
-            "verdict_id": "v0",
-            "call_id": "c1",
-            "tier": "llm",
-        }
-        captured: list[Any] = []
-        fake_judge = MagicMock()
-        fake_judge.evaluate.side_effect = lambda items, *_a, **kw: (
-            captured.append(kw.get("callback")) or [fake_verdict] * len(items)
-        )
-        monkeypatch.setattr(session, "_ensure_judge", lambda: fake_judge)
-
-        item = {"call_id": "c1", "func_name": "bash", "needs_approval": True}
-        session._evaluate_intent([item], principal_id="alice")
-        captured[0](fake_verdict)
-
-        session.ui.on_intent_verdict.assert_called_once_with(
-            {
-                "verdict_id": "v0",
-                "call_id": "c1",
-                "tier": "llm",
-                "execution_principal_id": "alice",
-            }
-        )
 
     def test_superseded_verdict_skips_persist_on_display_only_ui(self, tmp_db, monkeypatch) -> None:
         """Display-only UIs (CLI / eval) don't define the persist-only hook;
@@ -2863,7 +2700,6 @@ class TestTitleRetry:
     def test_delayed_title_uses_scheduling_principal(self, tmp_db) -> None:
         """A shared-workstream handoff cannot lend B's OBO token to A's title."""
         session = _make_session()
-        storage = _bind_mock_storage(session)
         session._title_generated = True
         session.messages = turns_from_dicts([{"role": "user", "content": "Hello"}])
         session._acting_user_id = "user-a"
@@ -2884,7 +2720,7 @@ class TestTitleRetry:
 
         with (
             patch.object(session, "_utility_completion", side_effect=delayed_completion),
-            patch.object(storage, "update_workstream_title"),
+            patch("turnstone.core.session.update_workstream_title"),
         ):
             worker = threading.Thread(
                 target=session._generate_title,
@@ -2907,7 +2743,6 @@ class TestTitleRetry:
         from turnstone.core.providers._protocol import ModelCapabilities
 
         session = _make_session()
-        _bind_mock_storage(session)
         session._title_generated = True
         session.messages = turns_from_dicts(
             [
@@ -2928,7 +2763,6 @@ class TestTitleRetry:
         from turnstone.core.providers._protocol import ModelCapabilities
 
         session = _make_session()
-        storage = _bind_mock_storage(session)
         session._title_generated = True
         session.messages = turns_from_dicts(
             [
@@ -2942,7 +2776,7 @@ class TestTitleRetry:
         provider.create_streaming.return_value = as_stream(result)
         replace_session_lane(session, provider=provider, capabilities=ModelCapabilities())
 
-        with patch.object(storage, "update_workstream_title"):
+        with patch("turnstone.core.session.update_workstream_title"):
             session._generate_title()
 
         # Flag stays True after successful generation
@@ -2960,7 +2794,6 @@ class TestTitleRetry:
         from turnstone.core.session import _TITLE_MAX_TOKENS
 
         session = _make_session()
-        storage = _bind_mock_storage(session)
         session._title_generated = True
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
         result = mock_completion_result()
@@ -2973,9 +2806,8 @@ class TestTitleRetry:
         replace_session_lane(session, provider=provider, capabilities=ModelCapabilities())
 
         captured: dict[str, str] = {}
-        with patch.object(
-            storage,
-            "update_workstream_title",
+        with patch(
+            "turnstone.core.session.update_workstream_title",
             side_effect=lambda ws_id, title: captured.update(title=title),
         ):
             session._generate_title()
@@ -2996,7 +2828,6 @@ class TestTitleRetry:
         from turnstone.core.providers._protocol import ModelCapabilities
 
         session = _make_session()
-        storage = _bind_mock_storage(session)
         session._title_generated = True
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
         result = mock_completion_result()
@@ -3005,7 +2836,7 @@ class TestTitleRetry:
         provider.create_streaming.return_value = as_stream(result)
         replace_session_lane(session, provider=provider, capabilities=ModelCapabilities())
 
-        with patch.object(storage, "update_workstream_title") as upd:
+        with patch("turnstone.core.session.update_workstream_title") as upd:
             session._generate_title()
 
         upd.assert_not_called()
@@ -3051,7 +2882,6 @@ class TestTitleRetry:
         ]
         for content, expected in cases:
             session = _make_session()
-            storage = _bind_mock_storage(session)
             session._title_generated = True
             session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
             result = mock_completion_result()
@@ -3061,9 +2891,8 @@ class TestTitleRetry:
             replace_session_lane(session, provider=provider, capabilities=ModelCapabilities())
 
             captured: dict[str, str] = {}
-            with patch.object(
-                storage,
-                "update_workstream_title",
+            with patch(
+                "turnstone.core.session.update_workstream_title",
                 side_effect=lambda ws_id, title, _c=captured: _c.update(title=title),
             ):
                 session._generate_title()
@@ -3081,7 +2910,6 @@ class TestTitleRetry:
         from turnstone.core.providers._protocol import ModelCapabilities
 
         session = _make_session()
-        storage = _bind_mock_storage(session)
         session._title_generated = True
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
         result = mock_completion_result()
@@ -3099,9 +2927,8 @@ class TestTitleRetry:
         replace_session_lane(session, provider=provider, capabilities=ModelCapabilities())
 
         captured: dict[str, str] = {}
-        with patch.object(
-            storage,
-            "update_workstream_title",
+        with patch(
+            "turnstone.core.session.update_workstream_title",
             side_effect=lambda ws_id, title: captured.update(title=title),
         ):
             session._generate_title()
@@ -3116,7 +2943,6 @@ class TestTitleRetry:
         from turnstone.core.providers._protocol import ModelCapabilities
 
         session = _make_session()
-        storage = _bind_mock_storage(session)
         session._title_generated = True
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
         result = mock_completion_result()
@@ -3131,9 +2957,8 @@ class TestTitleRetry:
         )
 
         captured: dict[str, str] = {}
-        with patch.object(
-            storage,
-            "update_workstream_title",
+        with patch(
+            "turnstone.core.session.update_workstream_title",
             side_effect=lambda ws_id, title: captured.update(title=title),
         ):
             session._generate_title()
@@ -3150,7 +2975,6 @@ class TestTitleRetry:
         from turnstone.core.session import _TITLE_MAX_CHARS
 
         session = _make_session()
-        storage = _bind_mock_storage(session)
         session._title_generated = True
         session.messages = turns_from_dicts([{"role": "user", "content": "hi"}])
         result = mock_completion_result()
@@ -3160,9 +2984,8 @@ class TestTitleRetry:
         replace_session_lane(session, provider=provider, capabilities=ModelCapabilities())
 
         captured: dict[str, str] = {}
-        with patch.object(
-            storage,
-            "update_workstream_title",
+        with patch(
+            "turnstone.core.session.update_workstream_title",
             side_effect=lambda ws_id, title: captured.update(title=title),
         ):
             session._generate_title()
@@ -3173,7 +2996,6 @@ class TestTitleRetry:
         from turnstone.core.providers._protocol import ModelCapabilities
 
         session = _make_session()
-        storage = _bind_mock_storage(session)
         session._title_generated = True
         session.messages = turns_from_dicts(
             [
@@ -3195,7 +3017,7 @@ class TestTitleRetry:
 
         provider.create_streaming.side_effect = _change_ws_id
 
-        with patch.object(storage, "update_workstream_title") as mock_update:
+        with patch("turnstone.core.session.update_workstream_title") as mock_update:
             session._generate_title()
 
         # Title should NOT be applied to the new workstream
@@ -3288,13 +3110,10 @@ class TestLiveConfigUpdate:
 
         # Default: relevance_k=5
         assert session._mem_cfg.relevance_k == 5
-        assert session._mem_cfg.model_index_over_budget_notice is False
 
         # Admin changes the setting
         cs.set("memory.relevance_k", 10, changed_by="test")
         assert session._mem_cfg.relevance_k == 10
-        cs.set("memory.model_index_over_budget_notice", True, changed_by="test")
-        assert session._mem_cfg.model_index_over_budget_notice is True
 
     def test_judge_config_reads_from_config_store(self, tmp_db):
         """_judge_cfg returns live behavioral flags from ConfigStore."""
@@ -3551,7 +3370,7 @@ class TestAgentOutputGuard:
             {"content": "Done"},
         )
         client.chat.completions.create = create
-        base = session._agent_system_messages_for_capabilities(frozenset({"memory"}))[0]["content"]
+        base = session._agent_system_messages[0]["content"]
 
         def fake_prepare(tc_dict, **_kwargs):
             return {
@@ -3827,145 +3646,6 @@ class TestAgentOutputGuard:
             assert synth_args[0].startswith("agent_synth_task_")
             assert synth_args[1] == forced
             assert synth_args[2] == "task_agent_synthesis"
-
-
-class TestAgentContextReporting:
-    """A task agent reports normalized prompt usage after every model turn."""
-
-    class _ContextUI(NullUI):
-        def __init__(self) -> None:
-            self.context_calls: list[dict[str, Any]] = []
-
-        def on_agent_context(
-            self,
-            parent_call_id: str,
-            prompt_tokens: int,
-            context_window: int,
-            *,
-            generation: int = 0,
-        ) -> None:
-            self.context_calls.append(
-                {
-                    "parent_call_id": parent_call_id,
-                    "prompt_tokens": prompt_tokens,
-                    "context_window": context_window,
-                    "generation": generation,
-                }
-            )
-
-    def test_usage_uses_resolved_lane_context_window(self) -> None:
-        from turnstone.core.providers import UsageInfo
-
-        ui = self._ContextUI()
-        session = _make_session(ui=ui)
-        result = make_result(
-            "done",
-            usage=UsageInfo(prompt_tokens=41_000, completion_tokens=900, total_tokens=41_900),
-        )
-
-        with (
-            patch.object(session, "_context_window_for_lane", return_value=128_000) as window,
-            patch("turnstone.core.session.model_turn", return_value=result),
-        ):
-            output = session._run_agent(
-                [Turn.user("test")],
-                tools=[],
-                auto_tools=set(),
-                parent_call_id="task-A",
-            )
-
-        assert output == "done"
-        window.assert_called_once()
-        assert ui.context_calls == [
-            {
-                "parent_call_id": "task-A",
-                "prompt_tokens": 41_000,
-                "context_window": 128_000,
-                "generation": 0,
-            }
-        ]
-
-    def test_missing_usage_emits_no_context_event(self) -> None:
-        ui = self._ContextUI()
-        session = _make_session(ui=ui)
-
-        with patch("turnstone.core.session.model_turn", return_value=make_result("done")):
-            session._run_agent(
-                [Turn.user("test")],
-                tools=[],
-                auto_tools=set(),
-                parent_call_id="task-A",
-            )
-
-        assert ui.context_calls == []
-
-    def test_unparented_agent_does_not_compute_or_emit_badge_usage(self) -> None:
-        from turnstone.core.providers import UsageInfo
-
-        ui = self._ContextUI()
-        session = _make_session(ui=ui)
-        result = make_result(
-            "done",
-            usage=UsageInfo(prompt_tokens=10, completion_tokens=2, total_tokens=12),
-        )
-
-        with (
-            patch.object(session, "_context_window_for_lane") as window,
-            patch("turnstone.core.session.model_turn", return_value=result),
-        ):
-            session._run_agent([Turn.user("test")], tools=[], auto_tools=set())
-
-        window.assert_not_called()
-        assert ui.context_calls == []
-
-    def test_superseded_generation_cannot_publish_context(self) -> None:
-        from turnstone.core.providers import UsageInfo
-        from turnstone.core.session import GenerationCancelled
-
-        ui = self._ContextUI()
-        session = _make_session(ui=ui)
-        generation = session._claim_generation()
-        result = make_result(
-            "stale",
-            usage=UsageInfo(prompt_tokens=80, completion_tokens=2, total_tokens=82),
-        )
-
-        def supersede(*_args: Any, **_kwargs: Any) -> ModelTurnResult:
-            session._claim_generation()
-            return result
-
-        with (
-            patch.object(session, "_context_window_for_lane", return_value=100),
-            patch("turnstone.core.session.model_turn", side_effect=supersede),
-            pytest.raises(GenerationCancelled),
-        ):
-            session._run_agent(
-                [Turn.user("test")],
-                tools=[],
-                auto_tools=set(),
-                parent_call_id="task-A",
-                origin_generation=generation,
-            )
-
-        assert ui.context_calls == []
-
-    def test_force_abandon_immediately_purges_retired_context(self) -> None:
-        from turnstone.core.session_ui_base import SessionUIBase
-
-        ui = SessionUIBase(ws_id="ws-agent-context")
-        session = _make_session(ui=ui)
-        generation = session._claim_generation()
-        ui.on_agent_context("task-old", 80, 100, generation=generation)
-
-        abandoned, persistence_error = session.force_abandon_generation(
-            target_is_current=lambda: True,
-            clear_target=lambda: True,
-            publish_abandoned=lambda: None,
-        )
-
-        assert abandoned is True
-        assert persistence_error is None
-        assert ui._snapshot_agent_contexts() == []
 
 
 class TestAgentChildRegistration:
@@ -4767,7 +4447,7 @@ class TestReadFilesIsolation:
         # agent can edit a file the parent read for it, without leaking mid-run
         # to a sibling) and merges the agent's own reads back on completion.
         session = _make_session()
-        session._agent_prompt_components = ()
+        session._agent_system_messages = []
         session._task_tools = []
         session._read_files.add("/parent/read")
         seen = {}
@@ -4849,13 +4529,12 @@ class TestExecTaskReporting:
 
     def _bare_session(self):
         session = _make_session()
-        session._agent_prompt_components = ()
+        session._agent_system_messages = []
         session._task_tools = []
         return session
 
     def test_success_reports_result(self):
         session = self._bare_session()
-        session.ui.clear_agent_context = MagicMock()
         with (
             patch.object(session, "_run_agent", return_value="the synthesis"),
             patch.object(session, "_report_tool_result") as rpt,
@@ -4863,43 +4542,6 @@ class TestExecTaskReporting:
             cid, out = session._exec_task({"call_id": "t1", "prompt": "go"})
         assert (cid, out) == ("t1", "the synthesis")
         rpt.assert_called_once_with("t1", "task_agent", "the synthesis")
-        assert session.ui.clear_agent_context.call_args_list == [
-            call("t1", generation=0),
-            call("t1", generation=0),
-        ]
-
-    def test_terminal_clear_precedes_subscriber_snapshot_and_result(self):
-        from turnstone.core.session_ui_base import SessionUIBase
-
-        ui = SessionUIBase(ws_id="ws-agent-terminal-order")
-        session = _make_session(ui=ui)
-        session._agent_prompt_components = ()
-        session._task_tools = []
-        generation = session._claim_generation()
-        ui.on_agent_context("t1", 80, 100, generation=generation)
-        observed: dict[str, Any] = {}
-
-        def report(call_id, name, output, **kwargs):
-            listener, snapshot = ui.register_listener_with_in_progress_snapshot()
-            observed["snapshot"] = snapshot
-            observed["listener"] = listener
-            ui.on_tool_result(call_id, name, output, **kwargs)
-
-        with (
-            patch.object(session, "_run_agent", return_value="the synthesis"),
-            patch.object(session, "_report_tool_result", side_effect=report),
-        ):
-            cid, out = session._exec_task(
-                {
-                    "call_id": "t1",
-                    "prompt": "go",
-                    "_origin_generation": generation,
-                }
-            )
-
-        assert (cid, out) == ("t1", "the synthesis")
-        assert observed["snapshot"]["agent_contexts"] == []
-        assert observed["listener"].get_nowait()["type"] == "tool_result"
 
     def test_error_reports_is_error(self):
         session = self._bare_session()
@@ -4910,28 +4552,6 @@ class TestExecTaskReporting:
             cid, out = session._exec_task({"call_id": "t1", "prompt": "go"})
         assert out == "Task error: boom"
         rpt.assert_called_once_with("t1", "task_agent", "Task error: boom", is_error=True)
-
-    def test_superseded_task_still_runs_exact_context_cleanup(self):
-        from turnstone.core.session import GenerationCancelled
-
-        session = self._bare_session()
-        generation = session._claim_generation()
-        session.ui.clear_agent_context = MagicMock()
-
-        def supersede(*_args, **_kwargs):
-            session._claim_generation()
-            raise GenerationCancelled()
-
-        with patch.object(session, "_run_agent", side_effect=supersede):
-            session._exec_task(
-                {
-                    "call_id": "t1",
-                    "prompt": "go",
-                    "_origin_generation": generation,
-                }
-            )
-
-        session.ui.clear_agent_context.assert_called_once_with("t1", generation=generation)
 
 
 def _install_output_guard_judge(session: ChatSession, judge: MagicMock) -> None:
@@ -5755,14 +5375,7 @@ class TestBatchEvaluateOutputs:
             try:
                 assert guard_entered.wait(2)
                 session.cancel()
-                abandoned, persistence_error = session.force_abandon_generation(
-                    target_is_current=lambda: True,
-                    clear_target=lambda: True,
-                    publish_abandoned=lambda: None,
-                )
-                assert abandoned is True
-                assert persistence_error is None
-                successor_generation = session._generation
+                successor_generation = session._claim_generation()
 
                 # Install successor-owned state under the same provider call id.
                 # The old guard continuation must neither pop nor persist it.
@@ -5886,6 +5499,7 @@ def test_send_preamble_failure_leaves_no_principal_or_attachment_cache() -> None
     """Send-owned identity/cache state begins only inside its cleanup bracket."""
     session = _make_session()
     session._title_generated = True
+    session._system_composed_with_context = False
 
     with (
         _send_with_mocks(session, [], lambda _calls: ([], None)),
@@ -5926,8 +5540,8 @@ class TestCompletedModelResultPublication:
         successor's handle while it unwinds.
         """
         session = _make_session()
-        storage = _bind_mock_storage(session)
         session._title_generated = True
+        session._system_composed_with_context = True
         session._last_usage = {"prompt_tokens": 41, "completion_tokens": 7}
         session._chars_per_token = 3.25
         session._system_tokens = 13
@@ -5986,7 +5600,7 @@ class TestCompletedModelResultPublication:
                 "_print_status_line",
                 wraps=session._print_status_line,
             ) as print_status,
-            patch.object(storage, "save_message", return_value=1) as save_message,
+            patch("turnstone.core.session.save_message") as save_message,
         ):
             worker = threading.Thread(target=send_old)
             worker.start()
@@ -6024,14 +5638,14 @@ class TestCompletedModelResultPublication:
     def test_successor_claim_waits_for_entire_completed_result_commit(self, tmp_db) -> None:
         """A successor cannot observe the main result halfway through its fold.
 
-        ``on_turn_committed`` is a useful pre-append midpoint: the accepted
-        stream is finalized while the assistant row, token bookkeeping, and
-        persistence are still pending under the generation lock. A successor
-        driven to that lock must remain blocked until the whole fold completes.
+        ``on_turn_committed`` is a useful midpoint: status and the assistant
+        turn already landed, while assistant token bookkeeping and persistence
+        are still pending.  A successor driven to the generation lock there
+        must remain blocked until those trailing writes complete too.
         """
         session = _make_session()
-        storage = _bind_mock_storage(session)
         session._title_generated = True
+        session._system_composed_with_context = True
         session._last_usage = {"prompt_tokens": 43, "completion_tokens": 7}
         result = make_result(
             "atomic assistant result",
@@ -6083,7 +5697,7 @@ class TestCompletedModelResultPublication:
 
         with (
             patch.object(session, "_stream_response", return_value=result),
-            patch.object(storage, "save_message", return_value=1) as save_message,
+            patch("turnstone.core.session.save_message") as save_message,
         ):
             worker = threading.Thread(target=send_old)
             successor = threading.Thread(
@@ -6095,10 +5709,10 @@ class TestCompletedModelResultPublication:
             try:
                 assert commit_midpoint.wait(2)
                 old_generation = session._generation
-                # Acceptance now blocks before the assistant append, so even
-                # the old owner observes a complete USER-only prefix here.
-                assert len(session.messages) == len(session._msg_tokens)
-                assert [turn.role.value for turn in session.messages] == ["user"]
+                # This is intentionally torn only while the old generation
+                # owns the transaction lock: the assistant turn is visible to
+                # itself, but its token/persistence tail has not run yet.
+                assert len(session.messages) == len(session._msg_tokens) + 1
                 assert [call.args[1] for call in save_message.call_args_list] == ["user"]
                 assert session.ui.on_status.call_count == 1
 
@@ -6552,109 +6166,7 @@ class TestSafePrepareTool:
         assert "RuntimeError" in output
 
 
-class TestToolBatchPolicy:
-    @staticmethod
-    def _tool_calls(count: int) -> list[dict[str, Any]]:
-        return [
-            {
-                "id": f"call_{index}",
-                "function": {"name": "state_tool", "arguments": "{}"},
-            }
-            for index in range(count)
-        ]
-
-    def test_mixed_read_write_batch_is_rejected(self, tmp_db):
-        session = _make_session()
-        executed: list[str] = []
-
-        def execute(item):
-            executed.append(item["call_id"])
-            return item["call_id"], "unexpected"
-
-        items = [
-            {
-                "call_id": "call_0",
-                "func_name": "state_tool",
-                "execute": execute,
-                "needs_approval": False,
-                "_batch_policy": {
-                    "group": "state",
-                    "access": "write",
-                    "mixed_access_error": "Error: state reads and writes cannot run together",
-                    "serialize": True,
-                },
-            },
-            {
-                "call_id": "call_1",
-                "func_name": "state_tool",
-                "execute": execute,
-                "needs_approval": False,
-                "_batch_policy": {
-                    "group": "state",
-                    "access": "read",
-                    "mixed_access_error": "Error: state reads and writes cannot run together",
-                },
-            },
-        ]
-        with (
-            patch.object(session, "_safe_prepare_tool", side_effect=items),
-            patch.object(session.ui, "approve_tools", return_value=(True, None)),
-        ):
-            results, _ = session._execute_tools(self._tool_calls(2))
-
-        assert executed == []
-        assert all("cannot run together" in str(result) for _, result in results)
-
-    def test_write_batch_executes_serially_in_model_order(self, tmp_db):
-        session = _make_session()
-        executed: list[str] = []
-
-        def execute(item):
-            executed.append(item["call_id"])
-            return item["call_id"], "ok"
-
-        items = [
-            {
-                "call_id": f"call_{index}",
-                "func_name": "state_tool",
-                "execute": execute,
-                "needs_approval": False,
-                "_batch_policy": {
-                    "group": "state",
-                    "access": "write",
-                    "mixed_access_error": "Error: mixed state access",
-                    "serialize": True,
-                },
-            }
-            for index in range(2)
-        ]
-        with (
-            patch.object(session, "_safe_prepare_tool", side_effect=items),
-            patch.object(session.ui, "approve_tools", return_value=(True, None)),
-            patch(
-                "turnstone.core.session.concurrent.futures.ThreadPoolExecutor",
-                side_effect=AssertionError("serialized writes must not enter the parallel pool"),
-            ),
-        ):
-            results, _ = session._execute_tools(self._tool_calls(2))
-
-        assert executed == ["call_0", "call_1"]
-        assert [call_id for call_id, _ in results] == executed
-
-
 class TestCoordinatorMemoryScope:
-    @staticmethod
-    def _visible(session: ChatSession) -> list[dict[str, str]]:
-        from turnstone.core.memory import list_visible_structured_memories
-
-        return list_visible_structured_memories(session._visible_scopes())
-
-    @staticmethod
-    def _search(session: ChatSession, query: str) -> list[dict[str, str]]:
-        from turnstone.core.memory import search_visible_structured_memories
-
-        return search_visible_structured_memories(query, session._visible_scopes())
-
     """Verify the ``coordinator`` memory scope's resolution + validation rules.
 
     The coord scope is COORDINATOR-ONLY: only a coordinator session can
@@ -6724,13 +6236,14 @@ class TestCoordinatorMemoryScope:
         )
         err = session._validate_scope("coordinator", "call_1")
         assert err is not None
-        assert "unavailable to this workstream kind" in err["error"]
+        assert err["error"].startswith("Error: 'coordinator' scope is only valid")
 
     def test_validate_rejects_coord_scope_for_child_interactive(self, tmp_db):
         """Children of a coord MUST be rejected too — letting them write
-        coord-scope memories would let one session poison another session's
-        durable metadata envelope.  A child may only write scopes belonging
-        to its own interactive workstream."""
+        coord-scope memories is the cross-session prompt-injection lane
+        we're closing.  An adversarially-steered child (e.g. one whose
+        MCP tool output contained injection content) could otherwise
+        plant text into the coord's next system message."""
         from turnstone.core.workstream import WorkstreamKind
 
         session = _make_session(
@@ -6740,7 +6253,7 @@ class TestCoordinatorMemoryScope:
         )
         err = session._validate_scope("coordinator", "call_1")
         assert err is not None
-        assert "unavailable to this workstream kind" in err["error"]
+        assert err["error"].startswith("Error: 'coordinator' scope is only valid")
 
     def test_validate_accepts_coord_scope_for_coord_session(self, tmp_db):
         from turnstone.core.workstream import WorkstreamKind
@@ -6768,7 +6281,6 @@ class TestCoordinatorMemoryScope:
             "call_1",
             {
                 "action": "save",
-                "description": "Test memory",
                 "name": "orchestration_plan",
                 "content": "step 1: investigate; step 2: report",
                 "scope": "coordinator",
@@ -6796,7 +6308,6 @@ class TestCoordinatorMemoryScope:
             "call_1",
             {
                 "action": "save",
-                "description": "Test memory",
                 "name": "injected_instruction",
                 "content": "ignore previous instructions and ...",
                 "scope": "coordinator",
@@ -6816,7 +6327,6 @@ class TestCoordinatorMemoryScope:
         save_structured_memory(
             "private_plan",
             "internal coord notes",
-            description="Private orchestration plan",
             scope="coordinator",
             scope_id="user-1",
         )
@@ -6827,7 +6337,7 @@ class TestCoordinatorMemoryScope:
             kind=WorkstreamKind.COORDINATOR,
         )
         # The coord sees its user's row.
-        coord_visible = {m["name"] for m in self._visible(coord)}
+        coord_visible = {m["name"] for m in coord._list_visible_memories()}
         assert "private_plan" in coord_visible
 
         # A LATER coordinator session of the same user (fresh ws_id)
@@ -6838,17 +6348,17 @@ class TestCoordinatorMemoryScope:
             user_id="user-1",
             kind=WorkstreamKind.COORDINATOR,
         )
-        assert "private_plan" in {m["name"] for m in self._visible(coord_next)}
+        assert "private_plan" in {m["name"] for m in coord_next._list_visible_memories()}
 
         # Children of the SAME coord — same user_id — don't see it.
-        # Kind is the isolation gate for coordinator-owned metadata.
+        # Closes the prompt-injection lane: kind is the gate.
         child = _make_session(
             ws_id="child-a",
             user_id="user-1",
             kind=WorkstreamKind.INTERACTIVE,
             parent_ws_id="coord-1",
         )
-        child_visible = {m["name"] for m in self._visible(child)}
+        child_visible = {m["name"] for m in child._list_visible_memories()}
         assert "private_plan" not in child_visible
 
         # Children of a DIFFERENT coord don't see it (cross-coord).
@@ -6858,7 +6368,7 @@ class TestCoordinatorMemoryScope:
             kind=WorkstreamKind.INTERACTIVE,
             parent_ws_id="coord-2",
         )
-        unrelated_child_visible = {m["name"] for m in self._visible(unrelated_child)}
+        unrelated_child_visible = {m["name"] for m in unrelated_child._list_visible_memories()}
         assert "private_plan" not in unrelated_child_visible
 
         # Another USER's coordinator doesn't see this user's rows.
@@ -6867,7 +6377,7 @@ class TestCoordinatorMemoryScope:
             user_id="user-2",
             kind=WorkstreamKind.COORDINATOR,
         )
-        other_coord_visible = {m["name"] for m in self._visible(other_coord)}
+        other_coord_visible = {m["name"] for m in other_coord._list_visible_memories()}
         assert "private_plan" not in other_coord_visible
 
     def test_coord_does_not_see_global_workstream_user_memories(self, tmp_db):
@@ -6876,31 +6386,21 @@ class TestCoordinatorMemoryScope:
         interactive sessions.  This keeps the coord's orchestration
         namespace focused: a memory written by a sibling interactive
         session under scope='user' must not leak into the coord's
-        immutable memory index."""
+        system-message memory injection."""
         from turnstone.core.memory import save_structured_memory
-        from turnstone.core.storage import get_storage
         from turnstone.core.workstream import WorkstreamKind
 
         # Seed every non-coord scope with a sentinel memory.
-        save_structured_memory(
-            "global_note", "anyone can read", description="Global note", scope="global"
-        )
-        get_storage().register_workstream(
-            "coord-1",
-            user_id="user-1",
-            kind=WorkstreamKind.COORDINATOR,
-        )
+        save_structured_memory("global_note", "anyone can read", scope="global")
         save_structured_memory(
             "ws_note",
             "interactive ws notes",
-            description="Workstream note",
             scope="workstream",
             scope_id="coord-1",  # same id as the coord under test
         )
         save_structured_memory(
             "user_note",
             "user-wide notes from another IC session",
-            description="User note",
             scope="user",
             scope_id="user-1",
         )
@@ -6910,7 +6410,7 @@ class TestCoordinatorMemoryScope:
             user_id="user-1",
             kind=WorkstreamKind.COORDINATOR,
         )
-        visible = {m["name"] for m in self._visible(coord)}
+        visible = {m["name"] for m in coord._list_visible_memories()}
         # ``user_note`` is the sharpest case now: its scope_id
         # ("user-1") is IDENTICAL to the coord's coordinator scope_id —
         # the scope COLUMN is what keeps the namespaces disjoint.  Same
@@ -6925,7 +6425,7 @@ class TestCoordinatorMemoryScope:
         # memories — proving the rows exist in storage and the coord
         # path is what's filtering, not a missing seed.
         ic = _make_session(ws_id="ic-1", user_id="user-1", kind=WorkstreamKind.INTERACTIVE)
-        ic_visible = {m["name"] for m in self._visible(ic)}
+        ic_visible = {m["name"] for m in ic._list_visible_memories()}
         assert "global_note" in ic_visible
         assert "user_note" in ic_visible
 
@@ -6933,13 +6433,10 @@ class TestCoordinatorMemoryScope:
         from turnstone.core.memory import save_structured_memory
         from turnstone.core.workstream import WorkstreamKind
 
-        save_structured_memory(
-            "global_x", "some content", description="Global content", scope="global"
-        )
+        save_structured_memory("global_x", "some content", scope="global")
         save_structured_memory(
             "coord_x",
             "orchestration content",
-            description="Coordinator content",
             scope="coordinator",
             scope_id="user-1",
         )
@@ -6951,7 +6448,7 @@ class TestCoordinatorMemoryScope:
         )
         # Search for a token both rows share (e.g. "content") — only
         # the coord-scope row should come back.
-        names = {m["name"] for m in self._search(coord, "content")}
+        names = {m["name"] for m in coord._search_visible_memories("content")}
         assert names == {"coord_x"}
 
     def test_coord_validate_rejects_non_coord_scopes(self, tmp_db):
@@ -6967,11 +6464,14 @@ class TestCoordinatorMemoryScope:
         for bad in ("global", "workstream", "user"):
             err = coord._validate_scope(bad, "call_1")
             assert err is not None, f"coord should reject scope={bad!r}"
-            assert f"scope '{bad}' is unavailable" in err["error"]
+            assert f"'{bad}' scope is not available" in err["error"]
 
     def test_coord_default_save_scope_is_coordinator(self, tmp_db):
         """Coord sessions calling memory(action='save') without an
-        explicit scope target the coordinator namespace."""
+        explicit scope default to 'coordinator' — anything else would
+        either land in a namespace the coord can't read back from
+        (workstream/user) or fall back to global which the new
+        visibility rules also exclude."""
         from turnstone.core.workstream import WorkstreamKind
 
         coord = _make_session(
@@ -6981,20 +6481,17 @@ class TestCoordinatorMemoryScope:
         )
         item = coord._prepare_memory(
             "call_1",
-            {
-                "action": "save",
-                "name": "auto_scope",
-                "content": "x",
-                "description": "Automatic scope test",
-            },
+            {"action": "save", "name": "auto_scope", "content": "x"},
         )
         assert "error" not in item
         assert item["scope"] == "coordinator"
         assert item["scope_id"] == "user-1"
 
-    def test_coord_inherited_get_targets_only_coordinator(self, tmp_db):
+    def test_coord_implicit_walk_only_coordinator(self, tmp_db):
         """Coord ``memory(action='get')`` with no explicit scope must
-        target only the coordinator scope."""
+        walk only the coordinator scope — the IC walk
+        (workstream → user → global) would be wasted lookups against
+        rows the coord can't see."""
         from turnstone.core.workstream import WorkstreamKind
 
         coord = _make_session(
@@ -7009,8 +6506,10 @@ class TestCoordinatorMemoryScope:
         assert "error" not in item
         assert [s for s, _ in item["scopes_to_try"]] == ["coordinator"]
 
-    def test_ic_unscoped_get_uses_single_global_target(self, tmp_db):
-        """Without a project, interactive save/get/delete all inherit global."""
+    def test_ic_implicit_walk_unchanged(self, tmp_db):
+        """Interactive sessions retain the narrowest-to-widest walk:
+        workstream → user → global.  Coord scope is excluded — IC
+        sessions can't see/write it anyway."""
         from turnstone.core.workstream import WorkstreamKind
 
         ic = _make_session(
@@ -7023,7 +6522,8 @@ class TestCoordinatorMemoryScope:
             {"action": "get", "name": "anything"},
         )
         assert "error" not in item
-        assert item["scopes_to_try"] == [("global", "")]
+        scopes = [s for s, _ in item["scopes_to_try"]]
+        assert scopes == ["workstream", "user", "global"]
 
     def test_coord_memory_persists_across_sessions(self, tmp_db):
         """End-to-end through the real save lane: a memory saved by one
@@ -7033,7 +6533,7 @@ class TestCoordinatorMemoryScope:
         was born into an empty namespace every time."""
         from turnstone.core.workstream import WorkstreamKind
 
-        first = _make_registered_session(
+        first = _make_session(
             ws_id="coord-old",
             user_id="user-1",
             kind=WorkstreamKind.COORDINATOR,
@@ -7042,18 +6542,17 @@ class TestCoordinatorMemoryScope:
             "call_1",
             {
                 "action": "save",
-                "description": "Test memory",
                 "name": "deploy_runbook",
                 "content": "drain node before rotating certs",
                 "scope": "coordinator",
             },
         )
         assert "error" not in item
-        result = _execute_prepared_tool(first, item)
+        result = item["execute"](item)
         assert "Saved" in str(result) or "saved" in str(result).lower()
 
         # Brand-new coordinator session, new ws_id, same user.
-        second = _make_registered_session(
+        second = _make_session(
             ws_id="coord-new",
             user_id="user-1",
             kind=WorkstreamKind.COORDINATOR,
@@ -7063,7 +6562,7 @@ class TestCoordinatorMemoryScope:
             {"action": "get", "name": "deploy_runbook"},
         )
         assert "error" not in get_item
-        out = str(_execute_prepared_tool(second, get_item))
+        out = str(get_item["execute"](get_item))
         assert "drain node before rotating certs" in out
 
     def test_coordinator_session_requires_user_id(self, tmp_db):
@@ -7104,37 +6603,31 @@ class TestCoordinatorMemoryScope:
         coord._user_id = ""  # simulate a constructor-bypassing double
         err = coord._validate_scope("coordinator", "call_1")
         assert err is not None
-        assert "requires an authenticated acting user" in err["error"]
+        assert "requires authenticated user identity" in err["error"]
         assert coord._coordinator_scope_id() == ""
         item = coord._prepare_memory(
             "call_1",
-            {
-                "action": "save",
-                "name": "x",
-                "content": "y",
-                "description": "Authentication backstop test",
-                "scope": "coordinator",
-            },
+            {"action": "save", "name": "x", "content": "y", "scope": "coordinator"},
         )
         assert "error" in item
 
-        # The implicit read lane must fail closed too: an anonymous
-        # coordinator namespace is invalid. Seed another user's row and
-        # prove the constructor-bypassing double synthesizes no visible
-        # coordinator scope.
+        # The implicit read lane must fail closed too: the storage
+        # helpers treat a falsy scope_id as "no scope_id filter", so
+        # ("coordinator", "") would otherwise read EVERY user's
+        # coordinator rows.  Seed another user's row and prove the
+        # unauthenticated double sees nothing, not everything.
         from turnstone.core.memory import save_structured_memory
 
         save_structured_memory(
             "other_users_row",
             "must not leak",
-            description="Another user's row",
             scope="coordinator",
             scope_id="user-9",
         )
         assert coord._visible_scopes() == []
         assert coord._visible_memory_count() == 0
-        assert self._visible(coord) == []
-        assert self._search(coord, "leak") == []
+        assert coord._list_visible_memories() == []
+        assert coord._search_visible_memories("leak") == []
 
 
 class TestMemoryToolAudit:
@@ -7156,83 +6649,12 @@ class TestMemoryToolAudit:
 
         return get_storage().list_audit_events(action=action)
 
-    def test_preparer_declares_generic_batch_policy(self, tmp_db):
-        session = _make_session(ws_id="ws-1", user_id="user-1")
-        saved = session._prepare_memory(
-            "save-call",
-            {
-                "action": "save",
-                "name": "fact_one",
-                "content": "alpha content",
-                "description": "Alpha fact",
-            },
-        )
-        fetched = session._prepare_memory(
-            "get-call",
-            {"action": "get", "name": "fact_one"},
-        )
-
-        assert saved["_batch_policy"] == {
-            "group": "memory",
-            "access": "write",
-            "mixed_access_error": _MEMORY_MIXED_BATCH_ERROR,
-            "serialize": True,
-        }
-        assert fetched["_batch_policy"] == {
-            "group": "memory",
-            "access": "read",
-            "mixed_access_error": _MEMORY_MIXED_BATCH_ERROR,
-            "serialize": False,
-        }
-
-    def test_unstamped_executor_does_not_inherit_session_actor(self, tmp_db):
-        session = _make_registered_session(ws_id="ws-1", user_id="user-1")
-        item = session._prepare_memory(
-            "get-call",
-            {"action": "get", "name": "private_fact", "scope": "user"},
-        )
-
-        _call_id, message = item["execute"](item)
-
-        assert "requires an authenticated acting user" in message
-
-    @pytest.mark.parametrize("description", [None, "", "   "])
-    def test_save_requires_non_empty_description(self, tmp_db, description):
-        session = _make_session(ws_id="ws-1", user_id="user-1")
-        item = session._prepare_memory(
-            "call_1",
-            {
-                "action": "save",
-                "name": "fact_one",
-                "content": "alpha content",
-                "description": description,
-            },
-        )
-        assert "error" in item
-        assert "description is required and must be non-empty" in item["error"]
-
-    def test_unsupported_script_name_returns_retryable_guidance(self, tmp_db):
-        session = _make_session(ws_id="ws-1", user_id="user-1")
-        item = session._prepare_memory(
-            "call_1",
-            {
-                "action": "save",
-                "name": "部署手順",
-                "content": "native body",
-                "description": "Native deployment notes",
-            },
-        )
-        assert item["needs_approval"] is False
-        assert "ASCII semantic key" in item["error"]
-        assert "description or content" in item["error"]
-
     def test_save_new_emits_memory_save(self, tmp_db):
-        session = _make_registered_session(ws_id="ws-1", user_id="user-1")
+        session = _make_session(ws_id="ws-1", user_id="user-1")
         item = session._prepare_memory(
             "call_1",
             {
                 "action": "save",
-                "description": "Test memory",
                 "name": "fact_one",
                 "content": "alpha content",
                 "scope": "user",
@@ -7240,7 +6662,7 @@ class TestMemoryToolAudit:
             },
         )
         assert "error" not in item
-        _execute_prepared_tool(session, item)
+        session._exec_memory(item)
 
         rows = self._audit_rows("memory.save")
         assert len(rows) == 1
@@ -7257,89 +6679,23 @@ class TestMemoryToolAudit:
         # The "create" path must NOT also stamp an update row.
         assert self._audit_rows("memory.update") == []
 
-    def test_prepared_user_save_stays_bound_to_acting_principal(self, tmp_db):
-        from turnstone.core.memory import get_structured_memory_by_name
-
-        session = _make_registered_session(ws_id="shared", user_id="owner")
-        session.bind_acting_user("guest")
-        item = session._prepare_tool(
-            {
-                "id": "call_1",
-                "function": {
-                    "name": "memory",
-                    "arguments": json.dumps(
-                        {
-                            "action": "save",
-                            "description": "Test memory",
-                            "name": "private_note",
-                            "content": "guest content",
-                            "scope": "user",
-                        }
-                    ),
-                },
-            }
-        )
-        assert item["_principal_id"] == "guest"
-        assert item["scope_id"] == "guest"
-
-        session.bind_acting_user("owner")
-        _, message = _execute_prepared_tool(session, item)
-
-        assert "Saved memory" in message
-        assert get_structured_memory_by_name("private_note", "user", "guest") is not None
-        assert get_structured_memory_by_name("private_note", "user", "owner") is None
-        rows = self._audit_rows("memory.save")
-        assert len(rows) == 1
-        assert rows[0]["user_id"] == "guest"
-
-    def test_guest_user_get_does_not_probe_owner_namespace(self, tmp_db):
-        from turnstone.core.memory import save_structured_memory
-
-        save_structured_memory(
-            "owner_secret",
-            "must not leak",
-            description="Owner secret",
-            scope="user",
-            scope_id="owner",
-        )
-        session = _make_registered_session(ws_id="shared", user_id="owner")
-        session.bind_acting_user("guest")
-        item = session._prepare_tool(
-            {
-                "id": "call_1",
-                "function": {
-                    "name": "memory",
-                    "arguments": json.dumps(
-                        {"action": "get", "name": "owner_secret", "scope": "user"}
-                    ),
-                },
-            }
-        )
-
-        _, message = _execute_prepared_tool(session, item)
-
-        assert "not found" in message
-        assert "must not leak" not in message
-        assert "exists in scope" not in message
-
     def test_save_global_scope_emits_empty_scope_id(self, tmp_db):
         """Global memories have no scope_id — the audit row's detail
         must still carry the key (with value ``""``) so a forensic
         consumer can distinguish ``scope='global'`` from a row that
         forgot to populate ``scope_id`` for a scoped write."""
-        session = _make_registered_session(ws_id="ws-1", user_id="user-1")
+        session = _make_session(ws_id="ws-1", user_id="user-1")
         item = session._prepare_memory(
             "call_1",
             {
                 "action": "save",
-                "description": "Test memory",
                 "name": "fact_global",
                 "content": "shared content",
                 "scope": "global",
             },
         )
         assert "error" not in item
-        _execute_prepared_tool(session, item)
+        session._exec_memory(item)
 
         rows = self._audit_rows("memory.save")
         assert len(rows) == 1
@@ -7349,20 +6705,19 @@ class TestMemoryToolAudit:
         assert detail["ws_id"] == "ws-1"
 
     def test_save_upsert_emits_memory_update(self, tmp_db):
-        session = _make_registered_session(ws_id="ws-1", user_id="user-1")
+        session = _make_session(ws_id="ws-1", user_id="user-1")
         for content in ("first", "second"):
             item = session._prepare_memory(
                 "call_x",
                 {
                     "action": "save",
-                    "description": "Test memory",
                     "name": "fact_one",
                     "content": content,
                     "scope": "user",
                     "type": "reference",
                 },
             )
-            _execute_prepared_tool(session, item)
+            session._exec_memory(item)
 
         saves = self._audit_rows("memory.save")
         updates = self._audit_rows("memory.update")
@@ -7372,26 +6727,25 @@ class TestMemoryToolAudit:
         assert saves[0]["resource_id"] == updates[0]["resource_id"]
 
     def test_delete_emits_memory_delete(self, tmp_db):
-        session = _make_registered_session(ws_id="ws-1", user_id="user-1")
+        session = _make_session(ws_id="ws-1", user_id="user-1")
         save_item = session._prepare_memory(
             "call_1",
             {
                 "action": "save",
-                "description": "Test memory",
                 "name": "fact_one",
                 "content": "alpha",
                 "scope": "user",
                 "type": "reference",
             },
         )
-        _execute_prepared_tool(session, save_item)
+        session._exec_memory(save_item)
         saved_memory_id = self._audit_rows("memory.save")[0]["resource_id"]
 
         delete_item = session._prepare_memory(
             "call_2",
             {"action": "delete", "name": "fact_one", "scope": "user"},
         )
-        _, msg = _execute_prepared_tool(session, delete_item)
+        _, msg = session._exec_memory(delete_item)
         assert "Deleted memory" in msg
 
         rows = self._audit_rows("memory.delete")
@@ -7405,82 +6759,28 @@ class TestMemoryToolAudit:
         assert detail["type"] == "reference"
 
     def test_delete_not_found_emits_no_audit(self, tmp_db):
-        session = _make_registered_session(ws_id="ws-1", user_id="user-1")
+        session = _make_session(ws_id="ws-1", user_id="user-1")
         delete_item = session._prepare_memory(
             "call_1",
             {"action": "delete", "name": "no_such_mem", "scope": "user"},
         )
-        _, msg = _execute_prepared_tool(session, delete_item)
+        _, msg = session._exec_memory(delete_item)
         assert "not found" in msg
         assert self._audit_rows("memory.delete") == []
 
-    def test_committed_delete_is_truthful_and_keeps_immutable_prefix(self, tmp_db):
-        from turnstone.core.memory import get_structured_memory_by_name, save_structured_memory
-
-        save_structured_memory("doomed", "value", description="Memory to delete", scope="global")
-        session = _make_registered_session(ws_id="ws-1", user_id="user-1")
-        generation = session._claim_generation(principal_id="user-1")
-        session._memory_index_admission_generation = generation
-        session._admit_memory_index_request(
-            session._primary_lane(),
-            my_generation=generation,
-            principal_id="user-1",
-        )
-        captured = TestMemoryIndexSnapshotLifecycle._index_text(session)
-        assert "doomed" in captured
-        item = session._prepare_memory(
-            "call_1", {"action": "delete", "name": "doomed", "scope": "global"}
-        )
-
-        _, message = _execute_prepared_tool(session, item)
-
-        assert "Deleted memory 'doomed'" in message
-        assert get_structured_memory_by_name("doomed", "global", "") is None
-        assert len(self._audit_rows("memory.delete")) == 1
-        assert session._system_prefix_dirty is False
-        with patch.object(session, "_init_system_messages") as recompose:
-            session._ensure_system_prefix_fresh(
-                principal_id="user-1",
-                origin_generation=generation,
-            )
-        recompose.assert_not_called()
-        assert TestMemoryIndexSnapshotLifecycle._index_text(session) == captured
-
-    def test_storage_failure_is_not_reported_as_not_found(self, tmp_db):
-        from turnstone.core.storage import get_storage
-
-        session = _make_registered_session(ws_id="ws-1", user_id="user-1")
-        storage = get_storage()
-        operations = (
-            (
-                "get_and_touch_structured_memory_by_name",
-                {"action": "get", "name": "key", "scope": "global"},
-            ),
-            (
-                "delete_structured_memory_returning",
-                {"action": "delete", "name": "key", "scope": "global"},
-            ),
-        )
-        for method_name, arguments in operations:
-            item = session._prepare_memory("call_1", arguments)
-            with patch.object(storage, method_name, side_effect=RuntimeError("db down")):
-                _, message = _execute_prepared_tool(session, item)
-            assert "storage operation failed" in message
-            assert "not found" not in message
-
     def test_reads_emit_no_audit(self, tmp_db):
-        session = _make_registered_session(ws_id="ws-1", user_id="user-1")
-        save_item = session._prepare_memory(
-            "call_save",
-            {
-                "action": "save",
-                "description": "Test memory",
-                "name": "fact_one",
-                "content": "alpha",
-                "scope": "user",
-            },
+        session = _make_session(ws_id="ws-1", user_id="user-1")
+        session._exec_memory(
+            session._prepare_memory(
+                "call_save",
+                {
+                    "action": "save",
+                    "name": "fact_one",
+                    "content": "alpha",
+                    "scope": "user",
+                },
+            )
         )
-        _execute_prepared_tool(session, save_item)
 
         for spec in (
             {"action": "get", "name": "fact_one", "scope": "user"},
@@ -7489,7 +6789,7 @@ class TestMemoryToolAudit:
         ):
             item = session._prepare_memory("call_read", spec)
             assert "error" not in item
-            _execute_prepared_tool(session, item)
+            session._exec_memory(item)
 
         # Only the save above should have audited.
         save_count = len(self._audit_rows("memory.save"))
@@ -7504,12 +6804,11 @@ class TestMemoryToolAudit:
         prevents the audit row from landing must not also lose the
         save/delete the user actually asked for.
         """
-        session = _make_registered_session(ws_id="ws-1", user_id="user-1")
+        session = _make_session(ws_id="ws-1", user_id="user-1")
         item = session._prepare_memory(
             "call_1",
             {
                 "action": "save",
-                "description": "Test memory",
                 "name": "fact_one",
                 "content": "alpha",
                 "scope": "user",
@@ -7519,7 +6818,7 @@ class TestMemoryToolAudit:
             "turnstone.core.audit.record_audit",
             side_effect=RuntimeError("audit storage exploded"),
         ):
-            _, msg = _execute_prepared_tool(session, item)
+            _, msg = session._exec_memory(item)
         assert "Saved memory 'fact_one'" in msg
         # The save itself still landed.
         from turnstone.core.memory import get_structured_memory_by_name
@@ -7531,10 +6830,10 @@ class TestPerKindToolVariants:
     """Verify the ``kind_variants`` metadata applies per-kind tool overrides.
 
     Each kind sees only the tool surface it can actually use — the
-    coord sees coordinator/project scopes and a coord-flavored description;
-    the IC sees global/workstream/user/project and the IC-flavored description.
-    The union ``TOOLS`` list keeps the full schema for introspection / docs /
-    eval catalogs.
+    coord sees ``scope`` enum ``["coordinator"]`` and a coord-flavored
+    description; the IC sees ``["global", "workstream", "user"]`` and
+    the existing IC-flavored description.  The union ``TOOLS`` list
+    keeps the full schema for introspection / docs / eval catalogs.
     """
 
     def test_coord_memory_tool_has_coord_only_scope_enum(self):
@@ -7545,11 +6844,6 @@ class TestPerKindToolVariants:
         # v1.7: a coordinator attached to a project also reads/writes the shared
         # 'project' scope, alongside its isolated 'coordinator' namespace.
         assert scope["enum"] == ["coordinator", "project"]
-        scope_desc = scope["description"]
-        assert "stored project attachment pins unscoped save/get/delete to project" in scope_desc
-        assert "fails closed without fallback" in scope_desc
-        assert "no project attachment defaults to coordinator" in scope_desc
-        assert "valid explicit scope selects exactly that scope" in scope_desc
 
     def test_coord_memory_tool_description_mentions_orchestration(self):
         from turnstone.core.tools import COORDINATOR_TOOLS
@@ -7569,11 +6863,6 @@ class TestPerKindToolVariants:
         scope = memory["function"]["parameters"]["properties"]["scope"]
         # v1.7: 'project' is offered (usable when the workstream is attached).
         assert scope["enum"] == ["global", "workstream", "user", "project"]
-        scope_desc = scope["description"]
-        assert "stored project attachment pins unscoped save/get/delete to project" in scope_desc
-        assert "fails closed without fallback" in scope_desc
-        assert "no project attachment defaults to global" in scope_desc
-        assert "valid explicit scope selects exactly that scope" in scope_desc
 
     def test_ic_memory_tool_description_omits_coord_scope(self):
         from turnstone.core.tools import INTERACTIVE_TOOLS
@@ -7583,12 +6872,6 @@ class TestPerKindToolVariants:
         # The IC description must NOT advertise a scope the IC can't
         # use — anything else is noise to the model.
         assert "coordinator" not in desc.lower()
-        description_schema = memory["function"]["parameters"]["properties"]["description"]
-        assert description_schema["minLength"] == 1
-        assert description_schema["maxLength"] == 512
-        name_schema = memory["function"]["parameters"]["properties"]["name"]
-        assert name_schema["pattern"] == "^[a-z0-9]+(?:_[a-z0-9]+)*$"
-        assert name_schema["maxLength"] == 256
 
     def test_kind_variants_isolated_from_each_other(self):
         """Mutating one kind's tool dict must not bleed into the other
@@ -7623,989 +6906,358 @@ class TestPerKindToolVariants:
             assert coord_t is union_t, f"{name} should pass through unchanged"
 
 
-class TestMemoryIndexSnapshotLifecycle:
-    @staticmethod
-    def _save(
-        name: str,
-        content: str,
-        *,
-        description: str | None = None,
-        scope: str = "global",
-        scope_id: str = "",
-    ) -> None:
-        from turnstone.core.memory import save_structured_memory_strict
+class TestMemoryCompositionDeferral:
+    """The memory block is selected from the recent-user-message query, so a
+    fresh session (no messages at __init__) must NOT freeze a recency-only,
+    un-reranked block — the memory-bearing compose defers to the first real
+    user turn, where the query is non-empty.
+    """
 
-        save_structured_memory_strict(
-            name,
-            content,
-            description=description or f"Hook for {name}",
-            scope=scope,
-            scope_id=scope_id,
-        )
+    def test_flag_false_until_real_user_query(self, tmp_db):
+        session = _make_session()
+        # __init__ composed against an empty history -> no query yet.
+        assert session._system_composed_with_context is False
+        # A whitespace-only "turn" (e.g. a wake send("")) is not a real query.
+        session.messages.append(turn_from_dict({"role": "user", "content": "   "}))
+        session._init_system_messages()
+        assert session._system_composed_with_context is False
+        # A real user message flips it (one-shot).
+        session.messages.append(turn_from_dict({"role": "user", "content": "what is the weather"}))
+        session._init_system_messages()
+        assert session._system_composed_with_context is True
 
-    @staticmethod
-    def _index_text(session: ChatSession) -> str:
-        joined = "\n".join(
-            str(message.get("content", ""))
-            for message in session.system_messages
-            if message.get("role") == "system"
-        )
-        start = joined.find("<memory-index")
-        if start < 0:
-            return ""
-        end = joined.find("</memory-index>", start)
-        assert end >= 0
-        return joined[start : end + len("</memory-index>")]
+    def test_send_recomposes_memory_block_on_first_user_turn(self, tmp_db):
+        from turnstone.core.memory_relevance import extract_recent_context
 
-    @staticmethod
-    def _admit(session: ChatSession, principal_id: str) -> list[dict[str, Any]]:
-        generation = session._claim_generation(principal_id=principal_id)
-        # Model the genuine USER row that production admits before reaching
-        # the first provider boundary.  Synthetic generations deliberately do
-        # not carry this witness and cannot acquire an index.
-        session._memory_index_admission_generation = generation
-        session._admit_memory_index_request(
-            session._primary_lane(),
-            my_generation=generation,
-            principal_id=principal_id,
-        )
-        return list(session.system_messages)
+        session = _make_session()
+        session._title_generated = True  # suppress the auto-title daemon thread
+        assert session._system_composed_with_context is False
+        seen_queries: list[str] = []
+        real_init = session._init_system_messages
 
-    def test_synthetic_wake_does_not_acquire_first_index(self, tmp_db):
-        from turnstone.core.storage import get_storage
+        def spy_init(*, origin_generation: int = 0):
+            seen_queries.append(extract_recent_context(dicts_from_turns(session.messages)))
+            real_init(origin_generation=origin_generation)
 
-        session = _make_registered_session(ws_id="wake-index", user_id="owner")
-        session._title_generated = True
-
+        responses = [make_result("ok")]
         with _send_with_mocks(
-            session,
-            [make_result("ok")],
-            lambda _tool_calls: ([], None),
+            session, responses, lambda _tc: ([], None), _init_system_messages=spy_init
         ):
-            session.send("", from_wake=True)
+            session.send("debug my kubernetes pods")
 
-        assert get_storage().get_memory_index_snapshot(session.ws_id) is None
-        assert self._index_text(session) == ""
+        # send() ran the deferred recompose AFTER appending the user turn, so the
+        # memory query saw the real message instead of the empty __init__ history.
+        assert any("kubernetes" in q for q in seen_queries)
+        assert session._system_composed_with_context is True
 
-    def test_constructor_defers_index_until_turn_principal_is_bound(self, tmp_db):
-        session = _make_registered_session(ws_id="ws-index", user_id="owner")
-
-        assert self._index_text(session) == ""
-        assert session._system_prefix_dirty is False
-
-        wire = self._admit(session, "owner")
-
-        assert '<memory-index format="1" entries="0" project_id="">' in self._index_text(session)
-        assert "<memory-index" in str(wire)
-        assert session._system_prefix_dirty is False
-
-    def test_snapshot_commit_failure_does_not_publish_candidate_prefix(self, tmp_db):
-        from turnstone.core.memory_index import render_memory_index
-
-        session = _make_registered_session(ws_id="commit-failure-index", user_id="owner")
-        session._known_senders = {"original-sender"}
-        session._shared_workstream = False
-        session._db_senders_loaded = False
-        session._senders_dirty = True
-        original_prefix = list(session.system_messages)
-        original_system_tokens = session._system_tokens
-        original_shared_state = (
-            set(session._known_senders),
-            session._shared_workstream,
-            session._db_senders_loaded,
-            session._senders_dirty,
-        )
-        rendered = render_memory_index([])
-        candidate = {
-            "ws_id": session.ws_id,
-            "principal_id": "owner",
-            "project_id": "",
-            "project_name": "",
-            "content": rendered.content,
-            "entry_count": rendered.entry_count,
-            "char_count": rendered.char_count,
-            "invalid_description_count": rendered.invalid_description_count,
-        }
-
-        def fail_commit(
-            ws_id: str,
-            principal_id: str,
-            *,
-            commit_context: Any,
-        ) -> dict[str, Any]:
-            assert ws_id == session.ws_id
-            assert principal_id == "owner"
-            with commit_context(candidate):
-                raise RuntimeError("snapshot commit failed")
-            raise AssertionError("snapshot commit unexpectedly returned")
-
-        with (
-            patch(
-                "turnstone.core.session.acquire_memory_index_snapshot",
-                side_effect=fail_commit,
-            ),
-            pytest.raises(RuntimeError, match="snapshot commit failed"),
-        ):
-            self._admit(session, "owner")
-
-        assert session._memory_index_snapshot is None
-        assert session.system_messages == original_prefix
-        assert session._system_tokens == original_system_tokens
-        assert self._index_text(session) == ""
-        assert (
-            session._known_senders,
-            session._shared_workstream,
-            session._db_senders_loaded,
-            session._senders_dirty,
-        ) == original_shared_state
-
-    def test_small_context_refuses_without_dispatch_or_snapshot_then_retries(self, tmp_db):
-        from turnstone.core.attachments import Attachment
-        from turnstone.core.memory import delete_structured_memory_returning_strict
-        from turnstone.core.memory_relevance import MemoryConfig
-        from turnstone.core.model_turn import ModelAdmissionError
-        from turnstone.core.personas import PersonaSnapshot
-        from turnstone.core.storage import get_storage
-
-        for index in range(20):
-            self._save(
-                f"oversized_{index}",
-                "private body",
-                description="D" * 500,
-            )
-        ui = NullUI()
-        ui.on_error = MagicMock()
-        session = _make_registered_session(
-            ws_id="small-context-index",
-            user_id="owner",
-            ui=ui,
-            context_window=4096,
-            max_tokens=512,
-            memory_config=MemoryConfig(nudges=False),
-            persona_snapshot=PersonaSnapshot(
-                "memory-only",
-                "You are helpful.",
-                frozenset({"memory"}),
-                False,
-                True,
-            ),
-        )
+    def test_whitespace_send_does_not_recompose(self, tmp_db):
+        """A whitespace-only / wake send carries no query, so the deferred
+        recompose must NOT fire -- and the flag stays False so a later real
+        turn still triggers it."""
+        session = _make_session()
         session._title_generated = True
-        provider = seam_provider("ok")
-        replace_session_lane(session, provider=provider)
-        resolve_attachments = MagicMock(
-            side_effect=AssertionError("refusal must precede attachment materialization")
-        )
-        provisional, provisional_capacity, _ = session._memory_index_prefix_estimate(
-            session.system_messages,
-            session._primary_lane(),
-        )
-        assert provisional <= provisional_capacity
+        init_calls = 0
 
-        with (
-            patch.object(session, "_resolve_attachments", resolve_attachments),
-            pytest.raises(ModelAdmissionError) as raised,
-        ):
-            session.send(
-                "Use the available context.",
-                attachments=[
-                    Attachment(
-                        attachment_id="oversized-document",
-                        filename="context.txt",
-                        mime_type="text/plain",
-                        kind="text",
-                        content=b"attachment context",
-                    )
-                ],
-                acting_user_id="owner",
-            )
+        def spy_init(*, origin_generation: int = 0):
+            nonlocal init_calls
+            del origin_generation
+            init_calls += 1
 
-        detail = str(raised.value.__cause__)
-        assert "complete final prefix is estimated at" in detail
-        assert "4,096-token context" in detail
-        assert "memory index " in detail and " characters" in detail
-        assert "larger-context model" in detail
-        assert "delete/consolidate memories" in detail
-        assert "did not commit a new memory-index snapshot" in detail
-        assert provider.create_streaming.call_count == 0
-        resolve_attachments.assert_not_called()
-        assert get_storage().get_memory_index_snapshot(session.ws_id) is None
-        ui.on_error.assert_called_once_with(detail)
-        admitted_user = next(turn for turn in session.messages if turn.role is Role.USER)
-        assert admitted_user.text.startswith("Use the available context.")
-        assert admitted_user.meta.extra["sender"] == "owner"
-
-        for index in range(18):
-            assert delete_structured_memory_returning_strict(f"oversized_{index}") is not None
-        session.send("Retry after remediation.", acting_user_id="owner")
-
-        snapshot = get_storage().get_memory_index_snapshot(session.ws_id)
-        assert snapshot is not None
-        assert snapshot["entry_count"] == 2
-        assert provider.create_streaming.call_count == 1
-
-    def test_prefix_only_gate_does_not_project_tool_definitions(self, tmp_db):
-        session = _make_registered_session(ws_id="prefix-only-index", user_id="owner")
-
-        with patch.object(
-            session,
-            "_get_active_tools",
-            side_effect=AssertionError("tool projection is outside the prefix-only gate"),
-        ):
-            prefix_tokens, input_capacity, context_window = session._memory_index_prefix_estimate(
-                session.system_messages,
-                session._primary_lane(),
-            )
-
-        assert prefix_tokens > 0
-        assert input_capacity == (
-            session.context_window
-            - min(session.max_tokens, session.context_window // 4)
-            - int(session.context_window * 0.05)
-        )
-        assert context_window == session.context_window
-
-    def test_large_context_admits_complete_index_and_dispatches(self, tmp_db):
-        from turnstone.core.memory_relevance import MemoryConfig
-        from turnstone.core.personas import PersonaSnapshot
-        from turnstone.core.storage import get_storage
-
-        for index in range(20):
-            self._save(
-                f"large_{index}",
-                "private body",
-                description="D" * 500,
-            )
-        session = _make_registered_session(
-            ws_id="large-context-index",
-            user_id="owner",
-            context_window=32_768,
-            max_tokens=1024,
-            memory_config=MemoryConfig(nudges=False),
-            persona_snapshot=PersonaSnapshot(
-                "memory-only",
-                "You are helpful.",
-                frozenset({"memory"}),
-                False,
-                True,
-            ),
-        )
-        session._title_generated = True
-        provider = seam_provider("ok")
-        replace_session_lane(session, provider=provider)
-
-        session.send("Use the available context.", acting_user_id="owner")
-
-        snapshot = get_storage().get_memory_index_snapshot(session.ws_id)
-        assert snapshot is not None
-        assert snapshot["entry_count"] == 20
-        assert snapshot["content"] == self._index_text(session)
-        assert provider.create_streaming.call_count == 1
-
-    def test_first_capture_transaction_does_not_reenter_prefix_storage_planning(self, tmp_db):
-        from turnstone.core.storage import get_storage
-
-        self._save("runbook", "private body", description="Incident procedure")
-        session = _make_registered_session(ws_id="pool-safe-index", user_id="owner")
-        storage = get_storage()
-        real_acquire = storage.acquire_memory_index_snapshot
-        real_build = session._build_system_prefix_plan
-        real_sizing = session._memory_index_sizing
-        capture_active = False
-
-        def acquire(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
-            nonlocal capture_active
-            capture_active = True
-            try:
-                return real_acquire(*args, **kwargs)
-            finally:
-                capture_active = False
-
-        def build(*args: Any, **kwargs: Any) -> Any:
-            assert not capture_active
-            return real_build(*args, **kwargs)
-
-        def sizing(*args: Any, **kwargs: Any) -> Any:
-            assert not capture_active
-            return real_sizing(*args, **kwargs)
-
-        with (
-            patch.object(storage, "acquire_memory_index_snapshot", side_effect=acquire),
-            patch.object(session, "_build_system_prefix_plan", side_effect=build),
-            patch.object(session, "_memory_index_sizing", side_effect=sizing),
-        ):
-            self._admit(session, "owner")
-
-        assert get_storage().get_memory_index_snapshot(session.ws_id) is not None
-
-    def test_raced_existing_snapshot_refusal_reports_truthful_remediation(self, tmp_db):
-        from turnstone.core.personas import PersonaSnapshot
-        from turnstone.core.storage import get_storage
-
-        for index in range(20):
-            self._save(
-                f"raced_{index}",
-                "private body",
-                description="D" * 500,
-            )
-        persona = PersonaSnapshot(
-            "memory-only",
-            "You are helpful.",
-            frozenset({"memory"}),
-            False,
-            True,
-        )
-        winner = _make_registered_session(
-            ws_id="raced-index",
-            user_id="first-owner",
-            context_window=32_768,
-            persona_snapshot=persona,
-        )
-        self._admit(winner, "first-owner")
-        storage = get_storage()
-        durable = storage.get_memory_index_snapshot(winner.ws_id)
-        assert durable is not None
-
-        loser = _make_registered_session(
-            ws_id="raced-index",
-            user_id="first-owner",
-            context_window=4096,
-            max_tokens=512,
-            persona_snapshot=persona,
-        )
-        # Model a first-capture pre-load miss followed by the adapter finding
-        # the winner's row inside its transaction.
-        loser._memory_index_snapshot = None
-        generation = loser._claim_generation(principal_id="second-owner")
-        loser._memory_index_admission_generation = generation
-        real_build = loser._build_system_prefix_plan
-        with (
-            patch.object(storage, "get_memory_index_snapshot", return_value=None),
-            patch.object(loser, "_build_system_prefix_plan", wraps=real_build) as build,
-            pytest.raises(RuntimeError) as raised,
-        ):
-            loser._admit_memory_index_request(
-                loser._primary_lane(),
-                my_generation=generation,
-                principal_id="second-owner",
-            )
-
-        detail = str(raised.value)
-        assert "if this workstream still has no immutable snapshot" in detail
-        assert "did not commit a new memory-index snapshot" in detail
-        assert durable["principal_id"] == "first-owner"
-        assert storage.get_memory_index_snapshot(winner.ws_id) == durable
-        assert build.call_count == 1
-
-    def test_first_capture_uses_fallback_lane_context_window(self, tmp_db):
-        import dataclasses
-
-        from turnstone.core.model_registry import ModelConfig
-        from turnstone.core.storage import get_storage
-
-        session = _make_registered_session(
-            ws_id="fallback-context-index",
-            user_id="owner",
-            context_window=32_768,
-        )
-        registry = MagicMock()
-        registry.get_config.return_value = SimpleNamespace(context_window=32_768)
-        session._registry = registry
-        frozen_config = ModelConfig(
-            alias="small-fallback",
-            base_url="https://frozen.invalid/v1",
-            api_key="test",
-            model="small-fallback-model",
-            context_window=2048,
-        )
-        fallback = dataclasses.replace(
-            session._primary_lane(),
-            alias="small-fallback",
-            model="small-fallback-model",
-            registry=registry,
-            backend_auth_config=frozen_config,
-        )
-        generation = session._claim_generation(principal_id="owner")
-        session._memory_index_admission_generation = generation
-
-        with pytest.raises(RuntimeError, match="2,048-token context"):
-            session._admit_memory_index_request(
-                fallback,
-                my_generation=generation,
-                principal_id="owner",
-            )
-
-        registry.get_config.assert_not_called()
-        assert get_storage().get_memory_index_snapshot(session.ws_id) is None
-
-    def test_admitted_prefix_invalidates_resumed_provider_anchor(self, tmp_db):
-        from turnstone.core.trajectory import TurnProvenance
-
-        self._save("runbook", "private body", description="Incident procedure")
-        session = _make_registered_session(ws_id="anchored-index", user_id="owner")
-        lane = session._primary_lane()
-        session.messages.append(Turn.user("resumed history"))
-        session._msg_tokens.append(1)
-        session._activate_token_calibration(lane)
-        session._last_usage = {
-            "prompt_tokens": 900,
-            "completion_tokens": 10,
-            "total_tokens": 910,
-        }
-        session._update_token_table(
-            msgs=[{"role": "user", "content": "x" * 3600}],
-            tool_def_chars=0,
-            provenance=TurnProvenance(
-                model_alias=lane.alias,
-                backend_model_id=lane.model,
-                registry_generation=lane.registry_generation,
-            ),
-        )
-        key = session._active_token_calibration_key
-        assert key is not None
-        assert session._token_calibrations[key].prompt_tokens == 900
-        assert session._last_usage_calibration_key == key
-
-        self._admit(session, "owner")
-
-        calibration = session._token_calibrations[key]
-        assert calibration.prompt_tokens is None
-        assert calibration.message_prefix_ids == ()
-        assert session._last_usage is None
-        assert session._last_usage_calibration_key is None
-        assert session._calibrated_msg_count == 0
-        system_chars = sum(session._msg_char_count(message) for message in session.system_messages)
-        assert session._system_tokens == max(
-            1,
-            int(system_chars / session._chars_per_token),
-        )
-        assert session._estimated_prompt_tokens() == (
-            session._system_tokens + sum(session._msg_tokens) + session._tool_def_tokens()
-        )
-
-    def test_capture_is_complete_metadata_only_and_immutable(self, tmp_db):
-        from turnstone.core.memory import delete_structured_memory_returning_strict
-
-        session = _make_registered_session(ws_id="ws-index", user_id="owner")
-        self._save("kafka_runbook", "SECRET BODY", description="Kafka recovery steps")
-        self._save("garden_notes", "ANOTHER BODY", description="Tomato schedule")
-
-        self._admit(session, "owner")
-        captured = self._index_text(session)
-        assert "[global/general] kafka_runbook — Kafka recovery steps" in captured
-        assert "[global/general] garden_notes — Tomato schedule" in captured
-        assert "SECRET BODY" not in captured
-        assert "ANOTHER BODY" not in captured
-
-        self._save("later_memory", "new body", description="Created later")
-        delete_structured_memory_returning_strict("garden_notes", "global", "")
-        session._init_system_messages(principal_id="owner")
-
-        assert self._index_text(session) == captured
-        assert "later_memory" not in captured
-        assert "garden_notes" in captured
-
-    def test_same_tuple_reuses_persisted_bytes_across_session_instances(self, tmp_db):
-        from turnstone.core.storage import get_storage
-
-        self._save("runbook", "body", description="Incident procedure")
-        first = _make_registered_session(ws_id="shared-index", user_id="owner")
-        self._admit(first, "owner")
-        captured = self._index_text(first)
-        durable = get_storage().get_memory_index_snapshot(first.ws_id)
-        assert durable is not None
-
-        self._save("newer", "body", description="Created after capture")
-        reopened = _make_registered_session(ws_id="shared-index", user_id="owner")
-        self._admit(reopened, "owner")
-
-        assert self._index_text(reopened) == captured
-        assert "newer" not in captured
-        assert get_storage().get_memory_index_snapshot(reopened.ws_id) == durable
-
-    def test_first_principal_binds_one_shared_immutable_snapshot(self, tmp_db):
-        self._save("global_note", "body")
-        self._save("alice_note", "body", scope="user", scope_id="alice")
-        self._save("bob_note", "body", scope="user", scope_id="bob")
-        session = _make_registered_session(ws_id="shared-index", user_id="owner")
-
-        self._admit(session, "alice")
-        alice_index = self._index_text(session)
-        self._admit(session, "bob")
-        bob_index = self._index_text(session)
-
-        assert "global_note" in alice_index and "global_note" in bob_index
-        assert "alice_note" in alice_index and "alice_note" in bob_index
-        assert "bob_note" not in alice_index and "bob_note" not in bob_index
-        assert bob_index == alice_index
-
-    def test_project_snapshot_carries_explicit_stable_project_id(self, tmp_db):
-        from turnstone.core.storage import get_storage
-
-        storage = get_storage()
-        storage.create_project("project-42", "Mutable Project Name", "owner")
-        session = _make_registered_session(
-            ws_id="project-index",
-            user_id="owner",
-            project_id="project-42",
-        )
-        self._save(
-            "project_runbook",
-            "body",
-            description="Project incident procedure",
-            scope="project",
-            scope_id="project-42",
-        )
-
-        wire = self._admit(session, "owner")
-        captured = self._index_text(session)
-
-        assert 'project_id="project-42"' in captured
-        assert "[project/general] project_runbook — Project incident procedure" in captured
-        assert "Mutable Project Name (id: project-42)" in str(wire)
-
-        storage.update_project("project-42", name="Renamed Project")
-        session._init_system_messages(principal_id="owner")
-        assert self._index_text(session) == captured
-
-    @pytest.mark.parametrize(
-        ("transition", "expected_project"),
-        [
-            ("added", "Added Project"),
-            ("changed", "Changed Project"),
-            ("removed", ""),
-        ],
-    )
-    def test_admission_renders_snapshot_project_without_rewriting_prompt_text(
-        self,
-        tmp_db,
-        transition: str,
-        expected_project: str,
-    ) -> None:
-        import turnstone.prompts as prompts
-        from turnstone.core.personas import PersonaSnapshot
-        from turnstone.core.storage import get_storage
-
-        project_id = f"project-{transition}"
-        base = "BASE OPEN\n## Session Context\n\n- **Project:** BASE PROJECT SENTINEL\nBASE CLOSE"
-        env = "ENV OPEN\n## Session Context\n\n- **Project:** ENV PROJECT SENTINEL\nENV CLOSE"
-        storage = get_storage()
-        if transition != "added":
-            storage.create_project(project_id, "Original Project", "owner")
-        original_load = prompts._load
-
-        def load_prompt(relpath: str) -> str:
-            return env if relpath.startswith("env/") else original_load(relpath)
-
-        with patch("turnstone.prompts._load", side_effect=load_prompt):
-            session = _make_registered_session(
-                ws_id=f"snapshot-{transition}",
-                user_id="owner",
-                project_id=project_id,
-                persona_snapshot=PersonaSnapshot(
-                    "project-sentinel",
-                    base,
-                    None,
-                    True,
-                    True,
-                ),
-            )
-            if transition == "added":
-                storage.create_project(project_id, expected_project, "owner")
-            elif transition == "changed":
-                storage.update_project(project_id, name=expected_project)
-            else:
-                assert storage.delete_project(project_id) is True
-
-            wire = self._admit(session, "owner")
-
-        rendered = str(wire[0]["content"])
-        assert base in rendered
-        assert env in rendered
-        snapshot = storage.get_memory_index_snapshot(session.ws_id)
-        assert snapshot is not None
-        if expected_project:
-            assert f"- **Project:** {expected_project} (id: {project_id})" in rendered
-            assert snapshot["project_id"] == project_id
-            assert snapshot["project_name"] == expected_project
-        else:
-            assert "Original Project (id:" not in rendered
-            assert snapshot["project_id"] == ""
-            assert snapshot["project_name"] == ""
-
-    def test_capture_failure_does_not_publish_fake_complete_index(self, tmp_db):
-        from turnstone.core.storage import get_storage
-
-        session = _make_registered_session(ws_id="failing-index", user_id="owner")
-        before = list(session.system_messages)
-        with (
-            patch.object(
-                get_storage(),
-                "acquire_memory_index_snapshot",
-                side_effect=RuntimeError("database unavailable"),
-            ),
-            pytest.raises(RuntimeError, match="database unavailable"),
-        ):
-            self._admit(session, "owner")
-
-        assert session.system_messages == before
-        assert self._index_text(session) == ""
-
-    def test_live_pointer_is_persisted_after_the_user_turn(self, tmp_db):
-        session = _make_registered_session(ws_id="pointer-ws", user_id="owner")
-        session._title_generated = True
-        self._save("kafka_runbook", "body", description="Restart Kafka broker pods")
-
+        responses = [make_result("ok")]
         with _send_with_mocks(
-            session,
-            [make_result("ok")],
-            lambda _tool_calls: ([], None),
+            session, responses, lambda _tc: ([], None), _init_system_messages=spy_init
         ):
-            session.send("How do I restart the Kafka brokers?")
-
-        pointer_turns = [
-            turn
-            for turn in session.messages
-            if turn.role is Role.SYSTEM and turn.source == "memory_pointer"
-        ]
-        assert len(pointer_turns) == 1
-        assert "kafka_runbook" in pointer_turns[0].text
-        pointer_index = session.messages.index(pointer_turns[0])
-        assert session.messages[pointer_index - 1].role is Role.USER
-
-    def test_queued_user_turn_persists_its_pointer_after_the_user(self, tmp_db):
-        from turnstone.core.storage import get_storage
-
-        session = _make_registered_session(ws_id="queued-pointer-ws", user_id="owner")
-        self._save("kafka_runbook", "body", description="Restart Kafka broker pods")
-        session.queue_message(
-            "How do I restart the Kafka brokers?",
-            queue_msg_id="queued-pointer-send",
-            interjector_user_id="owner",
-            turn_principal_id="owner",
-        )
-
-        assert session._flush_queued_messages() is True
-
-        rows = get_storage().load_messages(session._ws_id)
-        assert rows[-2]["role"] == "user"
-        assert rows[-2]["content"] == "How do I restart the Kafka brokers?"
-        assert rows[-1]["role"] == "system"
-        assert rows[-1]["_source"] == "memory_pointer"
-        assert "kafka_runbook" in rows[-1]["content"]
+            session.send("   ")
+        assert init_calls == 0
+        assert session._system_composed_with_context is False
 
 
 class TestMemoryAccessTouch:
+    """Access metadata (``access_count`` / ``last_accessed``) moves only when
+    the model actually sees a memory: the injected top-k during composition,
+    and explicit search/get reads via the memory tool.  Save/list and the
+    wider candidate pool must NOT bump the counter.
+    """
+
     @staticmethod
     def _access_count(name: str, scope: str = "global", scope_id: str = "") -> int:
         from turnstone.core.storage import get_storage
 
-        memory = get_storage().get_structured_memory_by_name(name, scope, scope_id)
-        assert memory is not None
-        return int(memory["access_count"])
+        mem = get_storage().get_structured_memory_by_name(name, scope, scope_id)
+        assert mem is not None, f"memory {name!r} not found"
+        return int(mem["access_count"])
 
     @staticmethod
-    def _save(name: str, content: str, description: str = "Test memory") -> None:
-        from turnstone.core.memory import save_structured_memory_strict
+    def _save(name: str, content: str) -> None:
+        from turnstone.core.memory import save_structured_memory
 
-        save_structured_memory_strict(
-            name,
-            content,
-            description=description,
-            scope="global",
-        )
+        save_structured_memory(name, content, scope="global")
 
     @staticmethod
-    def _session() -> ChatSession:
-        return _make_registered_session(ws_id="ws-1", user_id="user-1")
+    def _empty_session() -> ChatSession:
+        """A session whose __init__ composed before any memory existed.
 
-    def test_index_pointer_list_search_and_save_do_not_touch(self, tmp_db):
-        session = self._session()
-        self._save("kafka_runbook", "PRIVATE BODY", "Kafka recovery")
-        session._init_system_messages(principal_id="user-1")
-        session._plan_memory_pointer(
-            "Kafka recovery",
-            access=session._memory_access("user-1"),
+        The constructor composes the system prefix once; building it before
+        the memories are saved keeps that first (empty) compose from touching
+        rows, so the tests observe only the turn-driven recompose below.
+        """
+        return _make_session(ws_id="ws-1", user_id="user-1")
+
+    @staticmethod
+    def _compose_turn(session: ChatSession, query: str) -> None:
+        """Drive one user turn's worth of composition.
+
+        Mirrors ``send``: a fresh user turn invalidates the per-turn memory
+        caches, then the prefix recomposes against the new query.
+        """
+        session._invalidate_memory_cache()
+        session.messages.append(turn_from_dict({"role": "user", "content": query}))
+        session._init_system_messages()
+
+    def test_composition_touches_injected_memories(self, tmp_db):
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        self._save("kafka_alerts", "kafka consumer lag alert thresholds")
+        self._compose_turn(session, "how do I restart kafka")
+        # Both query-matching memories were injected, so both got touched once.
+        assert self._access_count("kafka_runbook") == 1
+        assert self._access_count("kafka_alerts") == 1
+
+    def test_composition_skips_unmatched_candidates(self, tmp_db):
+        """The candidate pool is a superset of the injected set — a memory
+        that loses BM25 ranking (no query overlap) must NOT be touched."""
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        self._save("garden_notes", "tomato watering schedule midsummer")
+        self._compose_turn(session, "restart kafka broker pods status")
+        # The matching memory was injected and touched.
+        assert self._access_count("kafka_runbook") == 1
+        # The non-matching one was a candidate but never injected.
+        assert self._access_count("garden_notes") == 0
+        # Sanity: it really was in the visible candidate pool.
+        visible = {m["name"] for m in session._list_visible_memories()}
+        assert "garden_notes" in visible
+
+    def test_composition_touches_each_memory_once_per_turn(self, tmp_db):
+        """``_init_system_messages`` runs many times within a turn (tool
+        results, MCP refresh); the injected set must be touched at most once
+        per memory between user turns, not once per recompose."""
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        self._compose_turn(session, "how do I restart kafka")
+        # Several mid-turn recomposes (no new user turn between them).
+        session._init_system_messages()
+        session._init_system_messages()
+        assert self._access_count("kafka_runbook") == 1
+        # A genuinely new turn lets the same memory be counted again.
+        self._compose_turn(session, "kafka again please")
+        assert self._access_count("kafka_runbook") == 2
+
+    def test_composition_touches_exactly_the_injected_keys(self, tmp_db):
+        """Spy the touch boundary and assert the keys match the names the
+        composer rendered into the ``<memories>`` block — exactly, not the
+        candidate pool."""
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        self._save("garden_notes", "tomato watering schedule midsummer")
+        session._invalidate_memory_cache()
+        session.messages.append(
+            turn_from_dict({"role": "user", "content": "restart kafka broker pods status"})
         )
-        for call_id, args in (
-            ("search", {"action": "search", "query": "Kafka"}),
-            ("list", {"action": "list"}),
+        touched: list[tuple[str, str, str]] = []
+        with patch(
+            "turnstone.core.session.touch_structured_memories",
+            side_effect=lambda keys: touched.extend(keys),
         ):
-            item = session._prepare_memory(call_id, args)
-            _call_id, message = _execute_prepared_tool(session, item)
-            assert "PRIVATE BODY" not in message
-        assert self._access_count("kafka_runbook") == 0
+            session._init_system_messages()
+        joined = "\n".join(m["content"] for m in session.system_messages if m["role"] == "system")
+        touched_names = {name for name, _, _ in touched}
+        assert touched_names == {"kafka_runbook"}
+        assert '<memory name="kafka_runbook"' in joined
+        assert '<memory name="garden_notes"' not in joined
 
-        save_item = session._prepare_memory(
-            "save",
-            {
-                "action": "save",
-                "name": "another",
-                "content": "body",
-                "description": "Another hook",
-                "scope": "global",
-            },
+    def test_composition_survives_touch_storage_error(self, tmp_db):
+        """A storage blow-up inside the touch must not break composition —
+        the facade swallows it and the memory block still lands."""
+        from turnstone.core.storage import get_storage
+
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        session._invalidate_memory_cache()
+        session.messages.append(
+            turn_from_dict({"role": "user", "content": "how do I restart kafka"})
         )
-        _execute_prepared_tool(session, save_item)
-        assert self._access_count("kafka_runbook") == 0
-        assert self._access_count("another") == 0
+        with patch.object(
+            get_storage(),
+            "touch_structured_memories",
+            side_effect=RuntimeError("storage exploded"),
+        ):
+            session._init_system_messages()
+        joined = "\n".join(m["content"] for m in session.system_messages if m["role"] == "system")
+        assert '<memory name="kafka_runbook"' in joined
 
-    @pytest.mark.parametrize(
-        ("enabled", "expect_notice"),
-        [(False, False), (True, True)],
-    )
-    def test_model_save_over_budget_notice_is_opt_in(
-        self,
-        tmp_db,
-        enabled: bool,
-        expect_notice: bool,
-    ) -> None:
-        from turnstone.core.memory_relevance import MemoryConfig
+    def test_search_action_touches_returned_hits(self, tmp_db):
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        item = session._prepare_memory("call_1", {"action": "search", "query": "kafka"})
+        assert "error" not in item
+        session._exec_memory(item)
+        assert self._access_count("kafka_runbook") == 1
 
-        session = _make_registered_session(
-            ws_id=f"notice-{enabled}",
-            user_id="owner",
-            memory_config=MemoryConfig(
-                index_budget_chars=1,
-                model_index_over_budget_notice=enabled,
-            ),
-        )
+    def test_get_action_touches_fetched_memory(self, tmp_db):
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
         item = session._prepare_memory(
-            "save",
-            {
-                "action": "save",
-                "name": "runbook",
-                "content": "private body",
-                "description": "Incident recovery procedure",
-                "scope": "global",
-            },
+            "call_1", {"action": "get", "name": "kafka_runbook", "scope": "global"}
         )
-
-        _call_id, message = _execute_prepared_tool(session, item)
-
-        assert ("configured soft budget" in message) is expect_notice
-        if expect_notice:
-            assert "/ 1 characters" in message
-            assert "delete" not in message.lower()
-            assert "compact" not in message.lower()
-
-    def test_model_save_backpressure_calls_prospective_facade(
-        self,
-        tmp_db,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        calls: list[tuple[list[tuple[str, str]], str]] = []
-
-        def prospective(
-            scopes: list[tuple[str, str]],
-            *,
-            acting_principal_id: str = "",
-        ) -> dict[str, int]:
-            calls.append((scopes, acting_principal_id))
-            return {
-                "entry_count": 1,
-                "char_count": 100,
-                "invalid_description_count": 1,
-            }
-
-        monkeypatch.setattr("turnstone.core.session.prospective_memory_index", prospective)
-        session = self._session()
-        item = session._prepare_memory(
-            "save",
-            {
-                "action": "save",
-                "name": "runbook",
-                "content": "private body",
-                "description": "Incident recovery procedure",
-                "scope": "global",
-            },
-        )
-
-        _call_id, message = _execute_prepared_tool(session, item)
-
-        assert calls == [
-            (
-                [("global", ""), ("workstream", "ws-1"), ("user", "user-1")],
-                "user-1",
-            )
-        ]
-        assert "1 legacy entries need authored descriptions" in message
-
-    def test_model_save_backpressure_facade_failure_keeps_notice_wording(
-        self,
-        tmp_db,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        def fail(*_args: object, **_kwargs: object) -> dict[str, int]:
-            raise RuntimeError("health unavailable")
-
-        monkeypatch.setattr("turnstone.core.session.prospective_memory_index", fail)
-        session = self._session()
-        item = session._prepare_memory(
-            "save",
-            {
-                "action": "save",
-                "name": "runbook",
-                "content": "private body",
-                "description": "Incident recovery procedure",
-                "scope": "global",
-            },
-        )
-
-        _call_id, message = _execute_prepared_tool(session, item)
-
-        assert message.endswith(
-            "\nNotice: complete live index health could not be calculated; "
-            "check admin memory index health before adding more entries."
-        )
-
-    def test_get_is_the_only_tool_read_that_touches(self, tmp_db):
-        session = self._session()
-        self._save("kafka_runbook", "PRIVATE BODY", "Kafka recovery")
-        item = session._prepare_memory(
-            "get",
-            {"action": "get", "name": "kafka_runbook", "scope": "global"},
-        )
-
-        _call_id, message = _execute_prepared_tool(session, item)
-
-        assert "PRIVATE BODY" in message
+        assert "error" not in item
+        session._exec_memory(item)
         assert self._access_count("kafka_runbook") == 1
 
     def test_get_miss_touches_nothing(self, tmp_db):
-        session = self._session()
-        self._save("existing", "body")
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
         item = session._prepare_memory(
-            "get",
-            {"action": "get", "name": "missing", "scope": "global"},
+            "call_1", {"action": "get", "name": "no_such_mem", "scope": "global"}
         )
-        _call_id, message = _execute_prepared_tool(session, item)
-        assert "not found" in message
-        assert self._access_count("existing") == 0
+        _, msg = session._exec_memory(item)
+        assert "not found" in msg
+        # The existing row must not be collaterally touched by a miss.
+        assert self._access_count("kafka_runbook") == 0
 
-    def test_save_never_changes_existing_snapshot_but_pointer_sees_new_hook(self, tmp_db):
-        session = self._session()
-        self._save("initial", "body", "Initial hook")
-        session._init_system_messages(principal_id="user-1")
-        before = TestMemoryIndexSnapshotLifecycle._index_text(session)
+    def test_list_action_does_not_touch(self, tmp_db):
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        item = session._prepare_memory("call_1", {"action": "list"})
+        session._exec_memory(item)
+        assert self._access_count("kafka_runbook") == 0
+
+    def test_save_action_does_not_touch_access_count(self, tmp_db):
+        """The save action handler must not bump ``access_count`` — that counter
+        is read traffic only, and save no longer recomposes the system prefix
+        (see ``_exec_memory``), so the saved row is never surfaced as an injected
+        memory by the handler.  Composition-path touches are exercised by the
+        ``test_composition_*`` tests."""
+        session = self._empty_session()
+        item = session._prepare_memory(
+            "call_1",
+            {"action": "save", "name": "kafka_runbook", "content": "x", "scope": "global"},
+        )
+        session._exec_memory(item)
+        assert self._access_count("kafka_runbook") == 0
+
+    def test_save_through_exec_does_not_recompose_prefix(self, tmp_db):
+        """End-to-end through ``_exec_memory``: a memory(save) must NOT rebuild
+        the system prefix -- injected memories ride in the cached system block,
+        so re-initing on every write would bust the prompt cache.  The write
+        still (a) invalidates the per-turn search cache so an in-turn
+        memory(search) sees the new row, and (b) folds into the prefix at the
+        next natural recompose.  Exercises the real call chain (no patching of
+        ``_init_system_messages``), which the other memory tests stub out."""
+        session = self._empty_session()
+        self._save("kafka_runbook", "restart the kafka broker pods")
+        self._compose_turn(session, "restart kafka broker pods status")
+        before = "\n".join(m["content"] for m in session.system_messages if m["role"] == "system")
+        assert '<memory name="kafka_runbook"' in before  # composition sanity
+
+        # Prime the per-turn search cache with a probe that excludes the
+        # not-yet-saved row, so a stale cache would be observable below.
+        probe = "scale the broker pods cluster"
+        assert "kafka_scaling" not in {m["name"] for m in session._search_visible_memories(probe)}
 
         item = session._prepare_memory(
-            "save",
+            "call_1",
             {
                 "action": "save",
                 "name": "kafka_scaling",
-                "content": "PRIVATE BODY",
-                "description": "Scale Kafka broker pods",
+                "content": "restart kafka and scale the broker pods cluster",
                 "scope": "global",
             },
         )
-        _execute_prepared_tool(session, item)
-        session._init_system_messages(principal_id="user-1")
+        assert "error" not in item
+        session._exec_memory(item)
 
-        assert TestMemoryIndexSnapshotLifecycle._index_text(session) == before
-        assert "kafka_scaling" not in before
-        pointer = session._plan_memory_pointer(
-            "scale Kafka brokers",
-            access=session._memory_access("user-1"),
+        # 1. Prefix byte-for-byte unchanged -> no prompt-cache bust.
+        after = "\n".join(m["content"] for m in session.system_messages if m["role"] == "system")
+        assert after == before
+        assert '<memory name="kafka_scaling"' not in after
+
+        # 2. The save invalidated the search cache: the SAME probe now returns
+        #    the new row (a stale cache would still omit it).
+        assert "kafka_scaling" in {m["name"] for m in session._search_visible_memories(probe)}
+
+        # 3. The next natural recompose folds the new memory into the prefix.
+        self._compose_turn(session, "how do I scale the kafka broker pods cluster")
+        recomposed = "\n".join(
+            m["content"] for m in session.system_messages if m["role"] == "system"
         )
-        assert "kafka_scaling" in pointer
+        assert '<memory name="kafka_scaling"' in recomposed
 
-    def test_deleted_snapshot_entry_remains_honest_but_get_is_live(self, tmp_db):
-        session = _make_registered_session(ws_id="ws-1", user_id="user-1")
-        self._save("obsolete", "old body", "Old procedure")
-        TestMemoryIndexSnapshotLifecycle._admit(session, "user-1")
-        captured = TestMemoryIndexSnapshotLifecycle._index_text(session)
-
-        delete_item = session._prepare_memory(
-            "delete",
-            {"action": "delete", "name": "obsolete", "scope": "global"},
-        )
-        _execute_prepared_tool(session, delete_item)
-        session._init_system_messages(principal_id="user-1")
-        get_item = session._prepare_memory(
-            "get",
-            {"action": "get", "name": "obsolete", "scope": "global"},
-        )
-        _call_id, message = _execute_prepared_tool(session, get_item)
-
-        assert "obsolete" in captured
-        assert TestMemoryIndexSnapshotLifecycle._index_text(session) == captured
-        assert "not found" in message
-
-    def test_tool_save_requires_normalizes_and_updates_description(self, tmp_db):
+    def test_save_through_tool_preserves_omitted_overwrites_explicit(self, tmp_db):
+        """The None-sentinel flows through _prepare_memory -> _exec_memory: a
+        content-only re-save keeps the stored type/description, while an
+        explicit field overwrites it.  Guards the _prepare_memory omit->None
+        logic that the storage-level tests don't exercise."""
         from turnstone.core.memory import get_structured_memory_by_name
 
-        session = self._session()
-        first = session._prepare_memory(
-            "first",
+        session = self._empty_session()
+        item = session._prepare_memory(
+            "c1",
             {
                 "action": "save",
                 "name": "digest",
                 "content": "v1",
                 "type": "reference",
-                "description": " daily\n digest ",
+                "description": "daily digest",
                 "scope": "global",
             },
         )
-        _execute_prepared_tool(session, first)
-        second = session._prepare_memory(
-            "second",
+        assert "error" not in item
+        session._exec_memory(item)
+
+        # Content-only re-save (omits type/description) -> both preserved.
+        item2 = session._prepare_memory(
+            "c2", {"action": "save", "name": "digest", "content": "v2", "scope": "global"}
+        )
+        session._exec_memory(item2)
+        mem = get_structured_memory_by_name("digest", "global", "")
+        assert mem is not None
+        assert mem["content"] == "v2"
+        assert mem["type"] == "reference"
+        assert mem["description"] == "daily digest"
+
+        # An invalid/typo'd type is treated as unset -> stored type preserved,
+        # not silently downgraded to "general".
+        item_bad = session._prepare_memory(
+            "c2b",
             {
                 "action": "save",
                 "name": "digest",
-                "content": "v2",
-                "description": "revised daily digest",
+                "content": "v2b",
+                "type": "nonsense",
                 "scope": "global",
             },
         )
-        _execute_prepared_tool(session, second)
+        session._exec_memory(item_bad)
+        mem = get_structured_memory_by_name("digest", "global", "")
+        assert mem is not None
+        assert mem["type"] == "reference"  # invalid type ignored, not downgraded
 
-        memory = get_structured_memory_by_name("digest", "global", "")
-        assert memory is not None
-        assert memory["content"] == "v2"
-        assert memory["type"] == "reference"
-        assert memory["description"] == "revised daily digest"
-
-        too_long = session._prepare_memory(
-            "long",
+        # An explicit field -> overwrites (the behaviour the None-sentinel enables).
+        item3 = session._prepare_memory(
+            "c3",
             {
                 "action": "save",
                 "name": "digest",
                 "content": "v3",
-                "description": "x" * 513,
+                "type": "general",
                 "scope": "global",
             },
         )
-        assert "512" in too_long["error"]
-
-    def test_undeclared_key_and_value_aliases_are_rejected(self, tmp_db):
-        session = self._session()
-
-        alias_only = (
-            {
-                "action": "save",
-                "key": "legacy",
-                "value": "body",
-                "description": "Legacy alias",
-            },
-            {"action": "get", "key": "legacy"},
-            {"action": "delete", "key": "legacy"},
-        )
-        for index, arguments in enumerate(alias_only):
-            item = session._prepare_memory(f"alias-{index}", arguments)
-            assert "error" in item
-            assert "name" in item["error"]
-
-        missing_content = session._prepare_memory(
-            "alias-value",
-            {
-                "action": "save",
-                "name": "canonical_name",
-                "value": "legacy body",
-                "description": "Legacy value alias",
-            },
-        )
-        assert "content" in missing_content["error"]
+        session._exec_memory(item3)
+        mem = get_structured_memory_by_name("digest", "global", "")
+        assert mem is not None
+        assert mem["type"] == "general"
 
 
 class TestMetacognitiveBuffers:
@@ -8635,7 +7287,8 @@ class TestMetacognitiveBuffers:
         session.messages.append(turn_from_dict({"role": "user", "content": "hello there"}))
         session._msg_tokens.append(1)
         session._queue_user_advisory("correction", "ALERT_TEXT")
-        session._emit_pending_user_nudges()
+        with patch("turnstone.core.session.save_message"):
+            session._emit_pending_user_nudges()
         # User turn untouched; a system turn now follows it.
         assert turn_to_dict(session.messages[-2]) == {"role": "user", "content": "hello there"}
         assert turn_to_dict(session.messages[-1]) == {
@@ -8652,18 +7305,20 @@ class TestMetacognitiveBuffers:
         session.messages.append(turn_from_dict({"role": "user", "content": "untouched"}))
         session._msg_tokens.append(1)
         pre_len = len(session.messages)
-        session._emit_pending_user_nudges()
+        with patch("turnstone.core.session.save_message"):
+            session._emit_pending_user_nudges()
         # No nudges → no system turn appended.
         assert len(session.messages) == pre_len
         assert turn_to_dict(session.messages[-1])["role"] == "user"
 
     def test_emit_user_nudges_appends_one_system_turn_per_nudge(self, tmp_db):
-        session = _make_registered_session()
+        session = _make_session()
         session.messages.append(turn_from_dict({"role": "user", "content": "user text"}))
         session._msg_tokens.append(1)
         session._queue_user_advisory("denial", "FIRST")
         session._queue_user_advisory("correction", "SECOND")
-        session._emit_pending_user_nudges()
+        with patch("turnstone.core.session.save_message"):
+            session._emit_pending_user_nudges()
         sys_turns = [m for m in dicts_from_turns(session.messages) if m.get("role") == "system"]
         assert sys_turns == [
             {"role": "system", "_source": "denial", "content": "FIRST"},
@@ -8764,39 +7419,10 @@ class TestMetacognitiveBuffers:
         # authority, especially on the native path), not the raw text.
         assert content.endswith("User message: hows it going?")
         assert "while you were working" in content
-        # Queue cleared by the drain, and the advisory pop window closed at
-        # the seam's return (the advisory lane has no restore path).
+        # Queue cleared by the drain.
         assert session._queued_messages == {}
-        assert session._popped_in_flight == set()
         # _collect_advisories itself appends nothing — the caller does.
         assert len(session.messages) == pre_count
-
-    def test_user_interjection_meta_retains_sender_for_ui_correlation(self, tmp_db):
-        """The final system event cannot settle another viewer's reused token."""
-
-        session = _make_session(user_id="alice")
-        session.queue_message(
-            "still working?",
-            queue_msg_id="q1",
-            interjector_user_id="alice",
-            client_send_id="shared-token",
-        )
-
-        specs = session._collect_advisories(
-            assessment=None,
-            func_name="bash",
-            is_last_in_batch=True,
-        )
-
-        assert len(specs) == 1
-        source, _content, meta = specs[0]
-        assert source == "user_interjection"
-        assert meta == {
-            "priority": "notice",
-            "message": "still working?",
-            "sender": "alice",
-            "client_send_id": "shared-token",
-        }
 
     def test_cross_user_interjection_rejected(self, tmp_db):
         """A different authenticated participant cannot interject into another
@@ -8830,252 +7456,6 @@ class TestMetacognitiveBuffers:
         session._acting_user_id = "alice"
         session.queue_message("internal", interjector_user_id="", queue_msg_id="q1")
         assert "q1" in session._queued_messages
-
-    def test_interjection_into_empty_principal_turn_fails_closed(self, tmp_db):
-        """An authenticated interjector is rejected when the in-flight turn has
-        no bound principal (ownerless session, internal wake): admitting it
-        would run the words under the ambient credential context and
-        misattribute them to the turn's initiator."""
-        from turnstone.core.session import CrossUserInterjectionError
-
-        session = _make_session(user_id=None)  # no owner => empty effective id
-        assert not (session._mcp_effective_user_id or "")
-        with pytest.raises(CrossUserInterjectionError):
-            session.queue_message("let me in", interjector_user_id="bob")
-        assert session._queued_messages == {}
-
-    def test_interjection_into_empty_slot_principal_fails_closed(self, tmp_db):
-        """The immutable worker-slot principal fails closed the same way: an
-        empty ``turn_principal_id`` (claim taken with no principal — init
-        worker) rejects authenticated interjectors instead of comparing
-        against the mutable actor."""
-        from turnstone.core.session import CrossUserInterjectionError
-
-        session = _make_session(user_id="owner")
-        with pytest.raises(CrossUserInterjectionError):
-            session.queue_message(
-                "let me in",
-                interjector_user_id="bob",
-                turn_principal_id="",
-            )
-        assert session._queued_messages == {}
-
-    def test_pop_partitions_by_owner(self, tmp_db):
-        """The pop is owner-partitioned and flag-less: the acting user's and
-        unowned/legacy rows pop; another participant's rows are structurally
-        retained — never consumed under a different actor, never a raise
-        (rounds 3-5: the per-site mode flag was the defect factory)."""
-        session = _make_session(user_id="owner")
-        session._acting_user_id = "alice"
-        session.queue_message("alice's words", interjector_user_id="alice", queue_msg_id="qa")
-        session._acting_user_id = "bob"
-        session.queue_message("bob's words", interjector_user_id="bob", queue_msg_id="qb")
-        # Pre-owner legacy 2-tuple: unowned, pops under any actor.
-        session._queued_messages["legacy"] = ("legacy words", "normal")
-
-        popped = session._pop_queued_messages()
-        assert sorted(popped) == ["legacy", "qb"]
-        assert list(session._queued_messages) == ["qa"]
-
-        # The retained row drains for its owner.
-        session._acting_user_id = "alice"
-        assert list(session._pop_queued_messages()) == ["qa"]
-        assert session._queued_messages == {}
-
-    def test_pop_with_empty_principal_drains_everything(self, tmp_db):
-        """CLI/internal lanes (empty effective principal) pop the whole
-        queue — an owned row cannot coexist with an empty actor (admission
-        fails closed on empty principals and the effective id is sticky), so
-        this arm only ever sees all-unowned queues."""
-        session = _make_session(user_id=None)
-        assert not (session._mcp_effective_user_id or "")
-        session.queue_message("internal one", interjector_user_id="", queue_msg_id="q1")
-        session._queued_messages["legacy"] = ("legacy words", "normal")
-
-        assert sorted(session._pop_queued_messages()) == ["legacy", "q1"]
-        assert session._queued_messages == {}
-
-    def test_retraction_ledger_survives_a_nested_partitioned_pop(self, tmp_db):
-        """Per-id ledger discipline: an inner pop (the wake send's flush
-        seams) must not destroy a suppression record guarding the OUTER wake
-        pop's window — a wholesale clear would let the restore resurrect a
-        message the user cancelled mid-wake (round-5 map, edge 3a)."""
-        session = _make_session(user_id="owner")
-        session._acting_user_id = "alice"
-        session.queue_message("outer", interjector_user_id="alice", queue_msg_id="q-outer")
-
-        outer = session._pop_queued_messages()
-        assert list(outer) == ["q-outer"]
-        # The pop OPENED the window: the id is in flight, which is the only
-        # reason the retraction below is recorded at all (round 6: misses
-        # for unheld ids record nothing — that unbounded growth was the
-        # price of unconditional recording under per-id discipline).
-        assert "q-outer" in session._popped_in_flight
-        # Retraction lands while the outer window holds the items.
-        assert session.dequeue_message("q-outer") is False
-        assert "q-outer" in session._retracted_while_popped
-
-        # An unrelated INNER pop (empty or different ids) must not consume
-        # the outer window's suppression record — nor close its window.
-        session.queue_message("inner", interjector_user_id="alice", queue_msg_id="q-inner")
-        inner = session._pop_queued_messages()
-        assert "q-outer" in session._retracted_while_popped
-        assert "q-outer" in session._popped_in_flight
-        session._close_pop_window(inner)
-        assert "q-inner" not in session._popped_in_flight
-        assert "q-outer" in session._popped_in_flight
-
-        # The outer restore honours the retraction, consumes its record, and
-        # closes the window it owned.
-        session._restore_queued_messages(outer)
-        assert "q-outer" not in session._queued_messages
-        assert "q-outer" not in session._retracted_while_popped
-        assert session._popped_in_flight == set()
-
-    def test_dequeue_miss_for_an_unheld_id_records_nothing(self, tmp_db):
-        """The ledger is bounded by OPEN pop windows: a miss for an id no
-        window holds — never queued, or already delivered and its window
-        closed — must record nothing.  Under per-id discipline nothing ever
-        prunes such an entry, so unconditional recording grew the set for
-        the session's lifetime (one permanent entry per retract-after-
-        delivery; unbounded for any authenticated writer looping DELETEs
-        with invented ids)."""
-        session = _make_session(user_id="owner")
-        session._acting_user_id = "alice"
-
-        # Never queued at all (the invented-id / other-node case).
-        assert session.dequeue_message("never-queued") is False
-        assert session._retracted_while_popped == set()
-
-        # Queued, popped, and its window CLOSED (delivered): the late
-        # retraction is a pure "already sent" no-op.
-        session.queue_message("delivered", interjector_user_id="alice", queue_msg_id="q-done")
-        popped = session._pop_queued_messages()
-        session._close_pop_window(popped)
-        assert session._popped_in_flight == set()
-        assert session.dequeue_message("q-done") is False
-        assert session._retracted_while_popped == set()
-
-    def test_identity_swap_drain_discards_what_cannot_land(self, tmp_db):
-        """Round-4 review pin: the /new//resume queue settlement never raises.
-        On a gone latch everything is discarded with a notice (flushing would
-        refuse and crash the REPL's only escape commands); a foreign-retained
-        entry is discarded with a notice rather than bleeding into the next
-        identity."""
-        # Gone latch: discard-all with notice.
-        ui = MagicMock()
-        session = _make_session(user_id="owner", ui=ui)
-        session._acting_user_id = "owner"
-        session.queue_message("stranded", interjector_user_id="owner", queue_msg_id="q1")
-        session._workstream_gone_ws = session._ws_id
-        # A stale in-flight marker must not outlive the identity swap: on
-        # the NEW workstream it would let a same-id miss record a bogus
-        # suppression.  (No window can be open on this CLI-only path — the
-        # clear is the belt-and-braces invariant, pinned here.)
-        session._popped_in_flight.add("stale-window-id")
-        session._drain_queue_for_identity_swap()
-        assert session._queued_messages == {}
-        assert session._popped_in_flight == set()
-        assert any("deleted" in str(c.args[0]) for c in ui.on_info.call_args_list)
-
-        # Foreign-retained entry on a healthy workstream: discarded, not bled.
-        ui2 = MagicMock()
-        session2 = _make_session(user_id="owner", ui=ui2)
-        session2._acting_user_id = "alice"
-        session2.queue_message("alice's words", interjector_user_id="alice", queue_msg_id="qa")
-        session2._acting_user_id = "bob"
-        session2._drain_queue_for_identity_swap()
-        assert session2._queued_messages == {}
-        assert not any(
-            "alice's words" in str(m.get("content")) for m in dicts_from_turns(session2.messages)
-        )
-        assert any("another participant" in str(c.args[0]) for c in ui2.on_info.call_args_list)
-
-    def test_identity_swap_mixed_queue_flushes_own_and_notices_foreign_only(self, tmp_db):
-        """Round-5 review pin (notice accuracy): on a mixed queue /new's
-        settlement persists the acting user's row into the CURRENT workstream
-        and the discard notice counts ONLY the other participant's rows."""
-        ui = MagicMock()
-        session = _make_session(user_id="owner", ui=ui)
-        session._acting_user_id = "alice"
-        session.queue_message("alice's words", interjector_user_id="alice", queue_msg_id="qa")
-        session._acting_user_id = "bob"
-        session.queue_message("bob's words", interjector_user_id="bob", queue_msg_id="qb")
-
-        session._drain_queue_for_identity_swap()
-
-        assert session._queued_messages == {}
-        # The flush's own window closed on the success path too.
-        assert session._popped_in_flight == set()
-        flushed = [
-            m
-            for m in dicts_from_turns(session.messages)
-            if m.get("role") == "user" and m.get("content") == "bob's words"
-        ]
-        assert len(flushed) == 1
-        notices = [str(c.args[0]) for c in ui.on_info.call_args_list]
-        assert any("1 queued message(s) from another participant" in n for n in notices)
-        assert not any("of your queued message" in n for n in notices)
-
-    def test_identity_swap_with_empty_queue_never_touches_the_journal(self, tmp_db):
-        """Round-5 review pin (total-ness): an empty queue skips the flush
-        preamble entirely, so a poisoned reconcile latch cannot raise out of
-        /new with nothing queued at all."""
-        from turnstone.core.session import ConversationPersistenceError
-
-        session = _make_session(user_id="owner")
-        session._conversation_persistence_failure_kind = "conflict"
-        session._conversation_persistence_error = ConversationPersistenceError("latched")
-
-        session._drain_queue_for_identity_swap()  # must not raise
-
-    def test_identity_swap_degrades_to_discard_when_the_flush_raises(self, tmp_db):
-        """Round-5 review pin (degrade arm): a flush failure of ANY class
-        becomes discard-with-notice — the escape commands can never be
-        blocked by an unhealthy journal, and the notice never miscounts the
-        actor's own rows as another participant's."""
-        ui = MagicMock()
-        session = _make_session(user_id="owner", ui=ui)
-        session._acting_user_id = "alice"
-        session.queue_message("alice's words", interjector_user_id="alice", queue_msg_id="qa")
-
-        with patch.object(
-            session, "_flush_queued_messages", side_effect=RuntimeError("journal refused")
-        ):
-            session._drain_queue_for_identity_swap()  # must not raise
-
-        assert session._queued_messages == {}
-        notices = [str(c.args[0]) for c in ui.on_info.call_args_list]
-        assert any("1 of your queued message(s)" in n for n in notices)
-        assert not any("another participant" in n for n in notices)
-
-    def test_failure_finalizer_retains_foreign_queue_and_records_error(self, tmp_db):
-        """Round-3 review: a foreign-owned queued entry (retained across its
-        owner's failed turn) must not abort the next actor's failure finalizer
-        via the ownership assert — ``_record_fatal_error`` always runs
-        (spinner convergence + last_error) while the entry stays queued for
-        its owner's next turn."""
-        ui = MagicMock()
-        session = _make_registered_session(user_id="owner", ui=ui)
-        session._acting_user_id = "alice"
-        session.queue_message("alice's words", interjector_user_id="alice", queue_msg_id="qa")
-        session._acting_user_id = "bob"
-
-        def _boom(_gen):
-            raise RuntimeError("provider blew up")
-
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(patch.object(session, "_stream_response", side_effect=_boom))
-            stack.enter_context(patch.object(session, "_full_messages", return_value=[]))
-            stack.enter_context(patch.object(session, "_update_token_table"))
-            stack.enter_context(patch.object(session, "_print_status_line"))
-            stack.enter_context(patch.object(session, "_emit_state"))
-            stack.enter_context(patch.object(session, "_visible_memory_count", return_value=0))
-            with pytest.raises(RuntimeError, match="provider blew up"):
-                session.send("bob's turn")
-
-        ui.on_error.assert_called()
-        assert "qa" in session._queued_messages
 
     def test_emit_state_surfaces_acting_user_to_ui(self, tmp_db):
         """_emit_state pushes the acting user (turn initiator, owner fallback)
@@ -9354,14 +7734,22 @@ class TestMetacognitiveBuffers:
             f"feedback must persist as a user row; saw: {user_saves!r}"
         )
 
-    def test_late_queue_arrival_waits_for_next_planned_user_boundary(self, tmp_db):
-        """A queue arrival after a boundary plan waits for the next USER turn.
+    def test_user_feedback_and_queued_coexistence_single_row_with_prefix(self, tmp_db):
+        """Seam 1 + Seam 2 coexistence — a queued message that lands
+        AFTER ``_collect_advisories`` already drained the queue for
+        the last tool result (Seam 1 closed) but BEFORE
+        ``_flush_queued_messages`` ran (Seam 2).  In production this
+        race is operator-typing during the approval prompt narrowly
+        crossing the boundary; here we simulate it by wrapping
+        ``_collect_advisories`` with a pass-through that queues a
+        new message AFTER the original returned.
 
-        Relevance planning must happen outside the generation commit. A message
-        arriving after that immutable plan cannot be folded into it honestly;
-        it remains queued until the next no-tool boundary, where it becomes a
-        separate genuine user turn (and can receive its own memory pointer).
-        """
+        The queued text rides Seam 2's flush as the suffix of a
+        single trailing user row, with ``user_feedback`` as the
+        prefix.  Crucially: NO back-to-back user rows (the strict-
+        template hazard the prefix-merge logic was added to fix).
+        Reverting the prefix-merge in ``_flush_queued_messages``
+        breaks this test."""
         session = _make_session()
         responses = [
             make_result(
@@ -9375,7 +7763,6 @@ class TestMetacognitiveBuffers:
                 ],
             ),
             make_result("ack"),
-            make_result("late ack"),
         ]
 
         def mock_execute(_tool_calls, *, principal_id: str = "", my_generation: int = 0):
@@ -9416,17 +7803,13 @@ class TestMetacognitiveBuffers:
             assert not (roles[i] == "user" and roles[i - 1] == "user"), (
                 f"back-to-back user rows at idx {i - 1}/{i} in {roles!r}"
             )
-        assert roles == [
-            "user",
-            "assistant",
-            "tool",
-            "user",
-            "assistant",
-            "user",
-            "assistant",
-        ]
-        assert msgs[3]["content"] == "y, use full path"
-        assert msgs[5]["content"] == "late arrival"
+        # Single trailing user row containing prefix + queued.
+        assert roles == ["user", "assistant", "tool", "user", "assistant"], (
+            f"expected single-trailing-user shape, got {roles!r}"
+        )
+        flushed_content = msgs[3]["content"]
+        # The two pieces are joined by the canonical separator.
+        assert flushed_content == "y, use full path\n\nlate arrival"
         # Queue cleared.
         assert session._queued_messages == {}
 
@@ -9637,25 +8020,40 @@ class TestMetacognitiveBuffers:
         assert sys_turn["_source"] == "user_interjection"
         assert sys_turn["content"].endswith("User message: inspect the histogram")
 
-    def test_first_turn_has_no_redundant_start_nudge(self, tmp_db):
-        """The immutable index/pointer path is the sole first-turn recall hint."""
+    def test_start_nudge_fires_through_send(self, tmp_db):
+        """Pin the +1 count-shift invariant — `start` must still fire on the
+        first user message after the nudge check moved before _append_user_turn.
+
+        Drives `send()` end-to-end with a mocked stream that raises
+        GenerationCancelled to exit the loop after the user turn + nudge
+        system turn have been appended. Asserts the start nudge became a
+        first-class ``system`` turn following the (clean) user turn and
+        the buffer drained."""
         from turnstone.core.session import GenerationCancelled
 
         session = _make_session()
-        with patch.object(
-            session,
-            "_stream_response",
-            side_effect=GenerationCancelled(),
+        # Stub visible memories so the start-nudge `memory_count > 0`
+        # gate passes — content of the memories doesn't matter here.
+        with (
+            patch.object(session, "_visible_memory_count", return_value=3),
+            patch.object(session, "_stream_response", side_effect=GenerationCancelled()),
         ):
             session.send("first user message")
 
+        # User turn landed clean; the start nudge follows it as a system turn.
         assert session.messages, "user message should have been appended"
         msgs = dicts_from_turns(session.messages)
         user_turns = [m for m in msgs if m.get("role") == "user"]
         assert user_turns[-1]["content"] == "first user message"
         assert "_reminders" not in user_turns[-1]
         sys_turns = [m for m in msgs if m.get("role") == "system"]
-        assert not any(m.get("_source") == "start" for m in sys_turns)
+        assert any(m["_source"] == "start" for m in sys_turns), (
+            f"expected a start system turn, got {sys_turns!r}"
+        )
+        assert any(
+            "saved memories from prior sessions" in m["content"] for m in sys_turns
+        )  # NUDGE_START body
+        # And the buffer drained.
         assert _user_pending(session) == []
 
     def test_emit_user_nudges_does_not_emit_visibility_ping(self, tmp_db):
@@ -9667,7 +8065,8 @@ class TestMetacognitiveBuffers:
         session.messages.append(turn_from_dict({"role": "user", "content": "noted"}))
         session._msg_tokens.append(1)
         session._queue_user_advisory("correction", "watch out")
-        session._emit_pending_user_nudges()
+        with patch("turnstone.core.session.save_message"):
+            session._emit_pending_user_nudges()
         info_lines = [call.args[0] for call in session.ui.on_info.call_args_list if call.args]
         assert not any("metacognition: nudge injected" in line for line in info_lines), (
             f"expected NO legacy ping, got {info_lines!r}"
@@ -9682,7 +8081,8 @@ class TestMetacognitiveBuffers:
         session.messages.append(turn_from_dict({"role": "user", "content": "noted"}))
         session._msg_tokens.append(1)
         session._queue_user_advisory("correction", "watch out")
-        session._emit_pending_user_nudges()
+        with patch("turnstone.core.session.save_message"):
+            session._emit_pending_user_nudges()
         assert session.ui.on_system_turn.call_count == 1
         content, source, meta = session.ui.on_system_turn.call_args.args
         assert content == "watch out"
@@ -9700,7 +8100,8 @@ class TestMetacognitiveBuffers:
         session.messages.append(turn_from_dict({"role": "user", "content": "noted"}))
         session._msg_tokens.append(1)
         session._queue_user_advisory("correction", "watch out")
-        session._emit_pending_user_nudges()
+        with patch("turnstone.core.session.save_message"):
+            session._emit_pending_user_nudges()
         # The system turn was appended despite the hook raising.
         assert turn_to_dict(session.messages[-1]) == {
             "role": "system",
@@ -9834,14 +8235,7 @@ class TestApplyPostExecuteAdvisories:
             try:
                 assert advisory_commit_entered.wait(2)
                 session.cancel()
-                abandoned, persistence_error = session.force_abandon_generation(
-                    target_is_current=lambda: True,
-                    clear_target=lambda: True,
-                    publish_abandoned=lambda: None,
-                )
-                assert abandoned is True
-                assert persistence_error is None
-                successor_generation = session._generation
+                successor_generation = session._claim_generation()
 
                 session._repeat_detector.clear()
                 session._repeat_detector.record("successor-signature")
@@ -10207,7 +8601,7 @@ class TestUserAdvisoryCancelClear:
 
         Fix: ``_flush_queued_messages`` returns whether anything drained;
         the no-tool branch ``continue``-s when it did."""
-        session = _make_registered_session()
+        session = _make_session()
         # Suppress the auto-title daemon thread the no-tool branch
         # would spawn — irrelevant to this test and would otherwise
         # call the mocked client from a background thread.
@@ -10231,6 +8625,7 @@ class TestUserAdvisoryCancelClear:
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
             patch.object(session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
         ):
             session.send("first message")
 
@@ -10304,6 +8699,7 @@ class TestDeliverWakeNudge:
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
             patch.object(session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
         ):
             session.deliver_wake_nudge_from_queue()
         # Queue drained.
@@ -10319,40 +8715,6 @@ class TestDeliverWakeNudge:
         sys_turns = [m for m in msgs if m.get("role") == "system"]
         assert {"role": "system", "_source": "idle_children", "content": "your kids"} in sys_turns
 
-    def test_foreign_retained_input_does_not_kill_the_wake(self, tmp_db):
-        """Round-4 review pin: a persistence-retained FOREIGN queued entry
-        must not make the wake raise CrossUserInterjectionError — neither at
-        the drain's pop nor at the wake send's mid-turn flush seams (the
-        spawn backstop would hot-loop while the nudge sat undelivered).
-        The foreign entry stays queued for its owner; the nudge drains
-        normally."""
-        session = _make_session(user_id="owner")
-        session._title_generated = True
-        session._acting_user_id = "alice"
-        session.queue_message(
-            "alice's retained words", interjector_user_id="alice", queue_msg_id="qa"
-        )
-        session._acting_user_id = "bob"
-        session._nudge_queue.enqueue("idle_children", "your kids", "any")
-        with (
-            patch.object(session, "_stream_response", return_value=make_result("ok")),
-            patch.object(session, "_full_messages", return_value=[]),
-            patch.object(session, "_update_token_table"),
-            patch.object(session, "_print_status_line"),
-            patch.object(session, "_emit_state"),
-            patch.object(session, "_visible_memory_count", return_value=0),
-        ):
-            session.deliver_wake_nudge_from_queue()
-        # The nudge drained onto the synthetic turn...
-        sys_turns = [m for m in dicts_from_turns(session.messages) if m.get("role") == "system"]
-        assert {"role": "system", "_source": "idle_children", "content": "your kids"} in sys_turns
-        # ...and alice's entry is retained, never consumed under bob.
-        assert "qa" in session._queued_messages
-        assert not any(
-            "alice's retained words" in str(m.get("content"))
-            for m in dicts_from_turns(session.messages)
-        )
-
     def test_marks_source_tag_on_synthesized_user_msg(self, tmp_db):
         session = _make_session()
         session._title_generated = True
@@ -10364,6 +8726,7 @@ class TestDeliverWakeNudge:
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
             patch.object(session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
         ):
             session.deliver_wake_nudge_from_queue()
         user_msgs = [m for m in dicts_from_turns(session.messages) if m.get("role") == "user"]
@@ -10381,6 +8744,7 @@ class TestDeliverWakeNudge:
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
             patch.object(session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
         ):
             session.deliver_wake_nudge_from_queue()
         # `finally` block resets the tag; production code outside the
@@ -10411,6 +8775,7 @@ class TestDeliverWakeNudge:
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
             patch.object(session, "_visible_memory_count", return_value=10),
+            patch("turnstone.core.session.save_message"),
         ):
             session.deliver_wake_nudge_from_queue()
         # No fresh correction entry was enqueued during the wake send.
@@ -10442,7 +8807,7 @@ class TestDeliverWakeNudge:
         wake turn never runs.  The mid-turn window is where the wake's
         chat loop and a real user message can still interleave.
         """
-        session = _make_registered_session()
+        session = _make_session()
         session._title_generated = True
         session._nudge_queue.enqueue("idle_children", "kids", "any")
 
@@ -10462,6 +8827,7 @@ class TestDeliverWakeNudge:
             patch.object(session, "_print_status_line"),
             patch.object(session, "_emit_state"),
             patch.object(session, "_visible_memory_count", return_value=0),
+            patch("turnstone.core.session.save_message"),
         ):
             session.deliver_wake_nudge_from_queue()
 
@@ -10506,7 +8872,7 @@ class TestDeliverWakeNudge:
         """
         from turnstone.core.storage import get_storage
 
-        session = _make_registered_session()
+        session = _make_session()
         session._title_generated = True
         session._queue_user_advisory("denial", "leftover")
         with (
@@ -10532,7 +8898,7 @@ class TestDeliverWakeNudge:
         """
         from turnstone.core.storage import get_storage
 
-        session = _make_registered_session()
+        session = _make_session()
         session._title_generated = True
         session._queue_user_advisory("denial", "do not do that")
         with (
@@ -11079,7 +9445,6 @@ class TestReminderSidechannelIsolation:
         ]
         assert copied[0].meta.extra["attachments_meta"] == [
             {
-                "attachment_id": user_attachment_id,
                 "kind": "text",
                 "filename": "notes.txt",
                 "mime_type": "text/plain",

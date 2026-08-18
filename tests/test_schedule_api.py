@@ -235,7 +235,6 @@ class TestScheduleAPI:
             json=_cron_payload(project_id="proj_x"),
         )
         assert resp.status_code == 403
-        assert storage.list_scheduled_tasks() == []
 
     def test_update_persona_and_project(self, client, storage):
         self._seed_persona(storage, name="scribe")
@@ -316,17 +315,8 @@ class TestScheduleAPI:
             created_by="original-owner",
             next_run="2099-01-01T09:00:00",
         )
-        # A public project is attachable with project.read even without membership.
+        # A public project the original owner (and anyone) can attach to.
         storage.create_project("proj_pub", "Pub", "someone-else", visibility="public")
-        storage.create_user("original-owner", "original-owner", "Original Owner", "hash")
-        storage.create_role(
-            "schedule-project-reader",
-            "schedule-project-reader",
-            "Schedule project reader",
-            "project.read",
-            False,
-        )
-        storage.assign_role("original-owner", "schedule-project-reader")
         resp = client.put(
             "/v1/api/admin/schedules/owned",
             json={"project_id": "proj_pub"},

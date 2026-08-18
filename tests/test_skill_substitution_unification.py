@@ -288,9 +288,8 @@ class TestSkillContextPlacement:
 
         session = make_session(skill="leak-skill")
         try:
-            messages = session._agent_system_messages_for_capabilities(frozenset({"memory"}))
-            assert len(messages) == 1
-            assert messages[0]["role"] == "system"
-            assert "SHOULD_NOT_LEAK" not in messages[0]["content"]
+            assert len(session._agent_system_messages) == 1
+            assert session._agent_system_messages[0]["role"] == "system"
+            assert "SHOULD_NOT_LEAK" not in session._agent_system_messages[0]["content"]
         finally:
             session.close()

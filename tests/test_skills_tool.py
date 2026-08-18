@@ -6,7 +6,6 @@ hint pattern, and the skill catalog disclosure in system messages.
 
 from __future__ import annotations
 
-import threading
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -106,7 +105,7 @@ def _make_session(*, kind: str = "interactive", user_id: str = "test-user") -> A
     # Truncation budget — required by _truncate_output on every exec.
     session.tool_truncation = 100_000
     # skills(action='find') ranks via BM25Index(..., reranker=self._bm25_reranker()),
-    # which reaches _resolve_rerank_lane -> self.tool_timeout. No _config_store/
+    # which reaches _resolve_rerank_client -> self.tool_timeout. No _config_store/
     # _registry here -> no endpoint -> reranker is None -> pure-BM25 path.
     session.tool_timeout = 30
 
@@ -313,7 +312,7 @@ class TestPrepareSkillsPermissionGate:
         # ...revoked between prepare and exec.
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=False),
-            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
         ):
             _, output = session._exec_skills(item)
         assert "permission denied" in output
@@ -335,7 +334,7 @@ class TestPrepareSkillsPermissionGate:
         storage = MagicMock()
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=False),
-            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
             patch("turnstone.core.audit.record_audit", side_effect=fake_record_audit),
         ):
             session._prepare_skills(
@@ -384,7 +383,7 @@ class TestExecSkillsFind:
             ]
         )
         item = session._prepare_skills("c", {"action": "find"})
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         import json as _json
 
@@ -406,7 +405,7 @@ class TestExecSkillsFind:
             [{"name": "x"}, {"name": "y"}, {"name": "z"}],
         ]
         item = session._prepare_skills("c", {"action": "find", "category": "nonexistent"})
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         assert "0 skills matched" in output
         # The hint is a first-class system turn now, not embedded in the result.
@@ -425,7 +424,7 @@ class TestExecSkillsFind:
         storage = MagicMock()
         storage.list_skills_filtered.return_value = []
         item = session._prepare_skills("c", {"action": "find"})
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         # Unfiltered no-results returns plain JSON, no hint queued.
         assert "[start system-reminder]" not in output
@@ -440,7 +439,7 @@ class TestExecSkillsFind:
             storage = MagicMock()
             storage.list_skills_filtered.return_value = []
             item = session._prepare_skills("c", {"action": "find"})
-            with patch("turnstone.core.session.get_storage", return_value=storage):
+            with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
                 session._exec_skills(item)
             call_kwargs = storage.list_skills_filtered.call_args.kwargs
             assert call_kwargs["kinds"] is None, (
@@ -480,7 +479,7 @@ class TestExecSkillsFind:
             },
         ]
         item = session._prepare_skills("c", {"action": "find"})
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         import json as _json
 
@@ -512,7 +511,7 @@ class TestExecSkillsFind:
             }
         ]
         item = session._prepare_skills("c", {"action": "find", "kind": "coordinator"})
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             session._exec_skills(item)
         call_kwargs = storage.list_skills_filtered.call_args.kwargs
         assert call_kwargs["kinds"] == ["coordinator", "any"]
@@ -560,7 +559,7 @@ class TestExecSkillsFind:
             },
         ]
         item = session._prepare_skills("c", {"action": "find", "query": "python pytest"})
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         import json as _json
 
@@ -592,7 +591,7 @@ class TestExecSkillsGet:
             "allowed_tools": "[]",
         }
         item = session._prepare_skills("c", {"action": "get", "name": "code-review"})
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         import json as _json
 
@@ -608,7 +607,7 @@ class TestExecSkillsGet:
         storage = MagicMock()
         storage.get_prompt_template_by_name.return_value = None
         item = session._prepare_skills("c", {"action": "get", "name": "ghost"})
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         assert "not found" in output
         assert "[start system-reminder]" not in output
@@ -637,7 +636,7 @@ class TestExecSkillsGet:
             "content": "Full body.",
         }
         item = session._prepare_skills("c", {"action": "get", "name": "coord-tagged"})
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         import json as _json
 
@@ -674,7 +673,7 @@ class TestExecSkillsLoad:
             "content": "do not load",
         }
         item = session._prepare_skills("c", {"action": "load", "name": "quarantined"})
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         assert "not found or disabled" in output
         assert session._skill_name is None  # never activated
@@ -686,7 +685,7 @@ class TestExecSkillsLoad:
         storage = MagicMock()
         storage.get_prompt_template_by_name.return_value = None
         item = session._prepare_skills("c", {"action": "load", "name": "ghost"})
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         assert "not found or disabled" in output
         assert session._skill_name is None
@@ -712,7 +711,7 @@ class TestExecSkillsLoad:
                 "risk_level": "low",
             }
             item = session._prepare_skills("c", {"action": "load", "name": skill_name})
-            with patch("turnstone.core.session.get_storage", return_value=storage):
+            with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
                 _, output = session._exec_skills(item)
             assert f"Loaded skill '{skill_name}'" in output, (
                 f"session kind={sess_kind!r} couldn't load row kind={row_kind!r}; "
@@ -734,7 +733,7 @@ class TestExecSkillsLoad:
             "risk_level": "low",
         }
         item = session._prepare_skills("c", {"action": "load", "name": "coord-persona"})
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         assert "Loaded skill 'coord-persona'" in output
         assert session._set_skill_called == [("coord-persona", "")]
@@ -753,7 +752,7 @@ class TestExecSkillsLoad:
             "risk_level": "low",
         }
         item = session._prepare_skills("c", {"action": "load", "name": "universal"})
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         assert "Loaded skill 'universal'" in output
         assert session._set_skill_called == [("universal", "")]
@@ -786,7 +785,7 @@ class TestExecSkillsLoad:
         assert item["approval_label"] != "skills__load__fix-issue__no-args"
         # Preview surfaces the args to the operator card.
         assert "arguments: 123 main" in item["preview"]
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output = session._exec_skills(item)
         assert "Loaded skill 'fix-issue'" in output
         # set_skill received the args verbatim — the renderer (covered
@@ -814,7 +813,7 @@ class TestExecSkillsLoad:
         item1 = session._prepare_skills(
             "c", {"action": "load", "name": "fix-issue", "arguments": "123 main"}
         )
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             session._exec_skills(item1)
 
         # Second load — same name, DIFFERENT args.  The fake set_skill
@@ -823,7 +822,7 @@ class TestExecSkillsLoad:
         item2 = session._prepare_skills(
             "c", {"action": "load", "name": "fix-issue", "arguments": "456 dev"}
         )
-        with patch("turnstone.core.session.get_storage", return_value=storage):
+        with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
             _, output2 = session._exec_skills(item2)
         # Second invocation re-renders rather than short-circuiting.
         assert "Loaded skill 'fix-issue'" in output2
@@ -942,7 +941,7 @@ class TestExecSkillsCreate:
                 },
             )
             assert item["needs_approval"] is True
-            with patch("turnstone.core.session.get_storage", return_value=storage):
+            with patch("turnstone.core.storage._registry.get_storage", return_value=storage):
                 session._exec_skills(item)
         # ``origin='model'`` stamps provenance so admins can distinguish
         # LLM-authored rows from human-installed ones at a glance.
@@ -969,7 +968,7 @@ class TestExecSkillsCreate:
 
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=True),
-            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
             patch("turnstone.core.audit.record_audit", side_effect=fake_record_audit),
         ):
             item = session._prepare_skills(
@@ -992,7 +991,7 @@ class TestExecSkillsCreate:
         storage.get_prompt_template_by_name.return_value = {"name": "existing"}
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=True),
-            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
         ):
             item = session._prepare_skills(
                 "c",
@@ -1073,7 +1072,7 @@ class TestExecSkillsCreate:
         storage.get_prompt_template.return_value = {}
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=True),
-            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
             patch(
                 "turnstone.core.audit.record_audit",
                 side_effect=RuntimeError("audit backend down"),
@@ -1127,7 +1126,7 @@ class TestExecSkillsUpdate:
         storage.get_prompt_template_by_name.return_value = row
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=True),
-            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
         ):
             item = session._prepare_skills(
                 "c",
@@ -1151,7 +1150,7 @@ class TestExecSkillsUpdate:
         session_b = _make_session()
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=True),
-            patch("turnstone.core.session.get_storage", return_value=storage_b),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage_b),
         ):
             item_b = session_b._prepare_skills(
                 "c",
@@ -1165,7 +1164,7 @@ class TestExecSkillsUpdate:
         storage.get_prompt_template_by_name.return_value = self._existing_row()
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=True),
-            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
             patch(
                 "turnstone.core.storage._utils.scan_skill_content",
                 return_value=("medium", "{}", "v1"),
@@ -1190,7 +1189,7 @@ class TestExecSkillsUpdate:
         storage.get_prompt_template_by_name.return_value = row
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=True),
-            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
         ):
             # ``content`` is NOT in the readonly runtime-fields set, so this
             # update has no applicable fields and should be rejected.
@@ -1219,7 +1218,7 @@ class TestExecSkillsUpdate:
         ]
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=True),
-            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
         ):
             item = session._prepare_skills(
                 "c", {"action": "update", "name": "existing", "description": "new"}
@@ -1239,7 +1238,7 @@ class TestExecSkillsUpdate:
         storage.list_skill_versions.return_value = []
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=True),
-            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
         ):
             item = session._prepare_skills(
                 "c", {"action": "update", "name": "existing", "description": "new"}
@@ -1267,7 +1266,7 @@ class TestExecSkillsToggle:
         # up the row to validate (existence + enabled state), exec writes.
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=True),
-            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
             patch("turnstone.core.audit.record_audit", side_effect=fake_record_audit),
         ):
             item = session._prepare_skills("c", {"action": "disable", "name": "x"})
@@ -1286,7 +1285,7 @@ class TestExecSkillsToggle:
         }
         with (
             patch("turnstone.core.auth.user_has_permission", return_value=True),
-            patch("turnstone.core.session.get_storage", return_value=storage),
+            patch("turnstone.core.storage._registry.get_storage", return_value=storage),
         ):
             item = session._prepare_skills("c", {"action": "disable", "name": "x"})
             assert "already disabled" in item.get("error", "")
@@ -1359,22 +1358,10 @@ class TestSkillCatalogDisclosure:
         session._applied_skill_content = None
         session.context_window = 128000
         session.messages = []
-        # ``__new__`` bypasses ChatSession's token-accounting defaults. Prefix
-        # publication invalidates any provider anchor when its bytes change,
-        # so mirror the real constructor state at that seam.
-        session._chars_per_token = 4.0
-        session._last_usage = None
-        session._token_calibrations = {}
-        session._active_token_calibration_key = None
-        session._last_usage_calibration_key = None
-        session._msg_tokens = []
-        session._system_tokens = 0
-        session._calibrated_msg_count = 0
         session._config = {}
         session.instructions = ""
         session.system_messages = []
-        session._agent_prompt_components = ()
-        session._memory_index_snapshot = None
+        session._agent_system_messages = []
         session.reasoning_effort = "medium"
         from turnstone.core.nudge_queue import NudgeQueue
 
@@ -1388,17 +1375,15 @@ class TestSkillCatalogDisclosure:
         session._tools = []
         session._client_type = ClientType.CLI
         session._username = ""
-        # This __new__-built session skips __init__'s attachment setup.
-        session._memory_attached_project_id = ""
-        session._generation_lock = threading.RLock()
-        session._publication_shutdown = False
-        session._system_prefix_lock = threading.RLock()
-        session._system_prefix_epoch = 0
-        session._system_prefix_dirty = True
-        session._system_prefix_signature = None
+        # _init_system_messages renders the attached project into the Session
+        # Context; this __new__-built session skips __init__'s project resolution,
+        # so seed the (unattached) defaults it reads.
+        session._project_name = ""
+        session._project_id = ""
+        session._project_writable = False
         session._kind = "interactive"
-        # Persona snapshot attrs (set by __init__, bypassed here): open
-        # defaults with no override, unrestricted tools, MCP + memory on.
+        # Persona snapshot attrs (set by __init__, bypassed here) — legacy
+        # defaults: no override, unrestricted tools, MCP + memory on.
         session._persona_name = ""
         session._persona_prompt = ""
         session._persona_tools = None
@@ -1406,9 +1391,8 @@ class TestSkillCatalogDisclosure:
         session._persona_memory = True
 
         session._memory_config = MagicMock()
-        session._memory_config.index_budget_chars = 65_536
+        session._memory_config.fetch_limit = 0
         session._user_id = "test-user"
-        session._acting_user_id = ""
         # _init_system_messages -> _recompute_shared_state reads the session
         # owner (_mcp_user_id) to decide shared-workstream framing; __init__
         # normally sets it from user_id, so seed it here for the __new__ build.
@@ -1421,14 +1405,15 @@ class TestSkillCatalogDisclosure:
         session._senders_dirty = True
         session._db_senders_loaded = True
         session._sender_label_nonce = "testnonce"
-        storage = MagicMock()
-        storage.get_memory_index_snapshot.return_value = None
+        session._mem_search_cache = {}
+        session._touched_memory_keys = set()
+
         with (
-            patch("turnstone.core.session.get_storage", return_value=storage),
             patch(
                 "turnstone.core.session.list_skills_by_activation",
                 return_value=search_skills or [],
             ),
+            patch.object(session, "_list_visible_memories", return_value=[]),
         ):
             session._init_system_messages()
 

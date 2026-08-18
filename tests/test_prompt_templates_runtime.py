@@ -74,8 +74,6 @@ class NullUI:
 
 
 def _make_session(**kwargs):
-    from turnstone.core.memory import register_workstream
-
     defaults = dict(
         client=MagicMock(),
         model="test-model",
@@ -86,12 +84,7 @@ def _make_session(**kwargs):
         tool_timeout=30,
     )
     defaults.update(kwargs)
-    session = ChatSession(**defaults)
-    # SessionManager establishes this parent row before constructing the live
-    # session.  The direct factory must do the same before slash commands can
-    # admit their keyed SYSTEM rows.
-    register_workstream(session.ws_id, user_id=kwargs.get("user_id"))
-    return session
+    return ChatSession(**defaults)
 
 
 def _sys_content(session: ChatSession) -> str:

@@ -15,15 +15,18 @@ from pathlib import Path
 
 import pytest
 
-from tests._js_harness_helpers import extract_braced as _extract_braced
-from tests._js_harness_helpers import strip_js_comments as _strip_comments
-
 _ROOT = Path(__file__).resolve().parent.parent
 _INTERACTIVE = _ROOT / "turnstone/shared_static/interactive.js"
 _COMPOSER = _ROOT / "turnstone/shared_static/composer.js"
 _AUTH = _ROOT / "turnstone/shared_static/auth.js"
 _APP = _ROOT / "turnstone/ui/static/app.js"
 _UI_INDEX = _ROOT / "turnstone/ui/static/index.html"
+
+
+def _strip_comments(js: str) -> str:
+    js = re.sub(r"/\*.*?\*/", "", js, flags=re.S)
+    js = re.sub(r"//[^\n]*", "", js)
+    return js
 
 
 def test_interactive_is_esm_imported_by_the_shell() -> None:
@@ -205,7 +208,7 @@ def test_media_playback_lifted_and_pane_owned() -> None:
         assert fn in body, f"media player helper must be lifted into the pane: {fn}"
     # The HLS vendor is fetched by absolute /shared/ URL (resolves in BOTH the
     # standalone server and the console, where /shared is mounted at the root).
-    assert 'script.src = "/shared/hls-1.7.0/hls.min.js";' in body
+    assert 'script.src = "/shared/hls-1.6.17/hls.min.js";' in body
     # Pane-owned + root-scoped — NOT a document-level delegated listener.
     assert 'this.el.addEventListener("click"' in body, (
         "media play must be wired on this.el (pane-owned), not document"
@@ -296,7 +299,6 @@ def test_rebuild_quiesces_live_events_and_releases_agent_tracking() -> None:
     ):
         assert line in seg, f"replayHistory must reset: {line!r}"
     assert "this._agentCards.clear();" in body
-    assert "this._agentContexts.clear();" in body
     # Review-hardened lifecycle: the card entry SURVIVES the terminal
     # tool_result (a late child event finding no Map entry would rebuild a
     # duplicate empty card beside the finished one), and transport-only
@@ -306,12 +308,10 @@ def test_rebuild_quiesces_live_events_and_releases_agent_tracking() -> None:
     # _loadHistoryThenConnect; terminal cleanup in the factory's destroy().
     assert "this._agentCards.delete(callId);" not in body
     disc = body.index("disconnectSSE() {")
-    disc_seg = body[
-        disc : body.index("_loadHistoryThenConnect(wsId, manualAttempt = false) {", disc)
-    ]
+    disc_seg = body[disc : body.index("_loadHistoryThenConnect(wsId) {", disc)]
     assert "this._clearAgentTracking();" not in disc_seg
     assert "this._replayQueue = null;" not in disc_seg
-    load = body.index("_loadHistoryThenConnect(wsId, manualAttempt = false) {")
+    load = body.index("_loadHistoryThenConnect(wsId) {")
     load_seg = body[load : body.index("async _refetchHistory(", load)]
     assert "this._clearAgentTracking();" in load_seg
     assert "this._replayQueue = null;" in load_seg
@@ -384,7 +384,7 @@ def test_interactive_refetch_failure_preserves_the_pane() -> None:
     # again.  The gate must be seedless-SCOPED — _loadHistoryThenConnect
     # disconnects first, so its evtSource is null for its whole fetch and
     # gating it would break every first paint, ws switch and resync.
-    ref = body.index("async _refetchHistory(")
+    ref = body.index("async _refetchHistory(wsId, token, seedCursor = false) {")
     ref_seg = body[ref : body.index("\n  _beginReplayQuiesce(token) {", ref)]
     gate = ref_seg.index("const cursorSafe =")
     gate_seg = ref_seg[gate : ref_seg.index(";", gate)]
@@ -487,7 +487,7 @@ def test_interactive_refetch_failure_preserves_the_pane() -> None:
     # survive a reload only when an armed truncation cursor lets the
     # reconnect resume into them; every other flavor (ws switch,
     # unarmed re-auth reload) resets.
-    lh = body.index("_loadHistoryThenConnect(wsId, manualAttempt = false) {")
+    lh = body.index("_loadHistoryThenConnect(wsId) {")
     lh_seg = body[lh : body.index("async _refetchHistory(", lh)]
     assert "if (this._truncatedFromCursor == null) this._resetStreamingRefs();" in lh_seg, (
         "reload must reset streaming refs unless a truncation resync is armed (#890)"
@@ -529,29 +529,17 @@ def test_interactive_refetch_failure_preserves_the_pane() -> None:
         "the idle edge must backstop the latch behind the truncated branch, "
         "skipping edges with a quiesced fetch already in flight"
     )
-    # The backstop must defer to the current event-backlog tail, then remain
-    # TRANSPORT-FREE: a quiesced same-token refetch, never
-    # _loadHistoryThenConnect.  A synchronous refetch here lets replay_ok's
-    # leading synthetic idle split the canonical backlog around a /history
-    # repaint; a transport reload draws another synthetic idle into this
-    # branch's own trigger (the round-5 storm).
+    # The backstop must be TRANSPORT-FREE: a quiesced same-token refetch,
+    # never _loadHistoryThenConnect — the reload's fresh reconnect draws
+    # the server's synthetic state_change:idle back into this branch's
+    # own trigger (the round-5 storm).
     backstop = body.index("} else if (this._historyStale && !this._replayQueue) {")
-    backstop_seg = body[backstop : body.index("// Only steal focus", backstop)]
-    assert "this._deferStaleHistoryBackstop();" in backstop_seg, (
-        "the idle edge must defer its stale heal to the event-backlog tail"
+    backstop_seg = body[backstop : backstop + 2200]
+    assert "this._refetchHistory(this.wsId, staleToken);" in backstop_seg, (
+        "the staleness backstop must heal via a quiesced REST refetch"
     )
     assert "this._loadHistoryThenConnect(" not in backstop_seg, (
         "the staleness backstop must never touch the transport (#890 r5)"
-    )
-    deferred = body.index("_deferStaleHistoryBackstop() {")
-    deferred_seg = body[deferred : body.index("\n  _clearAgentTracking() {", deferred)]
-    assert "queueMicrotask(() => {" in deferred_seg
-    assert "this._beginReplayQuiesce(staleToken);" in deferred_seg
-    assert "this._refetchHistory(staleWs, staleToken);" in deferred_seg, (
-        "the deferred staleness backstop must heal via a quiesced REST refetch"
-    )
-    assert "this._loadHistoryThenConnect(" not in deferred_seg, (
-        "the deferred staleness backstop must remain transport-free (#890 r5)"
     )
     # The retry yields to an in-flight quiesce (no same-token stomp).
     retry = cl_seg.index("this._staleRetryTimer = setTimeout(")
@@ -680,31 +668,21 @@ def test_pane_gates_send_on_cross_user_busy() -> None:
     # ...and drives the composer's hard block, re-run on every busy edge.
     assert "this.composer.setSendBlocked(" in body
     stripped = _strip_comments(body)
-    # The shared stripper is offset-preserving (comments become spaces), so
-    # slice to the method's real closing brace instead of a fixed byte
-    # window a comment edit could silently outgrow.
     setbusy = stripped.index("setBusy(b, source) {")
-    setbusy_end = stripped.index("\n  }", setbusy)
-    assert "this._reconcileSendBlock();" in stripped[setbusy:setbusy_end]
+    assert "this._reconcileSendBlock();" in stripped[setbusy : setbusy + 800]
 
 
 def test_pane_handles_cross_user_409() -> None:
     """The reactive fallback: a 409 (button not yet disabled) surfaces a clean
-    message, not the generic 'Connection error' catch.  Both the fetch-stage
-    conversion and the status ARM now live in the shared helper
-    (composer_queue.postAndSettleSend / settleSendResponse), so the pane owns
-    only the request — every send flow it has reaches the conversion by
-    construction instead of re-deriving it (the edit-and-resend flow used to
-    lack it and reported a refused resend as a connection error)."""
-    helper = (_ROOT / "turnstone/shared_static/composer_queue.js").read_text(encoding="utf-8")
-    assert "response.status === 409" in helper
-    assert 'status: "cross_user_interjection"' in helper
-    assert 'status === "cross_user_interjection"' in helper
+    message, not the generic 'Connection error' catch.  The pane converts
+    the 409 body at the fetch stage; the status ARM itself lives in the
+    shared settle helper (composer_queue.settleSendResponse) with the rest
+    of the response matrix."""
     body = _INTERACTIVE.read_text(encoding="utf-8")
-    assert "cross_user_interjection" not in body, (
-        "the 409 conversion must not be re-derived per pane"
-    )
-    assert body.count("postAndSettleSend(") == 2, "composer send + edit-and-resend"
+    assert "r.status === 409" in body
+    assert 'status: "cross_user_interjection"' in body
+    helper = (_ROOT / "turnstone/shared_static/composer_queue.js").read_text(encoding="utf-8")
+    assert 'status === "cross_user_interjection"' in helper
 
 
 def test_sync_approval_state_prunes_orphan_cycles() -> None:
@@ -882,7 +860,7 @@ def test_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None:
         r"this\._truncatedFromCursor = this\._lastEventId;",
         t,
     ), "the truncated case must record the truncation-time cursor keep-oldest"
-    load = body.index("_loadHistoryThenConnect(wsId, manualAttempt = false) {")
+    load = body.index("_loadHistoryThenConnect(wsId) {")
     load_seg = body[load : body.index("async _refetchHistory(", load)]
     assert "if (this.wsId !== wsId) this._truncatedFromCursor = null;" in load_seg, (
         "a ws switch must drop the old ws's truncation record"
@@ -1211,8 +1189,8 @@ def test_deferred_send_settle_protocol_pins() -> None:
     assert "deferred: !!data.deferred" in composer_queue
     assert "attachedCount: (data.attached_ids || []).length" in composer_queue
     assert "ctx.busyIsOptimistic()" in composer_queue
-    assert composer_queue.count("ctx.optimisticEl.remove()") >= 3, (
-        "retro-convert, queue_full, and attachments_busy must clear false optimistic bubbles"
+    assert composer_queue.count("ctx.optimisticEl.remove()") >= 2, (
+        "both the retro-convert and queue_full arms must clear the optimistic bubble"
     )
     # The missed-edge settle: a non-deferred chip binding onto an
     # already-idle pane missed its only sweep — the post-bind promote
@@ -1224,21 +1202,10 @@ def test_deferred_send_settle_protocol_pins() -> None:
     # consume the pane-tier settle event; the busy stamp is centralized in
     # each pane's setBusy (source defaults to "server" — only the send
     # flow's optimistic flip may ever be undone).
-    # postAndSettleSend wraps settleSendResponse with the fetch stage (rejected
-    # -body normalization, the 409 conversion, the accepted-guarded transport
-    # catch), so a pane reaching the settle matrix at all now proves it reached
-    # the whole choreography — the panes must not call settleSendResponse
-    # directly, which is how the edit-and-resend flows drifted.
-    assert "export function postAndSettleSend(queue, sendRequest, ctx)" in composer_queue
     for name, src in (("interactive.js", interactive), ("coordinator.js", coordinator)):
-        assert "postAndSettleSend(" in src, f"{name}: settle matrix must be the shared helper"
-        assert "settleSendResponse(" not in src, f"{name}: must not bypass the fetch stage"
+        assert "settleSendResponse(" in src, f"{name}: settle matrix must be the shared helper"
         assert "busyIsOptimistic" in src, name
         assert "paneIsBusy" in src, f"{name}: the missed-edge settle needs the live flag"
-        assert "mergeRejectedComposerText" in src, f"{name}: refused text must be restored"
-        assert src.count("restoreInput:") == 2, (
-            f"{name}: composer send and edit-resend both need refusal restoration"
-        )
         assert 'setBusy(true, "optimistic")' in src, f"{name}: optimistic flip must stamp"
         assert "parsePriority(" in src, f"{name}: shared !!! parse"
         assert 'case "message_dispatched"' in src, f"{name}: settle event not consumed"
@@ -1336,286 +1303,3 @@ console.log("settle matrix OK");
         timeout=15,
     )
     assert proc.returncode == 0, f"settle harness failed:\n{proc.stderr}\n{proc.stdout}"
-
-
-def test_stale_idle_refusals_restore_input(tmp_path) -> None:
-    """A stale local idle state must not render either busy refusal as
-    delivered or discard its companion text. Text entered during the POST is
-    retained after the rejected text, and an SSE idle that already arrived
-    prevents the old optimistic busy state from being reasserted."""
-    import shutil
-    import subprocess
-
-    if shutil.which("node") is None:
-        pytest.skip("node binary not available on PATH")
-    helper = _ROOT / "turnstone/shared_static/composer_queue.js"
-    script = tmp_path / "attachments_busy_harness.mjs"
-    script.write_text(
-        rf"""const {{ mergeRejectedComposerText, settleSendResponse }} =
-  await import("file://{helper}");
-
-function run(status, optimisticBusy) {{
-  const calls = [];
-  let composerValue = "typed during request";
-  const optimisticEl = {{
-    isConnected: true,
-    dataset: {{}},
-    remove: () => calls.push("remove-optimistic"),
-  }};
-  settleSendResponse(
-    {{ remove: () => calls.push("remove-queued") }},
-    {{ status }},
-    {{
-      queuedEl: null,
-      optimisticEl,
-      isBusy: false,
-      setBusy: (value) => calls.push("busy:" + value),
-      busyIsOptimistic: () => optimisticBusy,
-      paneIsBusy: () => optimisticBusy,
-      restoreInput: () => {{
-        composerValue = mergeRejectedComposerText("rejected", composerValue);
-        calls.push("restore");
-      }},
-      renderError: () => calls.push("error"),
-      consumeAttachments: () => calls.push("consume"),
-    }},
-  );
-  return {{ calls, composerValue }};
-}}
-
-for (const [status, expectedBusy] of [
-  ["attachments_busy", "busy:true"],
-  ["cross_user_interjection", "busy:false"],
-  ["queue_full", "busy:false"],
-]) {{
-  let result = run(status, true);
-  if (result.composerValue !== "rejected\ntyped during request")
-    throw new Error(status + " companion/current text merge drifted: " + result.composerValue);
-  for (const call of ["remove-optimistic", "restore", expectedBusy, "error"]) {{
-    if (!result.calls.includes(call))
-      throw new Error(status + " missing stale-idle settlement " + call + ": " + result.calls);
-  }}
-  if (result.calls.includes("consume") || result.calls.includes("remove-queued"))
-    throw new Error(status + " attachments/chip state was consumed: " + result.calls);
-
-  result = run(status, false);
-  if (result.calls.some((call) => call.startsWith("busy:")))
-    throw new Error(status + " overwrote a raced SSE state: " + result.calls);
-}}
-if (
-  mergeRejectedComposerText("rejected", "rejected\nlater") !==
-  "rejected\nrejected\nlater"
-)
-  throw new Error("independently typed matching text was discarded");
-if (mergeRejectedComposerText("rejected", "") !== "rejected")
-  throw new Error("empty composer did not restore rejected text");
-""",
-        encoding="utf-8",
-    )
-    proc = subprocess.run(
-        ["node", str(script)],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    assert proc.returncode == 0, f"attachments_busy harness failed:\n{proc.stderr}\n{proc.stdout}"
-
-
-def test_accepted_tool_event_recorded_only_when_painted() -> None:
-    """An unpainted accepted tool_result must stay replayable.
-
-    appendToolOutput returns false on every no-target path (transcript wiped
-    by clear_ui with the refetch in flight, a fresh mid-turn join); recording
-    the event id anyway would dedupe the ring's later replay and permanently
-    lose the tool's final guarded output.
-    """
-    body = _INTERACTIVE.read_text(encoding="utf-8")
-    case_start = body.index('case "tool_result"')
-    case = body[case_start : body.index("case ", case_start + 20)]
-    gate = case.index("if (\n          this.appendToolOutput(")
-    record = case.index("recordAcceptedToolEvent(this._renderedToolEventIds, evt)")
-    assert gate < record
-
-
-def test_task_agent_context_badge_is_keyed_idempotent_and_terminal_safe() -> None:
-    """Live and synthetic readings share one keyed reducer.
-
-    Context may precede the parallel parent row, repeat across the
-    store-before-enqueue refresh seam, or race a completed-history replay. The
-    map/relink/result guards keep all three cases convergent.
-    """
-    body = _INTERACTIVE.read_text(encoding="utf-8")
-    assert 'case "agent_context":' in body
-    assert "this._updateAgentContext(evt);" in body
-
-    update = body[
-        body.index("_updateAgentContext(evt) {") : body.index(
-            "_bufferAgentOrphan(", body.index("_updateAgentContext(evt) {")
-        )
-    ]
-    assert "this._agentContexts.set(parentId, { promptTokens, contextWindow });" in update
-    assert "terminal.row === parentRow" in update
-    assert "this._ensureAgentCard(parentId, true)" in update
-
-    relink = body[
-        body.index("_relinkAgentCards(items) {") : body.index(
-            "_updateAgentLabel(", body.index("_relinkAgentCards(items) {")
-        )
-    ]
-    assert "this._agentContexts.has(it.call_id)" in relink
-
-    sync = body[
-        body.index("_syncAgentContext(parentCallId, card) {") : body.index(
-            "_updateAgentContext(evt) {"
-        )
-    ]
-    assert "agentContextIsWarning(" in sync
-    assert 'card.context.textContent = used + " / " + total;' in sync
-    assert 'classList.toggle("conv-agent-context--warning", warning)' in sync
-    assert "this._syncAgentToggleLabel(card);" in sync
-
-    accessible = body[
-        body.index("_syncAgentToggleLabel(card) {") : body.index(
-            "_syncAgentContext(parentCallId, card) {"
-        )
-    ]
-    assert 'parts.push("running")' in accessible
-    assert 'parts.push("done")' in accessible
-    assert 'parts.push("failed")' in accessible
-    assert '"Warning: " + context.title' in accessible
-    assert 'label.textContent || "0 steps"' in accessible
-
-    assert "blockedByTerminalRow: parentRow" in update
-    state_case = body[body.index('case "state_change":') : body.index('case "tool_pending":')]
-    assert "reading.blockedByTerminalRow" in state_case
-
-    result = body[
-        body.index("appendToolOutput(callId") : body.index(
-            "sendMessage() {", body.index("appendToolOutput(callId")
-        )
-    ]
-    assert "this._agentContexts.delete(callId);" in result
-    assert "this._resetAgentContextBadge(agentCard);" in result
-    assert 'agentCard.wrap.dataset.contextOnly === "true"' in result
-    assert "agentCard.wrap.hidden = true;" in result
-
-    route = body[
-        body.index("_routeAgentItems(items") : body.index(
-            "_ensureAgentCard(parentCallId", body.index("_routeAgentItems(items")
-        )
-    ]
-    assert "delete card.wrap.dataset.contextOnly;" in route
-    assert "card.wrap.hidden = false;" in route
-
-
-def test_idless_agent_context_snapshot_relinks_after_parent_runtime(tmp_path: Path) -> None:
-    """An id-less fresh/truncated snapshot may precede its parent row.
-
-    Execute the production reducer and relinker together: the reading must be
-    retained without a row, stay keyed/idempotent on a duplicate snapshot, and
-    attach as soon as the parent task-agent occurrence paints.
-    """
-    import shutil
-    import subprocess
-
-    if shutil.which("node") is None:
-        pytest.skip("node binary not available on PATH")
-
-    body = _INTERACTIVE.read_text(encoding="utf-8")
-    update = _extract_braced(body, "  _updateAgentContext(evt) {").strip()
-    relink = _extract_braced(body, "  _relinkAgentCards(items) {").strip()
-    script = tmp_path / "agent_context_snapshot_harness.mjs"
-    script.write_text(
-        "const updateAgentContext = function "
-        + update
-        + ";\nconst relinkAgentCards = function "
-        + relink
-        + r""";
-
-let parentRow = null;
-let attached = 0;
-const pane = {
-  busy: true,
-  _agentContexts: new Map(),
-  _toolResultNodes: new Map(),
-  _toolRow() { return parentRow; },
-  _ensureAgentCard(parentId, contextOnly) {
-    if (!parentRow) return null;
-    const reading = this._agentContexts.get(parentId);
-    if (!reading || reading.promptTokens !== 27000 || reading.contextWindow !== 33000)
-      throw new Error("relink lost the snapshot reading");
-    if (!contextOnly) throw new Error("snapshot relink was not context-only");
-    attached += 1;
-    return { wrap: { dataset: { state: "running" } } };
-  },
-  _flushAgentOrphans() {},
-  _updateAgentContext: updateAgentContext,
-  _relinkAgentCards: relinkAgentCards,
-};
-const snapshot = {
-  type: "agent_context",
-  parent_call_id: "task-A",
-  prompt_tokens: 27000,
-  context_window: 33000,
-};
-if ("_event_id" in snapshot) throw new Error("fixture is not an id-less snapshot");
-pane._updateAgentContext(snapshot);
-pane._updateAgentContext(snapshot);
-if (pane._agentContexts.size !== 1 || attached !== 0)
-  throw new Error("pre-parent snapshot was dropped, duplicated, or attached early");
-parentRow = {};
-pane._relinkAgentCards([{ call_id: "task-A" }]);
-if (attached !== 1) throw new Error("snapshot did not attach when its parent painted");
-""",
-        encoding="utf-8",
-    )
-    proc = subprocess.run(
-        ["node", str(script)],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    assert proc.returncode == 0, f"agent context harness failed:\n{proc.stderr}\n{proc.stdout}"
-
-
-def test_replay_system_rows_do_not_terminate_the_tool_batch_window() -> None:
-    """A system row inside a tool batch is not a turn boundary: nulling
-    ``lastToolBlock`` in the ``role === "system"`` replay branch made every
-    tool result AFTER an interleaved row (mid-turn operator context, a
-    second writer's append) silently vanish from this pane while the
-    coordinator — whose indexHistoryToolOutcomes skips non-turn rows —
-    rendered the identical history correctly.  Only the user/assistant
-    branches may reset the anchor."""
-    body = _strip_comments(_INTERACTIVE.read_text(encoding="utf-8"))
-    start = body.index('(msg.role === "system")')
-    end = body.index("for (const leftovers of pendingAssessments.values())", start)
-    system_branch = body[start:end]
-    assert "lastToolBlock = null" not in system_branch, (
-        "the system replay branch terminates the batch result window — "
-        "interleaved-row tool results are dropped again"
-    )
-    # Mutation control: the anchor resets still exist in the turn branches
-    # (user, nudge-marker, assistant content/reasoning/pending arms).
-    loop = body[body.index("let lastToolBlock = null") : end]
-    assert loop.count("lastToolBlock = null") >= 4
-
-
-def test_orphan_tool_result_does_not_mark_a_batch_failed() -> None:
-    """Keeping the batch anchor live across non-turn rows means a tool row
-    that names a call_id this batch never issued (a result for an earlier
-    batch, a second writer's append) can reach the error stamp.  It must
-    not mark an all-succeeded batch as failed — the shared outcome index
-    skips unmatched occurrences for exactly this reason.  A row with NO
-    call_id is the legacy positional case and must still stamp, so the
-    guard keys on 'named a call_id we could not resolve', not on the
-    absence of a resolved target."""
-    body = _strip_comments(_INTERACTIVE.read_text(encoding="utf-8"))
-    assert "const isOrphanResult = !!msg.tool_call_id && !resultTarget;" in body, (
-        "the orphan discriminator must distinguish an unresolvable call_id "
-        "from a legacy row that carries none"
-    )
-    stamp = body.index("appendToolErrorBadge(lastToolBlock)")
-    guard = body.rindex("if (", 0, stamp)
-    assert "!isOrphanResult" in body[guard:stamp], (
-        "an orphan result can stamp conv-batch--error on a batch whose own calls all succeeded"
-    )

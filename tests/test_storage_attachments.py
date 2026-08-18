@@ -285,7 +285,6 @@ class TestReconstructMetaSibling:
         meta = backend.load_messages("ws-meta")[0].get("_attachments_meta")
         assert isinstance(meta, list) and len(meta) == 1
         assert meta[0] == {
-            "attachment_id": aid,
             "kind": "text",
             "filename": "doc.md",
             "mime_type": "text/markdown",

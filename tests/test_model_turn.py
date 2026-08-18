@@ -23,7 +23,6 @@ import pytest
 import turnstone.core.model_turn as model_turn_mod
 from tests._session_helpers import as_stream
 from turnstone.core.model_turn import (
-    ModelAdmissionError,
     ModelLane,
     finalize_provider_blocks,
     maybe_attach_vllm_chat_reasoning,
@@ -233,7 +232,7 @@ def test_resolve_model_binding_canonicalizes_empty_alias_to_default() -> None:
     assert binding.registry_generation == 7
 
 
-def test_model_turn_materializes_before_capacity_lease_and_mints_inside_hold() -> None:
+def test_model_turn_materializes_before_admission_and_mints_inside_hold() -> None:
     order: list[str] = []
 
     class _Gate:
@@ -317,177 +316,6 @@ def test_model_turn_materializes_before_capacity_lease_and_mints_inside_hold() -
             ],
         }
     ]
-
-
-def test_request_admission_composes_final_prefix_before_wire_preparation() -> None:
-    provider = _FakeProvider([CompletionResult(content="ok")])
-    prefix = {"value": "provisional prefix"}
-    order: list[str] = []
-
-    def admit(lane: ModelLane) -> None:
-        assert lane.model == "m"
-        order.append("admit")
-        prefix["value"] = "immutable admitted prefix"
-
-    def prepare(messages: list[dict[str, Any]], _lane: ModelLane) -> list[dict[str, Any]]:
-        order.append("prepare")
-        return [{"role": "system", "content": prefix["value"]}, *messages]
-
-    result = model_turn(
-        _lane(provider),
-        [Turn.user("hello")],
-        admit_request=admit,
-        prepare_wire=prepare,
-    )
-
-    assert order == ["admit", "prepare"]
-    assert provider.calls[0]["messages"][0]["content"] == "immutable admitted prefix"
-    assert "provisional" not in str(provider.calls[0]["messages"])
-    assert result.wire_msgs is provider.calls[0]["messages"]
-
-
-def test_request_admission_and_preparation_run_before_capacity_lease() -> None:
-    order: list[str] = []
-
-    class _Gate:
-        held = False
-
-        def acquire(self, *, cancel_ref: Any = None) -> Any:
-            del cancel_ref
-            order.append("acquire")
-            gate = self
-
-            class _Lease:
-                def __enter__(self) -> None:
-                    gate.held = True
-                    order.append("enter")
-
-                def __exit__(self, *_exc: object) -> None:
-                    gate.held = False
-                    order.append("release")
-
-            return _Lease()
-
-    gate = _Gate()
-    base_client = MagicMock()
-    bound_client = object()
-    base_client.with_options.return_value = bound_client
-
-    def admit(_lane: ModelLane) -> None:
-        assert not gate.held
-        order.append("admit")
-
-    def resolve(ids: list[str]) -> dict[str, Any]:
-        assert ids == ["image-1"]
-        assert not gate.held
-        order.append("materialize")
-        return {"image-1": {"type": "image_url", "image_url": {"url": "data:x"}}}
-
-    def prepare(messages: list[dict[str, Any]], _lane: ModelLane) -> list[dict[str, Any]]:
-        assert not gate.held
-        order.append("prepare")
-        return messages
-
-    def resolve_auth(_alias: str, _cfg: Any) -> str:
-        assert gate.held
-        order.append("auth")
-        return "minted-token"
-
-    class _Provider(_FakeProvider):
-        def create_streaming(self, **kwargs: Any) -> list[StreamChunk]:
-            assert gate.held
-            assert kwargs["client"] is bound_client
-            order.append("dispatch")
-            return super().create_streaming(**kwargs)
-
-    provider = _Provider([CompletionResult(content="ok")])
-    lane = ModelLane(
-        provider=provider,
-        client=base_client,
-        model="m",
-        alias="primary",
-        backend_auth_resolver=resolve_auth,
-        admission=gate,  # type: ignore[arg-type]
-    )
-
-    result = model_turn(
-        lane,
-        [Turn(Role.USER, (AttachmentRef(attachment_id="image-1", kind="image"),))],
-        admit_request=admit,
-        prepare_wire=prepare,
-        resolve_attachments=resolve,
-    )
-
-    assert result.content == "ok"
-    assert order == [
-        "admit",
-        "materialize",
-        "prepare",
-        "acquire",
-        "enter",
-        "auth",
-        "dispatch",
-        "release",
-    ]
-
-
-def test_request_admission_failure_never_acquires_capacity() -> None:
-    provider = _FakeProvider([CompletionResult(content="never")])
-    gate = MagicMock()
-    resolve_attachments = MagicMock()
-    lane = ModelLane(
-        provider=provider,
-        client=object(),
-        model="m",
-        admission=gate,
-    )
-
-    def reject(_lane: ModelLane) -> None:
-        raise RuntimeError("candidate refused")
-
-    with pytest.raises(ModelAdmissionError, match="RuntimeError") as raised:
-        model_turn(
-            lane,
-            [Turn(Role.USER, (AttachmentRef(attachment_id="image-1", kind="image"),))],
-            admit_request=reject,
-            resolve_attachments=resolve_attachments,
-        )
-
-    assert isinstance(raised.value.__cause__, RuntimeError)
-    resolve_attachments.assert_not_called()
-    gate.acquire.assert_not_called()
-    assert provider.calls == []
-
-
-def test_request_admission_abort_stops_before_attachments_or_capacity() -> None:
-    from turnstone.core.deadline import DeadlineCancelledError, StreamAbortRef
-
-    provider = _FakeProvider([CompletionResult(content="never")])
-    gate = MagicMock()
-    resolve_attachments = MagicMock()
-    cancel_ref = StreamAbortRef()
-    lane = ModelLane(
-        provider=provider,
-        client=object(),
-        model="m",
-        admission=gate,
-    )
-
-    def admit_and_abort(_lane: ModelLane) -> None:
-        cancel_ref.abort()
-
-    with pytest.raises(DeadlineCancelledError, match="aborted before dispatch"):
-        model_turn(
-            lane,
-            [Turn(Role.USER, (AttachmentRef(attachment_id="image-1", kind="image"),))],
-            admit_request=admit_and_abort,
-            resolve_attachments=resolve_attachments,
-            cancel_ref=cancel_ref,
-        )
-
-    resolve_attachments.assert_not_called()
-    gate.acquire.assert_not_called()
-    assert provider.calls == []
 
 
 def test_model_turn_releases_admission_before_retry_backoff(
@@ -673,38 +501,6 @@ def test_model_turn_retries_transient_mid_stream_death(monkeypatch: pytest.Monke
 
     assert result.content == "second try"
     assert len(provider.calls) == 2
-
-
-def test_drain_retry_reprepares_but_does_not_repeat_request_admission(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("turnstone.core.model_turn._DRAIN_RETRY_BASE_DELAY", 0.0)
-    provider = _FlakyProvider(
-        [
-            IncompleteStreamError("stream died mid-response"),
-            CompletionResult(content="second try"),
-        ]
-    )
-    admitted: list[str] = []
-    prepared: list[str] = []
-
-    def admit(_lane: ModelLane) -> None:
-        admitted.append("admit")
-
-    def prepare(messages: list[dict[str, Any]], _lane: ModelLane) -> list[dict[str, Any]]:
-        prepared.append("prepare")
-        return messages
-
-    result = model_turn(
-        ModelLane(provider=provider, client=object(), model="m"),
-        [Turn.user("x")],
-        admit_request=admit,
-        prepare_wire=prepare,
-    )
-
-    assert result.content == "second try"
-    assert admitted == ["admit"]
-    assert prepared == ["prepare", "prepare"]
 
 
 def test_model_turn_gives_up_after_retry_budget(monkeypatch: pytest.MonkeyPatch) -> None:
