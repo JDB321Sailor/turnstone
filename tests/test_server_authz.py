@@ -254,6 +254,9 @@ class _FakeSession:
         # When set, queue_message records the attempt and then raises it
         # (e.g. CrossUserInterjectionError for the drain's re-park arm).
         self.queue_raises: BaseException | None = None
+        # Principals for whom the fake models a retained queue item owned by
+        # somebody else.  The real session checks this at fresh-slot admission.
+        self.foreign_queue_principals: set[str] = set()
         self.fork_calls: list[tuple[str, str, bool]] = []
         # DELETE /send fall-through: ids the route asked this session to
         # dequeue (the fake never holds interjections, so it returns
@@ -273,13 +276,18 @@ class _FakeSession:
         attachment_ids: Any = None,
         queue_msg_id: str | None = None,
         interjector_user_id: str = "",
+        turn_principal_id: str | None = None,
     ) -> tuple[str, str, str]:
+        del turn_principal_id
         self.queue_calls.append(text)
         if self.queue_raises is not None:
             raise self.queue_raises
         cap = INTERJECTION_CAP_CHARS
         cleaned = text[:cap] + "..." if len(text) > cap else text
         return cleaned, "notice", queue_msg_id or "m1"
+
+    def has_foreign_queued_messages(self, principal_id: str) -> bool:
+        return principal_id in self.foreign_queue_principals
 
     def dequeue_message(self, msg_id: str) -> bool:
         self.dequeues.append(msg_id)
@@ -320,7 +328,8 @@ class _FakeSession:
     def close(self) -> None:
         pass
 
-    def handle_command(self, cmd: str) -> bool:
+    def handle_command(self, cmd: str, *, principal_id: str | None = None) -> bool:
+        del principal_id
         self.commands.append(cmd)
         if self.command_gate is not None:
             self.command_gate.wait(timeout=10)
@@ -697,6 +706,24 @@ class TestCrossTenantDelete:
 
 
 class TestCrossTenantApprove:
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"approved": "false"},
+            {"approved": True, "call_id": 123},
+        ],
+    )
+    def test_malformed_body_is_rejected_before_lookup(self, app_client, body):
+        client, _mgr = app_client
+
+        resp = client.post(
+            "/v1/api/workstreams/ws-missing/approve",
+            json=body,
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 400
+
     def test_non_owner_cannot_approve(self, app_client):
         from turnstone.core.storage import get_storage
 
@@ -950,9 +977,11 @@ class TestListWorkstreamsTrustedTeamVisibility:
             "user_id",
             "project_id",
             "persona",
+            "persistence_state",
         }
         assert row["kind"] == "interactive"
         assert row["user_id"] == "user-shape"
+        assert row["persistence_state"] == "healthy"
         # parent_ws_id is None for top-level interactive workstreams
         # (only coord-spawned children carry it).
         assert row["parent_ws_id"] is None
@@ -989,6 +1018,26 @@ class TestDashboardTrustedTeamVisibility:
         # The 1.6 singular field is GONE, not null — a consumer still
         # reading it should break loudly, not read None forever.
         assert "pending_approval_detail" not in rows[0]
+
+    def test_dashboard_projects_only_sanitized_persistence_state(self, app_client):
+        client, mgr = app_client
+        created = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "needs-history-repair"},
+            headers=_auth("user-a"),
+        )
+        ws = mgr.get(created.json()["ws_id"])
+        ws.session.conversation_persistence_status = lambda: {
+            "state": "retrying",
+            "attempts": 2,
+            "last_failure_at": "not-public",
+        }
+
+        row = client.get("/v1/api/dashboard", headers=_auth("user-a")).json()["workstreams"][0]
+
+        assert row["persistence_state"] == "retrying"
+        assert "attempts" not in row
+        assert "last_failure_at" not in row
 
     def test_dashboard_pending_approval_details_merge_judge_verdict(self, app_client):
         """When _pending_approval is set on a ws's UI, /dashboard
@@ -1223,10 +1272,12 @@ class TestPerWsSseGate:
         assert storage is not None
         _register_ws(storage, "ws-victim", "victim-user")
         resp = client.get(
-            "/v1/api/workstreams/ws-victim/events",
+            "/v1/api/workstreams/ws-victim/events?user_turn=1",
             headers=_auth("attacker-user"),
         )
         assert resp.status_code == 404
+        assert "user_turn" not in resp.text
+        assert "projection" not in resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -1318,6 +1369,51 @@ class TestInteractiveCancelLifted:
         assert ws.worker_thread is None
         assert ws._worker_running is False
 
+    def test_force_cancel_never_abandons_successor_that_replaces_pinned_target(
+        self,
+        app_client,
+    ):
+        """A exits and B spawns after Stop starts but before force cleanup."""
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None and ws.session is not None and ws.ui is not None
+        predecessor = threading.Thread(target=lambda: None, name="cancel-target-a")
+        successor = threading.Thread(target=lambda: None, name="fresh-successor-b")
+        with ws._lock:
+            ws._worker_running = True
+            ws.worker_thread = predecessor
+            ws._worker_principal_id = "alice"
+
+        def _cancel_and_replace_target() -> None:
+            # Deterministically occupy the exact window between the handler's
+            # target snapshot and its later force-ownership decision.
+            with ws._lock:
+                assert ws.worker_thread is predecessor
+                ws._worker_running = False
+                ws.worker_thread = None
+                ws._worker_principal_id = ""
+                ws._worker_running = True
+                ws.worker_thread = successor
+                ws._worker_principal_id = "bob"
+
+        ws.session.cancel = _cancel_and_replace_target  # type: ignore[method-assign]
+        resp = client.post(
+            f"/v1/api/workstreams/{ws_id}/cancel",
+            json={"force": True},
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 200
+        assert ws.worker_thread is successor
+        assert ws._worker_running is True
+        assert ws._worker_principal_id == "bob"
+        event_types = [event.get("type") for event in ws.ui._enqueued]
+        assert "cancelled" in event_types
+        assert "stream_end" not in event_types
+        assert "idle" not in ws.ui.states
+
     def test_cancel_returns_400_when_session_missing(self, app_client):
         """Parity with coord: a placeholder workstream (session=None)
         gets a 400 ``"No session"`` rather than a silent no-op 200.
@@ -1358,28 +1454,26 @@ class TestInteractiveEventsLifted:
     section.
     """
 
-    def test_events_replay_yields_connected_first(self):
-        """Pre-lift ``events_sse`` yielded a ``connected`` event
-        first (model + skip_permissions). The lifted callback
-        preserves the order so client SSE handlers that key on
-        the connected event for state setup keep working."""
-        from turnstone.server import _interactive_events_replay
+    def test_shared_preamble_yields_connected_first(self):
+        """The shared handler's preamble preserves connected-event shape."""
+        from turnstone.core.session_replay import session_replay_preamble
 
         ws, ui, request = _make_interactive_replay_mocks()
-        out = list(_interactive_events_replay(ws, ui, request))
+        out = list(session_replay_preamble(ws.session, ui, project_name="Visible Project"))
         assert out[0]["type"] == "connected"
         assert out[0]["model"] == "gpt-5"
         assert out[0]["model_alias"] == "default"
+        assert out[0]["project_name"] == "Visible Project"
         assert out[0]["skip_permissions"] is False
 
-    def test_events_replay_includes_status_only_when_last_usage_present(self):
+    def test_shared_preamble_includes_status_only_when_last_usage_present(self):
         """The ``status`` event populates the per-tab token-usage
         bar on resume. Skipped when ``session._last_usage`` is None
         (a freshly-created workstream that hasn't completed a turn)."""
-        from turnstone.server import _interactive_events_replay
+        from turnstone.core.session_replay import session_replay_preamble
 
-        ws, ui, request = _make_interactive_replay_mocks()
-        out = list(_interactive_events_replay(ws, ui, request))
+        ws, ui, _request = _make_interactive_replay_mocks()
+        out = list(session_replay_preamble(ws.session, ui))
         assert "status" not in {ev["type"] for ev in out}
 
     def test_events_replay_yields_pending_approval_then_verdicts(self):
@@ -1623,6 +1717,35 @@ class TestCompactCommandDispatch:
         # Never ran inline, never queued a phantom compaction.
         assert ws.session.compacts == 0
         assert ws.session.commands == []
+
+    def test_foreign_retained_queue_refuses_fresh_send_before_worker_spawn(self, app_client):
+        """A persistence-retained interjection keeps its original owner.
+
+        The foreign-owner check runs inside the atomic fresh-slot admission,
+        but ``session_worker.send`` reports that refusal as ``False``.  The
+        route must preserve the typed conflict outcome instead of falling
+        through to its generic queue-full response, and no worker may bind or
+        append the later participant's turn.
+        """
+
+        client, mgr = app_client
+        ws_id = self._create_ws(client)
+        ws = mgr.get(ws_id)
+        assert ws is not None
+        ws.session.foreign_queue_principals.add("user-1")
+
+        response = client.post(
+            f"/v1/api/workstreams/{ws_id}/send",
+            json={"message": "must wait for the retained owner"},
+            headers=_auth("user-1"),
+        )
+
+        assert response.status_code == 409
+        assert response.json()["status"] == "cross_user_interjection"
+        assert ws.session.sends == []
+        assert ws.session.queue_calls == []
+        assert ws.worker_thread is None
+        assert ws._worker_running is False
 
     def test_non_compact_commands_complete_before_response(self, app_client):
         """Quick commands dispatch through the same worker slot (mutual
@@ -2354,6 +2477,7 @@ class TestCompactCommandDispatch:
         msg_id = r.json()["msg_id"]
         queued_events = [e for e in ws.ui._enqueued if e.get("type") == "message_queued"]
         assert [e["msg_id"] for e in queued_events] == [msg_id]
+        assert [e["sender"] for e in queued_events] == ["user-1"]
         gate.set()
         wait_until(
             lambda: any(e.get("type") == "message_dispatched" for e in ws.ui._enqueued),
@@ -2803,6 +2927,90 @@ class TestRequireProjectMountWiring:
         body = resp.json()
         assert not (resp.status_code == 400 and body.get("code") == "require_project"), body
 
+    def test_unreadable_project_refuses_without_partial_create(
+        self,
+        app_client,
+        make_config_store,
+    ):
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        client.app.state.config_store = make_config_store()
+        storage = get_storage()
+        assert storage is not None
+        storage.create_project(
+            "public-without-read",
+            "Public Without Read",
+            "project-owner",
+            visibility="public",
+        )
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "must-not-exist", "project_id": "public-without-read"},
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 403
+        assert resp.json() == {"error": "project is not available for workstream attachment"}
+        assert mgr.list_all() == []
+        assert storage.list_workstreams() == []
+
+    def test_padded_owned_project_is_persisted_and_listed_canonically(
+        self,
+        app_client,
+        make_config_store,
+    ):
+        from turnstone.core.storage import get_storage
+
+        client, _mgr = app_client
+        client.app.state.config_store = make_config_store()
+        storage = get_storage()
+        assert storage is not None
+        storage.create_project("p1", "Project One", "user-1")
+        headers = _auth(
+            "user-1",
+            permissions=_DEFAULT_TEST_PERMS | frozenset({"project.read"}),
+        )
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "canonical-project", "project_id": "  p1  "},
+            headers=headers,
+        )
+
+        assert resp.status_code == 200, resp.text
+        ws_id = resp.json()["ws_id"]
+        row = storage.get_workstream(ws_id)
+        assert row is not None and row["project_id"] == "p1"
+        assert [item["ws_id"] for item in storage.list_workstreams_for_project("p1")] == [ws_id]
+        resources = client.get("/v1/api/projects/p1/resources", headers=headers)
+        assert resources.status_code == 200, resources.text
+        assert [item["ws_id"] for item in resources.json()["workstreams"]] == [ws_id]
+
+    def test_padded_unknown_project_refuses_without_partial_create(
+        self,
+        app_client,
+        make_config_store,
+    ):
+        from turnstone.core.storage import get_storage
+
+        client, mgr = app_client
+        client.app.state.config_store = make_config_store()
+        storage = get_storage()
+        assert storage is not None
+
+        resp = client.post(
+            "/v1/api/workstreams/new",
+            json={"name": "must-not-exist", "project_id": "  missing  "},
+            headers=_auth("user-1"),
+        )
+
+        assert resp.status_code == 400
+        assert resp.json() == {"error": "unknown project_id"}
+        assert mgr.list_all() == []
+        assert storage.list_workstreams() == []
+
     def test_flag_off_forwarded_service_cannot_fork_private_nonmember(
         self, app_client, make_config_store, monkeypatch
     ):
@@ -2938,12 +3146,12 @@ class TestCreateForkRollback:
             if event.get("type") in {"ws_created", "ws_rename"}
         }
 
-    def test_source_replacement_after_preflight_cannot_inherit_fork(
+    def test_replaced_source_incarnation_is_rejected_after_preflight(
         self,
         app_client,
         monkeypatch,
     ) -> None:
-        from turnstone.core.storage import ForkCloneExpectation, get_storage
+        from turnstone.core.storage import get_storage
 
         client, mgr = app_client
         storage = get_storage()
@@ -2951,7 +3159,6 @@ class TestCreateForkRollback:
         source_id = "8" * 32
         destination_id = "9" * 32
         self._register_source(storage, source_id, with_history=True)
-        replacement_token = "replacement-source-incarnation"
 
         def _replace_at_pre_commit(
             session: _FakeSession,
@@ -2965,19 +3172,24 @@ class TestCreateForkRollback:
             assert source_reservation_token
             assert storage.get_workstream_reservation_token(source_id) == (source_reservation_token)
             assert storage.delete_workstream(source_id) is True
-            assert storage.register_workstream(
-                source_id,
-                user_id="user-1",
-                name="replacement-source",
-                state="idle",
-                kind="interactive",
-                fork_reservation_token=replacement_token,
+            assert (
+                storage.register_workstream(
+                    source_id,
+                    user_id="user-1",
+                    name="replacement-source",
+                    state="idle",
+                    kind="interactive",
+                    fork_reservation_token="replacement-incarnation",
+                )
+                is True
             )
-            storage.save_message(source_id, "user", "replacement must not fork")
-            destination_token = str(getattr(session, "_fork_reservation_token", ""))
-            assert destination_token
+            replacement = storage.get_workstream(source_id)
+            assert replacement is not None
+            assert replacement["name"] == "replacement-source"
+            from turnstone.core.storage import ForkCloneExpectation
+
             return storage.clone_workstream(
-                source_id,
+                fork_source_id,
                 session.ws_id,
                 principal_id=principal_id,
                 trusted_internal=trusted_internal,
@@ -2986,7 +3198,9 @@ class TestCreateForkRollback:
                     project_id="",
                     project_name="",
                     project_writable=False,
-                    destination_reservation_token=destination_token,
+                    destination_reservation_token=(
+                        storage.get_workstream_reservation_token(session.ws_id)
+                    ),
                     source_reservation_token=source_reservation_token,
                 ),
             )
@@ -3009,11 +3223,7 @@ class TestCreateForkRollback:
         replacement = storage.get_workstream(source_id)
         assert replacement is not None
         assert replacement["name"] == "replacement-source"
-        assert "fork_reservation_token" not in replacement
-        assert storage.get_workstream_reservation_token(source_id) == replacement_token
-        assert [turn.text for turn in storage.load_message_turns(source_id)] == [
-            "replacement must not fork"
-        ]
+        assert storage.get_workstream_reservation_token(source_id) == "replacement-incarnation"
 
     def test_destination_storage_failure_rolls_back_destination(
         self, app_client, monkeypatch

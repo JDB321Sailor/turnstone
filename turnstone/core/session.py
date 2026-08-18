@@ -22,6 +22,7 @@ import json
 import mimetypes
 import os
 import queue
+import random
 import re
 import shlex
 import shutil
@@ -33,9 +34,9 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from html import escape as _html_escape
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, cast
 
 import httpx
 
@@ -62,6 +63,7 @@ from turnstone.core.background_shells import (
 from turnstone.core.config import get_searxng_engines, get_searxng_url, get_workspace_dir
 from turnstone.core.deadline import StreamAbortRef
 from turnstone.core.edit import find_occurrences, pick_nearest
+from turnstone.core.ip_classify import AddressLane
 from turnstone.core.log import get_logger
 from turnstone.core.lowering import (
     TIMEOUT_OUTCOME_CLAUSE,
@@ -76,45 +78,40 @@ from turnstone.core.lowering import (
 )
 from turnstone.core.mcp_client import try_prime_user_pools
 from turnstone.core.memory import (
-    count_messages,
+    acquire_memory_index_snapshot,
+    clear_last_error,
     count_structured_memories,
-    delete_messages_after,
-    delete_structured_memory_by_id,
     delete_workstream,
+    find_structured_memory_scopes,
     get_attachments,
-    get_compaction_checkpoint,
-    get_compaction_floor,
-    get_compaction_watermark,
     get_skill_by_name,
-    get_structured_memory_by_name,
     get_workstream_display_name,
     list_default_skills,
     list_skills_by_activation,
-    list_structured_memories,
-    list_visible_structured_memories,
     list_workstreams_with_history,
     load_message_turns,
     load_workstream_config,
-    normalize_key,
+    normalize_memory_name,
+    persist_last_error,
+    prospective_memory_index,
     resolve_workstream,
-    save_attachment,
+    sanitize_error_text,
     save_message,
     save_messages_bulk,
-    save_structured_memory,
+    save_tool_message_with_attachments,
+    save_user_message_with_attachments,
     save_workstream_config,
     search_history,
     search_history_recent,
-    search_structured_memories,
-    search_visible_structured_memories,
-    set_message_attachments,
     set_workstream_alias,
-    touch_structured_memories,
     update_workstream_title,
+)
+from turnstone.core.memory_index import (
+    normalize_memory_description,
+    render_memory_pointer,
 )
 from turnstone.core.memory_relevance import (
     MemoryConfig,
-    build_memory_context,
-    extract_recent_context,
     score_memories,
 )
 from turnstone.core.metacognition import (
@@ -142,6 +139,7 @@ from turnstone.core.model_backend_auth import (
 from turnstone.core.model_registry import ModelClientConstructionError
 from turnstone.core.model_turn import (
     TRAILING_INFO_SEPARATOR,
+    ModelAdmissionError,
     ModelLane,
     ModelTurnResult,
     ResolvedModelBinding,
@@ -194,13 +192,23 @@ from turnstone.core.preview import (
 )
 from turnstone.core.ratelimit import TokenBucket
 from turnstone.core.safety import is_command_blocked, sanitize_command
-from turnstone.core.settings_registry import DEFAULT_AUTO_COMPACT_PCT
+from turnstone.core.session_worker import WorkerClaim, current_worker_claim
+from turnstone.core.settings_registry import (
+    DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+    DEFAULT_AUTO_COMPACT_PCT,
+)
 from turnstone.core.skill_field_validation import SKILL_RUNTIME_CONFIG_FIELDS
 from turnstone.core.skill_parser import MAX_SKILL_DESCRIPTION_LEN
+from turnstone.core.storage import (
+    AttachmentWrite,
+    ConversationCommitConflictError,
+    ConversationCommitWorkstreamGoneError,
+)
 from turnstone.core.storage._registry import get_storage
 from turnstone.core.storage._utils import (
     COMPACTION_SOURCE,
     COMPACTION_SUMMARY_LABEL,
+    ProjectMemoryAuthorizationError,
     attachment_to_content_part,
     normalize_search_terms,
 )
@@ -223,6 +231,7 @@ from turnstone.core.tools import (
     merge_mcp_tools,
 )
 from turnstone.core.trajectory import (
+    PROVENANCE_META_KEY,
     AttachmentRef,
     EffectStatus,
     ProviderNative,
@@ -230,6 +239,7 @@ from turnstone.core.trajectory import (
     TextBlock,
     ToolCall,
     Turn,
+    TurnProvenance,
     dicts_from_turns,
     last_assistant_text,
     turn_from_dict,
@@ -237,11 +247,12 @@ from turnstone.core.trajectory import (
     turns_from_dicts,
 )
 from turnstone.core.watch import WATCH_REMINDER_OPTIONAL_KEYS
-from turnstone.core.web import check_ssrf, fetch_with_ssrf_guard, strip_html
+from turnstone.core.web import fetch_with_ssrf_guard, screen_url, strip_html
 from turnstone.core.workstream import (
     INTERJECTION_CAP_CHARS,
     PENDING_SENDS_MAX,
     WorkstreamKind,
+    concrete_method,
 )
 from turnstone.prompts import (
     INTERACTIVE_CONSENT_CLIENT_TYPES,
@@ -256,7 +267,7 @@ from turnstone.ui.colors import DIM, GRAY, GREEN, RED, RESET, YELLOW, bold, cyan
 log = get_logger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator, Mapping
 
     from turnstone.core.config_store import ConfigStore
     from turnstone.core.healthcheck import BackendHealthTracker, HealthTrackerRegistry
@@ -270,7 +281,7 @@ if TYPE_CHECKING:
     )
     from turnstone.core.output_guard import OutputAssessment
     from turnstone.core.output_guard_judge import OutputGuardJudge, OutputJudgeVerdict
-    from turnstone.core.rerank import RerankClient, Reranker
+    from turnstone.core.rerank import Reranker, RerankHit, RerankLane
     from turnstone.core.storage import ForkCloneSnapshot
     from turnstone.core.web_search import WebSearchClient
 
@@ -325,6 +336,27 @@ class CrossUserInterjectionError(Exception):
     """
 
 
+class ConversationPersistenceError(Exception):
+    """An accepted conversation row could not be durably reconciled.
+
+    The row remains in the live history handoff journal.  Later sends must stop
+    before appending a causal suffix until the idempotent commit succeeds (or a
+    history read proves that an in-row-only commit already landed).  This is
+    distinct from an ordinary provider/tool failure: generic failure cleanup
+    flushes queued user messages, which would create a durable row *after* the
+    missing boundary.
+    """
+
+
+class _MalformedToolBatchError(RuntimeError):
+    """Provider tool calls cannot be executed without unambiguous identities."""
+
+
+_CONVERSATION_PERSISTENCE_RETRY_BASE_SECONDS = 1.0
+_CONVERSATION_PERSISTENCE_RETRY_CAP_SECONDS = 60.0
+_SOFT_CLOSE_STRUCTURAL_WAIT_SECONDS = 1.0
+
+
 class _CompactionIrreducibleError(Exception):
     """Raised by ``ChatSession._summarize_blocks`` when chunked summarisation
     cannot shrink the input — a recursion level fails to reduce the block count,
@@ -339,10 +371,46 @@ class _CompactionIrreducibleError(Exception):
 
 @dataclasses.dataclass(frozen=True)
 class _SummaryResult:
-    """Compacted text plus the provider label from its final model turn."""
+    """Compacted text plus the identity of its final model turn."""
 
     text: str
     producer: str | None
+    provenance: TurnProvenance = dataclasses.field(default_factory=TurnProvenance)
+
+
+_ModelCalibrationKey = tuple[str, str, int]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _TokenCalibration:
+    """One producing model binding's prompt estimator.
+
+    ``prompt_tokens`` anchors the exact prefix whose object identities ride in
+    ``message_prefix_ids``.  ``None`` retains the learned tokenizer ratio while
+    explicitly invalidating an anchor after a structural history replacement.
+    """
+
+    chars_per_token: float
+    prompt_tokens: int | None = None
+    message_prefix_ids: tuple[int, ...] = ()
+
+
+def _usable_input_capacity(context_window: int, max_tokens: int) -> int:
+    """Return prompt capacity after the response reserve and safety margin."""
+    response_reserve = min(max_tokens, context_window // 4)
+    safety_margin = int(context_window * 0.05)
+    return max(0, context_window - response_reserve - safety_margin)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ServingFailureContext:
+    """Secret-free identity of the lane that raised a terminal stream error."""
+
+    model_alias: str
+    backend_model_id: str
+    registry_generation: int
+    provider_label: str
+    base_url: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -362,6 +430,31 @@ class _CancelledToolResult:
     is_error: bool
     preview: dict[str, Any] | None
     live_emitted: bool
+
+
+@dataclasses.dataclass(frozen=True)
+class _PendingConversationCommit:
+    """One accepted conversation row awaiting a complete durable ACK.
+
+    ``ack_from_durable_row`` is normally true because every accepted row kind
+    uses one keyed transaction (including user/tool attachments). It is
+    switched off after an immutable-key conflict: seeing a different durable
+    row with the same key must not acknowledge or hide the intended pending
+    operation.
+    """
+
+    commit_key: str
+    message: dict[str, Any]
+    persist: Callable[[], int]
+    ack_from_durable_row: bool = True
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ToolStructuralDebt:
+    """One accepted assistant tool-call block awaiting matching TOOL rows."""
+
+    generation: int
+    call_ids: tuple[str, ...]
 
 
 def _cancelled_observed_result_detail(
@@ -428,6 +521,11 @@ class _CancelRef(list[Any]):
     classifier, and the per-turn usage-slot resets all key on it.  A
     superseded arrival does not fire it — an orphan must not record
     health or reset the successor's usage slots.
+
+    ``register_cancel_handle`` is the deliberately unarmed sibling used while
+    an adapter validates a non-stream HTTP body.  It publishes the closeable
+    handle for Stop/close, but does not append, set ``armed``, or fire the hook;
+    a rejected response must remain a creation failure.
     """
 
     __slots__ = ("_session", "_my_generation", "_on_first_append", "_armed")
@@ -480,6 +578,28 @@ class _CancelRef(list[Any]):
         if refused:
             with contextlib.suppress(Exception):
                 stream.close()
+
+    def register_cancel_handle(self, handle: Any) -> None:
+        """Publish *handle* for cancellation without arming this attempt."""
+        session = self._session
+        with session._generation_lock:
+            refused = (
+                session._publication_shutdown
+                or self._superseded()
+                or session._cancel_event.is_set()
+            )
+            if not refused:
+                session._cancel_stream = handle
+        if refused:
+            with contextlib.suppress(Exception):
+                handle.close()
+
+    def unregister_cancel_handle(self, handle: Any) -> None:
+        """Clear a still-current cancellation-only handle by identity."""
+        session = self._session
+        with session._generation_lock:
+            if session._cancel_stream is handle:
+                session._cancel_stream = None
 
     @property
     def aborted(self) -> bool:
@@ -909,7 +1029,21 @@ class _StreamTurnConsumer:
             content = self.partial_content()
             self._flush_terminal_carries()
             self._session.ui.on_stream_end()
-            self._session._cancelled_partial_msg = {"role": "assistant", "content": content}
+            msg: dict[str, Any] = {"role": "assistant", "content": content}
+            lane = self.lane
+            if lane is not None:
+                principal_id = (
+                    self._session._generation_principals.get(self._my_generation, "")
+                    if self._my_generation
+                    else ""
+                )
+                msg["_provenance"] = TurnProvenance(
+                    model_alias=lane.alias,
+                    backend_model_id=lane.model,
+                    registry_generation=lane.registry_generation,
+                    acting_principal_id=principal_id,
+                ).to_meta()
+            self._session._cancelled_partial_msg = msg
 
         self._session._publish_for_generation(
             self._my_generation,
@@ -1085,6 +1219,9 @@ _active_task_agent_cancel_scope: contextvars.ContextVar[_ParallelModelCancelScop
 # item that crosses judge/UI serialization boundaries.
 _active_tool_origin_generation: contextvars.ContextVar[int] = contextvars.ContextVar(
     "turnstone_active_tool_origin_generation", default=0
+)
+_active_tool_prepare_principal: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "turnstone_active_tool_prepare_principal", default=None
 )
 
 # Generation whose bounded live commit is currently staging durable closures
@@ -1466,12 +1603,100 @@ _VALID_MEMORY_SCOPES: tuple[str, ...] = (
     "project",
 )
 
-# Implicit-scope walk for INTERACTIVE ``memory(action='get'/'delete')``
-# when no scope is specified.  Narrowest → widest so the most
-# session-specific row wins on a name collision.  Coord sessions use a
-# different walk (just ``("coordinator",)``) — see
-# :meth:`ChatSession._implicit_scope_walk`.
-_IMPLICIT_SCOPE_WALK: tuple[str, ...] = ("workstream", "user", "global")
+_MEMORY_MIXED_BATCH_ERROR = (
+    "Error: memory read and write actions cannot run in the same tool batch. "
+    "Split the mutation and the follow-up read across separate assistant turns."
+)
+
+
+def _batch_policy(
+    group: str,
+    access: Literal["read", "write"],
+    mixed_access_error: str,
+    *,
+    serialize: bool = False,
+) -> dict[str, str | bool]:
+    """Declare action-dependent execution constraints on a prepared tool item."""
+    return {
+        "group": group,
+        "access": access,
+        "mixed_access_error": mixed_access_error,
+        "serialize": serialize,
+    }
+
+
+@dataclasses.dataclass(frozen=True)
+class _MemoryAccess:
+    """One actor-specific, live memory authorization snapshot."""
+
+    principal_id: str
+    attached_project_id: str
+    project_id: str
+    project_name: str
+    project_writable: bool
+
+    @property
+    def signature(self) -> tuple[str, str, str, str, bool]:
+        """Cache witness for actor/project visibility and prompt metadata."""
+        return (
+            self.principal_id,
+            self.attached_project_id,
+            self.project_id,
+            self.project_name,
+            self.project_writable,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class _PromptComponent:
+    """One system-prompt fragment guarded by generic capability tags."""
+
+    content: str
+    required_capabilities: frozenset[str] = frozenset()
+
+
+@dataclasses.dataclass(frozen=True)
+class _SystemPrefixPlan:
+    """A fully rendered prefix awaiting one generation-owned publication."""
+
+    composition_epoch: int
+    memory_signature: tuple[str, str, str, str, bool]
+    shared_state: tuple[str, set[str], bool]
+    agent_prompt_components: tuple[_PromptComponent, ...]
+    system_messages: list[dict[str, Any]]
+
+
+@dataclasses.dataclass(frozen=True)
+class _MemoryIndexSizing:
+    """Frozen inputs for prefix-only admission arithmetic."""
+
+    capabilities: ModelCapabilities
+    chars_per_token: float
+    input_capacity: int
+    context_window: int
+
+
+@dataclasses.dataclass(frozen=True)
+class _MemoryIndexAdmissionPlan:
+    """Storage-free facts needed to validate and install one candidate."""
+
+    prefix: _SystemPrefixPlan
+    lane: ModelLane
+    candidate_witness: tuple[str, str]
+    sizing: _MemoryIndexSizing
+
+
+class _MemoryIndexContextError(RuntimeError):
+    """The complete memory-bearing request cannot fit the serving model."""
+
+
+class _MemoryIndexPlanStaleError(RuntimeError):
+    """The transaction candidate no longer matches its storage-free plan."""
+
+    def __init__(self, snapshot: dict[str, Any]) -> None:
+        super().__init__("memory-index admission plan changed during capture")
+        self.snapshot = snapshot
+
 
 # ``list_nodes`` reserves four top-level kwargs for control parameters
 # (filters / paging / output verbosity / liveness toggle).  Anything
@@ -1488,6 +1713,13 @@ _LIST_NODES_RESERVED_ARGS: frozenset[str] = frozenset(
 # result; all reads can't race) and reject only the mixed read+write
 # shape where ``tasks(list)`` paralleled with ``tasks(add=...)`` has
 # unspecified ordering inside ``_execute_tools``'s ThreadPoolExecutor.
+_TASKS_MIXED_BATCH_ERROR = (
+    "Error: tasks(...) read (`list`) and write "
+    "(`add` / `update` / `remove` / `reorder`) actions cannot run in the "
+    "same parallel tool batch — the read-after-write ordering is not guaranteed. "
+    "All-reads or all-writes are fine; mix only by splitting them across separate "
+    "assistant turns."
+)
 _TASKS_READ_ACTIONS: frozenset[str] = frozenset({"list"})
 _TASKS_WRITE_ACTIONS: frozenset[str] = frozenset({"add", "update", "remove", "reorder"})
 
@@ -1790,14 +2022,26 @@ _BACKEND_NOT_FOUND_EXC_NAMES: frozenset[str] = frozenset({"NotFoundError"})
 _BACKEND_AUTH_EXC_NAMES: frozenset[str] = frozenset(
     {"AuthenticationError", "PermissionDeniedError"}
 )
-_BACKEND_RATE_LIMIT_EXC_NAMES: frozenset[str] = frozenset({"RateLimitError"})
+_BACKEND_RATE_LIMIT_EXC_NAMES: frozenset[str] = frozenset(
+    {"RateLimitError", "UpstreamRateLimitError"}
+)
+_BACKEND_TRANSIENT_EXC_NAMES: frozenset[str] = frozenset({"UpstreamTransientError"})
+# Backend-reported stream errors stay OUT of ``_BACKEND_KNOWN_EXC_NAMES``:
+# their messages can carry a real context-window rejection, which
+# ``_is_ctx_overflow`` must see before the formatter categorizes them.  The
+# OpenAI SDK raises ``APIError`` for an in-band SSE error object;
+# ``UpstreamResponseError`` is Turnstone's equivalent for a compatibility
+# proxy that returns the same error as an HTTP-200 JSON body.  Its classified
+# rate-limit and transient subclasses stay IN the known set above so their
+# token-quota wording cannot be mistaken for context overflow.
+_BACKEND_REPORTED_EXC_NAMES: frozenset[str] = frozenset({"APIError", "UpstreamResponseError"})
 # Mid-response stream deaths: the normalized shape every guarded iterator
 # raises (``IncompleteStreamError`` from ``drain_stream`` /
-# ``transport_guarded``) plus the raw httpx names for any future unguarded
-# path (defense in depth).  Unioning them into ``_BACKEND_KNOWN_EXC_NAMES``
-# is required — ``_format_backend_error`` gates on that set before the
-# branch lookups — and makes these three names ineligible for
-# ``_is_ctx_overflow``'s text-based overflow detection (its class
+# ``transport_guarded``) plus the raw HTTPX/HTTPX2 names for any future
+# unguarded path (defense in depth).  Unioning them into
+# ``_BACKEND_KNOWN_EXC_NAMES`` is required — ``_format_backend_error`` gates
+# on that set before the branch lookups — and makes these three names
+# ineligible for ``_is_ctx_overflow``'s text-based overflow detection (its class
 # self-gate): harmless, since their texts are fixed transport/SSL strings
 # that never carry overflow phrases.
 _BACKEND_STREAM_EXC_NAMES: frozenset[str] = frozenset(
@@ -1810,6 +2054,7 @@ _BACKEND_KNOWN_EXC_NAMES: frozenset[str] = (
     | _BACKEND_NOT_FOUND_EXC_NAMES
     | _BACKEND_AUTH_EXC_NAMES
     | _BACKEND_RATE_LIMIT_EXC_NAMES
+    | _BACKEND_TRANSIENT_EXC_NAMES
     | _BACKEND_STREAM_EXC_NAMES
 )
 
@@ -1854,6 +2099,7 @@ def _is_ctx_overflow(exc: BaseException) -> bool:
         for s in (
             "context length",
             "maximum context",
+            "available context size",
             "context window",
             "context limit",
             "prompt is too long",
@@ -2047,48 +2293,118 @@ def _notify_auth_headers() -> dict[str, str]:
     return header
 
 
-def _screen_tool_url(url: str, allow_private_network: bool) -> tuple[str | None, bool]:
+def _screen_tool_url(url: str, allow_private_network: bool) -> tuple[str | None, bool, bool]:
     """SSRF-screen a tool's target URL under the operator's private-network opt-in.
 
     ``allow_private_network`` is the live ``tools.allow_private_network``
     setting (admin Settings → Tools; DB-backed, hot-toggleable — the caller
-    reads it per prepare).  Returns ``(error, private_origin)``.  ``error`` is
-    the rejection text (``None`` = proceed); a private-address rejection names
-    the setting so a self-hosted operator learns the knob from the refusal
-    itself.  ``private_origin`` is True when the target NAMES a private
-    address the operator opted into: the approval header tags it, and the
-    guarded fetch skips per-hop screening for that chain — the gate approved a
-    private URL, so its redirects are the operator's own network.  Public
-    origins never set it, keeping the public→private redirect bounce blocked
-    regardless of the opt-in.
+    reads it per prepare).  Returns ``(error, private_origin, private_block)``.
+
+    ``error`` is the rejection text, or ``None`` to proceed.  A private-address
+    rejection names the setting so a self-hosted operator learns the knob from
+    the refusal itself.
+
+    ``private_block`` means the target is in the PRIVATE lane — the lane the
+    opt-in governs — so callers can label the request without re-deriving that
+    from the refusal wording.  It is about the LANE, not about the outcome: it
+    is True both when the opt-in cleared the target and when the absence of the
+    opt-in refused it.  Callers use it for the "(private network)" header.
+
+    ``private_origin`` is True when the operator opted in and EVERY address the
+    target resolves to is private.  A hostname answering with both a private
+    and a public record is refused instead, naming the remedy: the connection
+    may land on either record, so approving it would not describe where the
+    fetch actually goes.  Public origins never set it, keeping the
+    public→private redirect bounce blocked regardless of the opt-in.
+
+    Because a granted chain therefore starts wholly private,
+    ``fetch_with_ssrf_guard`` never has to make an exception for the origin —
+    it revokes private-hop permission after any hop that is not wholly private
+    and needs no notion of an "approved host".
     """
-    ssrf_err = check_ssrf(url)
-    if not ssrf_err:
-        return None, False
-    is_private_block = "private/internal address" in ssrf_err
+    screen = screen_url(url)
+    if screen.error is None:
+        return None, False, False
+    # The LANE is the contract, not the wording. Substring-matching the refusal
+    # text made a docstring rewrap able to silently open the opt-in lane for
+    # cloud metadata, with nothing failing at the edit site.
+    is_private_block = screen.lane is AddressLane.PRIVATE
+    ssrf_err = screen.error
     if is_private_block and allow_private_network:
-        return None, True
+        if screen.all_private:
+            return None, True, True
+        # A hostname answering with BOTH a private and a public address cannot
+        # be approved as a private-network target: the connection may land on
+        # either, so the approval would not describe where the fetch goes, and
+        # granting the chain private-hop permission on that basis let an
+        # attacker-controlled public record steer the fetcher into the network.
+        # Refused with the remedy, rather than silently narrowed.
+        return (
+            f"Error: {ssrf_err}. That hostname also resolves to a public address, so it"
+            " cannot be approved as a private-network target — point the tool at the"
+            " LAN address directly.",
+            False,
+            True,
+        )
     hint = ""
     if is_private_block:
         hint = (
             " Enable 'tools.allow_private_network' in the console"
             " (Settings → Tools) to allow fetching private-network addresses."
         )
-    return f"Error: {ssrf_err}.{hint}", False
+    return f"Error: {ssrf_err}.{hint}", False, is_private_block
+
+
+def _attachment_writes(attachments: Iterable[Attachment]) -> tuple[AttachmentWrite, ...]:
+    """Project resolved attachments onto the atomic conversation-write shape.
+
+    ``size_bytes`` is derived from the content actually being written rather
+    than carried alongside it, so the durable row can never disagree with the
+    blob.  Shared by the user-turn path and both accepted-TOOL-row paths.
+    """
+    return tuple(
+        AttachmentWrite(
+            attachment_id=attachment.attachment_id,
+            filename=attachment.filename,
+            mime_type=attachment.mime_type,
+            size_bytes=len(attachment.content),
+            kind=attachment.kind,
+            content=attachment.content,
+        )
+        for attachment in attachments
+    )
 
 
 def _tool_turn_meta(
-    status: EffectStatus | None, preview: dict[str, Any] | None = None
+    status: EffectStatus | None,
+    preview: dict[str, Any] | None = None,
+    *,
+    acting_principal: str = "",
 ) -> str | None:
     """Serialize a tool turn's typed side-channels to the ``conversations.meta``
-    JSON envelope: the effect disposition and/or the preview-pane descriptor.
-    Role-exclusive with ``source_meta`` (which rides SYSTEM turns); the decode +
-    role routing lives in ``reconstruct_turns``. No channels → no meta."""
+    JSON envelope: the effect disposition, the preview-pane descriptor, and/or
+    the principal the turn executed under.  Role-exclusive with ``source_meta``
+    (which rides SYSTEM turns); the decode + role routing lives in
+    ``reconstruct_turns``. No channels → no meta.
+
+    ``acting_principal`` is the generation's bound acting principal — the same
+    identity the accepted ASSISTANT row records as its provenance
+    ``acting_principal_id`` axis — so revocation and audit queries can read a
+    TOOL row's principal directly instead of joining back to the assistant row
+    that opened its batch.  It is deliberately NOT the four-axis provenance
+    envelope: a tool row is an effect receipt, not a model attempt, and empty
+    kernel axes would falsify what that envelope promises.  Empty (wake,
+    internal, and CLI lanes) omits the key rather than persisting a
+    meaningless empty string, matching the USER row's ``sender`` convention.
+    Private audit metadata: no projection lowers it to a wire or public
+    payload."""
     envelope: dict[str, Any] = {}
     if status is not None:
         envelope["effect_status"] = status.value
     if preview:
         envelope["preview"] = preview
+    if acting_principal:
+        envelope["acting_principal"] = acting_principal
     return json.dumps(envelope) if envelope else None
 
 
@@ -2103,13 +2419,14 @@ def _tool_turn_meta(
 # wire-preparation fault continues it — only the mask reads this set.)
 _SELF_SURFACING_ERRORS: tuple[type[Exception], ...] = (
     BackendAuthUnavailableError,
+    ModelAdmissionError,
     WirePreparationError,
 )
 
 # Creation failures that say nothing about the BACKEND: the caller's own
 # lowering raised.  Recording them would paint a cluster-wide outage over
 # one session's malformed history.
-_NON_BACKEND_ERRORS: tuple[type[Exception], ...] = (WirePreparationError,)
+_NON_BACKEND_ERRORS: tuple[type[Exception], ...] = (ModelAdmissionError, WirePreparationError)
 
 
 def _speaks_for_backend(err: BaseException) -> bool:
@@ -2117,6 +2434,56 @@ def _speaks_for_backend(err: BaseException) -> bool:
     predicate both walk arms use, so primary and fallback can never
     classify the same error differently."""
     return not isinstance(err, _NON_BACKEND_ERRORS)
+
+
+_QueuedRow = tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]
+
+
+def _queued_row_owner(row: tuple[str, ...]) -> str:
+    """Owner principal of a queued-message row; ``""`` = unowned/legacy.
+
+    THE single reading of the tuple layout "owner is index 2 when
+    present" — the partition pop, the foreign-row predicate, the
+    identity-swap notice counting, and the advisory sender stamp must
+    all agree, or the before_spawn gate and the retention behavior
+    contradict each other.  Deliberately no ``.strip()``: owners are
+    stripped at write time and legacy rows injected by tests must read
+    back verbatim.
+    """
+    return row[2] if len(row) >= 3 and row[2] else ""
+
+
+def _queued_row_client_send_id(row: tuple[str, ...]) -> str:
+    """Browser correlation id of a queued row; ``""`` when absent.
+
+    The ``row[3]`` sibling of :func:`_queued_row_owner` — both fields'
+    layout knowledge is single-sourced together.
+    """
+    return row[3] if len(row) >= 4 and row[3] else ""
+
+
+@dataclasses.dataclass(frozen=True)
+class _GenuineUserTurnPlan:
+    """One admitted human turn and its derived, body-free memory pointer."""
+
+    content: str
+    principal_id: str
+    memory_pointer: str
+
+
+@dataclasses.dataclass(frozen=True)
+class _QueuedFlushPlan:
+    """Immutable, outside-lock plan for one trailing USER turn.
+
+    Queue rows stay in the live queue until generation admission. The commit
+    consumes only rows that still match this snapshot; a retraction therefore
+    wins cleanly and suppresses the precomputed pointer rather than exposing a
+    relevance decision for text that was never admitted.
+    """
+
+    prefix: str
+    items: tuple[tuple[str, _QueuedRow], ...]
+    turn: _GenuineUserTurnPlan
 
 
 class ChatSession:
@@ -2250,6 +2617,7 @@ class ChatSession:
             model_binding,
             lane=dataclasses.replace(
                 model_binding.lane,
+                registry_generation=model_binding.registry_generation,
                 temperature=temperature,
                 reasoning_effort=reasoning_effort or None,
                 backend_auth_resolver=self._model_backend_auth_token,
@@ -2275,8 +2643,21 @@ class ChatSession:
         # cannot improve until an admin edits it.
         self._rebind_failed_key: tuple[str, int] | None = None
         self._rebind_failed_cause: str | None = None
+        # Exception objects are not uniformly attribute- or weakref-capable.
+        # Retain the value-only lane snapshot out-of-band until the fatal
+        # formatter consumes it; no client, resolver, credential, or principal
+        # crosses this boundary.
+        self._serving_failure_context_lock = threading.Lock()
+        self._serving_failure_contexts: dict[int, tuple[BaseException, _ServingFailureContext]] = {}
         self._health_registry = health_registry
         self.ui = ui
+        # Give the UI a self-derivation path for session-owned reporting
+        # (persistence state) so it never resolves this session through a
+        # registry by id — that lookup misses (or hits an id-reuse
+        # replacement) exactly during tombstone retention and retirement.
+        bind_session = concrete_method(ui, "bind_session")
+        if bind_session is not None:
+            bind_session(self)
         self.instructions = instructions
         self.temperature = temperature
         self.max_tokens = max_tokens
@@ -2381,15 +2762,13 @@ class ChatSession:
             except Exception:
                 log.debug("rule_registry.init_failed", exc_info=True)
         self._memory_config = memory_config or MemoryConfig()
-        # Per-turn cache for _search_visible_memories — _init_system_messages
-        # fires many times within one turn (state transitions, MCP refresh,
-        # tool results) and the recent-context string is identical across
-        # them.  Invalidated on user-turn append and on memory write/delete.
-        self._mem_search_cache: dict[tuple[str, str, int], list[dict[str, str]]] = {}
-        # Per-turn dedup for composition touches: ``_init_system_messages`` runs
-        # many times within a turn, so the injected set is touched at most once
-        # per memory per turn.  Cleared alongside the search cache.
-        self._touched_memory_keys: set[tuple[str, str, str]] = set()
+        # Prefix composition stays outside the lock because storage and MCP
+        # lookups may block. Each attempt carries an epoch and only the newest
+        # still-current attempt may publish.
+        self._system_prefix_lock = threading.RLock()
+        self._system_prefix_epoch = 0
+        self._system_prefix_dirty = True
+        self._system_prefix_signature: tuple[str, str, str, str, bool] | None = None
         # Per-send memo for the wire attachment resolver (set in send(), None
         # outside a send).  _resolve_attachments re-runs on every agentic
         # round-trip, so this caches the materialized part by
@@ -2399,31 +2778,21 @@ class ChatSession:
             dict[tuple[str, tuple[bool, bool, bool]], dict[str, Any] | list[dict[str, Any]]] | None
         ) = None
         self._ws_id = ws_id or uuid.uuid4().hex
-        # Internal destination-incarnation witness installed by
-        # SessionManager after construction for HTTP fork creates.
+        # Internal destination-incarnation witness installed by SessionManager
+        # for exact lifecycle create/fork/delete operations.
         self._fork_reservation_token = fork_reservation_token
-        # Project attachment + access, resolved ONCE here (mid-session attach or
-        # access-revoke takes effect on the next session load — same contract as
-        # user_id / coordinator scope).  ``_project_id`` is set only when the user
-        # can READ the project, so it gates recall in ``_visible_scopes``;
-        # ``_project_writable`` additionally gates the memory(save) path so a
-        # non-member of a *public* project can read but not write its memory.
-        self._project_id = ""
-        self._project_name = ""
-        self._project_writable = False
-        if project_id and self._user_id:
-            from turnstone.core.auth import resolve_project_access
-
-            # One fetch resolves read access, write access, the display name, and
-            # the project state (vs three round-trips).  Recall is gated on READ
-            # access AND a non-archived project: an archived project is "not
-            # recalled" per the schema contract, even though its owner can still
-            # reach it through the management routes (to rename / unarchive).
-            acc = resolve_project_access(self._user_id, project_id)
-            if acc.can_read and acc.state != "archived":
-                self._project_id = project_id
-                self._project_writable = acc.can_write
-                self._project_name = acc.name
+        self._memory_index_snapshot: dict[str, Any] | None = None
+        # Generation whose accepted input contains at least one genuine human
+        # USER turn.  Snapshot admission consults this witness at the provider
+        # boundary so constructor work, synthetic wakes, and compaction-resume
+        # turns cannot become the first index owner.  A queued human message
+        # arriving during a wake marks that same generation when it is folded,
+        # allowing the following provider request to perform normal admission.
+        self._memory_index_admission_generation = -1
+        self._agent_prompt_components: tuple[_PromptComponent, ...] = ()
+        # Keep only the durable attachment. Authorization and display metadata
+        # are resolved live for the acting principal at each security boundary.
+        self._memory_attached_project_id = (project_id or "").strip()
         # Persona snapshot — the four levers, resolved ONCE at workstream
         # creation and immutable for the session's lifetime.  Everything
         # below (tool merge, MCP gate, composition, memory) reads these
@@ -2457,6 +2826,12 @@ class ChatSession:
         # Turns→dicts at that boundary until those layers migrate.
         self.messages: list[Turn] = []
         self._last_usage: dict[str, int] | None = None
+        # Provider tokenization varies by coherent serving identity.  A
+        # fallback's ratio and prompt anchor must not replace the primary's:
+        # the next A dispatch after A -> B fallback resumes A's estimator.
+        self._token_calibrations: dict[_ModelCalibrationKey, _TokenCalibration] = {}
+        self._active_token_calibration_key: _ModelCalibrationKey | None = None
+        self._last_usage_calibration_key: _ModelCalibrationKey | None = None
         self._msg_tokens: list[int] = []  # parallel to self.messages
         self._system_tokens = 0  # tokens for system_messages
         # Workstream template metadata
@@ -2525,17 +2900,30 @@ class ChatSession:
         # OrderedDict preserves FIFO order and supports O(1) removal by ID.
         # Queued user turns never carry attachments — see
         # ``AttachmentsNotQueueableError`` for the role-ordering reason —
-        # so the entry tuple is just ``(cleaned, priority)``.
+        # so the entry tuple is ``(cleaned, priority, owner_principal)``.
+        # The immutable owner prevents a retained interjection from being
+        # drained under another participant after a persistence failure.
         # Ids retracted while a dispatcher held the popped items — the
         # DELETE route can land during the handoff's in-flight send, find
         # the id already popped, and answer "already sent"; a restore
         # that resurrected it would deliver a message the user explicitly
-        # cancelled.  Written under ``_queued_lock``; cleared at each pop
-        # (a new window) and consumed by the restore.
+        # cancelled.  Written under ``_queued_lock``; per-id: each pop
+        # discards the stale records for the ids it pops, the restore
+        # consumes the records for the ids it considered.
         self._retracted_while_popped: set[str] = set()
-        self._queued_messages: collections.OrderedDict[str, tuple[str, str]] = (
-            collections.OrderedDict()
-        )
+        # Ids currently held by an OPEN pop window (popped, not yet
+        # committed/restored/discarded).  ``dequeue_message`` records a
+        # retraction into the ledger above ONLY for these ids — a miss
+        # for any other id (already delivered, never queued) records
+        # nothing, which is what bounds the ledger: with per-id
+        # discipline nothing would ever prune such an entry.  All
+        # mutation under ``_queued_lock``; every window close removes
+        # its ids via ``_restore_queued_messages`` (atomic with its
+        # ledger consume) or ``_close_pop_window``.
+        self._popped_in_flight: set[str] = set()
+        self._queued_messages: collections.OrderedDict[
+            str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]
+        ] = collections.OrderedDict()
         self._queued_lock = threading.Lock()
         # Repeat detection: streak counter over tool-call signatures.
         # Fires when a (name, args) signature has been seen N times in
@@ -2572,6 +2960,28 @@ class ChatSession:
         # outside this lock and cooperatively cancellable.
         self._generation_transition_lock = threading.Lock()
         self._generation_lock = threading.RLock()
+        # An accepted assistant row with provider tool calls creates a
+        # generation-owned structural obligation: one journaled TOOL row per
+        # call must exist before a terminal close or successor generation can
+        # cross it. The condition lets soft close cooperatively cancel and
+        # wait briefly without holding the generation lock needed by the
+        # worker's cancellation/failure finalizer.
+        self._tool_structural_condition = threading.Condition(self._generation_lock)
+        self._tool_structural_debt: _ToolStructuralDebt | None = None
+        self._soft_close_preparing = False
+        # Acting-user changes touch several coupled MCP listener/catalog
+        # projections.  Serialize the whole rebind independently of generation
+        # transitions: Stop/force remains responsive, while a stale predecessor
+        # must finish (and fail its owner check) before the successor installs
+        # the final actor projection.
+        self._acting_user_bind_lock = threading.RLock()
+        # Monotonic actor-projection witness.  Actor text alone is not enough:
+        # A -> B -> A must reject work that began in the first A epoch.
+        self._mcp_projection_epoch = 0
+        # A callback suppressed by a publication shutdown still represents a
+        # catalog edge.  Soft-close rollback must reconcile it before another
+        # provider request derives tool wire; terminal close may leave it set.
+        self._mcp_projection_dirty = False
         self._publication_shutdown = False
         # Durable writes admitted by generation commits execute in the same
         # order as their in-memory/live commits, but never while
@@ -2583,6 +2993,52 @@ class ChatSession:
         self._durability_cond = threading.Condition(threading.Lock())
         self._durability_next_ticket = 0
         self._durability_serving_ticket = 0
+        # A destructive history cut is admitted onto the durability lane, but
+        # applies its live slice only after the storage transaction commits.
+        # While that ticket is active, later generation/direct commits wait on
+        # this condition before mutating conversation state.  Stop and terminal
+        # generation claims use ``_generation_lock`` directly and therefore
+        # remain responsive while storage is blocked.
+        self._history_truncation_condition = threading.Condition(self._generation_lock)
+        self._history_truncation_active = False
+        # Conversation rows cross two independently observed surfaces:
+        # storage history and the live SSE stream. One ordered journal keeps
+        # their immutable, idempotently keyed rows from bounded generation
+        # admission until storage has positively acknowledged them.
+        # ``_history_handoff_lock`` owns the journal + monotonic accepted
+        # revision and is also the atomic bridge to initial listener
+        # registration.  ``_history_visibility_lock`` is deliberately separate
+        # from ``_generation_lock`` and spans only a history load or one
+        # conversation save/ack, making DB visibility and the pending overlay
+        # linearizable without blocking Stop/force-claim.
+        self._history_handoff_lock = threading.RLock()
+        # Reentrant because reconciliation owns the visibility lane across its
+        # publication-shutdown recheck and calls the single-entry persistence
+        # helper, which uses the same lane.  Lock order is visibility ->
+        # generation -> handoff; generation commit paths never acquire
+        # visibility while holding the generation lock.
+        self._history_visibility_lock = threading.RLock()
+        self._history_handoff_epoch = uuid.uuid4().hex
+        self._history_handoff_revision = 0
+        # KEYED BY WORKSTREAM IDENTITY: set to the ws_id whose durable parent
+        # a keyed save observed hard-deleted (cross-node delete or prune),
+        # never cleared. Readers compare against the CURRENT self._ws_id, so
+        # an identity swap (/new, resume) structurally un-poisons the session
+        # object while the latch stays permanent for the workstream that died
+        # — no reset choreography to forget (round-4 review).
+        self._workstream_gone_ws: str | None = None
+        self._pending_conversation_commits: collections.OrderedDict[
+            str, _PendingConversationCommit
+        ] = collections.OrderedDict()
+        self._conversation_persistence_error: ConversationPersistenceError | None = None
+        self._conversation_persistence_failure_kind: str | None = None
+        self._conversation_persistence_attempts = 0
+        self._conversation_persistence_first_failure_at: datetime | None = None
+        self._conversation_persistence_last_failure_at: datetime | None = None
+        self._conversation_persistence_next_retry_at: float | None = None
+        self._conversation_persistence_next_retry_wall_at: datetime | None = None
+        self._conversation_persistence_resync_commit_key: str | None = None
+        self._conversation_persistence_fatal_revision: int | None = None
         # Monotonic edge for approval gates that exist before a generation is
         # claimed (the token-budget override).  Unlike ``_cancel_event``, a
         # snapshot can distinguish a new Stop from a harmless set event left
@@ -2811,12 +3267,10 @@ class ChatSession:
         # so it must stay stable, and reused by every label this session.
         self._sender_label_nonce = fence.mint_nonce()
         self._load_skills()
-        # Memory selection keys off the recent-user-message query, but a fresh
-        # session has no messages yet here -> the first compose would inject
-        # recency-only memories with no relevance/rerank. Track whether we've
-        # composed against a real query so send() can defer the memory-bearing
-        # recompose to the first user turn (keeps the cached prefix stable).
-        self._system_composed_with_context: bool = False
+        # Construction deliberately has no acting-turn principal. The initial
+        # model admission captures the durable memory index after that immutable
+        # principal has been bound; constructor-time composition omits it.
+        self.system_messages: list[dict[str, Any]] = []
         self._init_system_messages()
         # Skip on rehydrate — ``_save_config`` is ``INSERT OR
         # REPLACE`` per-key, and the persisted row is what
@@ -2825,10 +3279,10 @@ class ChatSession:
         # they keep reopened workstreams on their original model and
         # settings instead of silently resetting to constructor
         # defaults.
-        if not load_workstream_config(self._ws_id):
+        if not self._load_workstream_config(self._ws_id):
             if self._fork_reservation_token:
                 storage = get_storage()
-                if storage is None or not storage.finalize_deferred_create(
+                if not storage.finalize_deferred_create(
                     self._ws_id,
                     self._fork_reservation_token,
                     config=self._config_for_save(),
@@ -2876,9 +3330,14 @@ class ChatSession:
         """
         lane = self._model_binding.lane
         effort = self.reasoning_effort or None
-        if lane.temperature != self.temperature or lane.reasoning_effort != effort:
+        if (
+            lane.registry_generation != self._model_binding.registry_generation
+            or lane.temperature != self.temperature
+            or lane.reasoning_effort != effort
+        ):
             lane = dataclasses.replace(
                 lane,
+                registry_generation=self._model_binding.registry_generation,
                 temperature=self.temperature,
                 reasoning_effort=effort,
             )
@@ -2892,7 +3351,8 @@ class ChatSession:
             return self._memory_config
         return MemoryConfig(
             relevance_k=cs.get("memory.relevance_k"),
-            fetch_limit=cs.get("memory.fetch_limit"),
+            index_budget_chars=cs.get("memory.index_budget_chars"),
+            model_index_over_budget_notice=cs.get("memory.model_index_over_budget_notice"),
             max_content=cs.get("memory.max_content"),
             nudge_cooldown=cs.get("memory.nudge_cooldown"),
             nudges=cs.get("memory.nudges"),
@@ -2912,10 +3372,10 @@ class ChatSession:
         cs = getattr(self, "_config_store", None)
         if cs is None:
             return jc
-        snapshot = getattr(type(cs), "effective_snapshot", None)
-        if callable(snapshot):
+        snapshot = concrete_method(cs, "effective_snapshot")
+        if snapshot is not None:
             try:
-                _version, values = snapshot(cs)
+                _version, values = snapshot()
                 if isinstance(values, dict):
                     return self._compose_judge_cfg(values.get)
             except Exception:
@@ -2964,10 +3424,10 @@ class ChatSession:
         if self._judge_config is None:
             return None, None
         cs = getattr(self, "_config_store", None)
-        snapshot = getattr(type(cs), "effective_snapshot", None)
-        if callable(snapshot):
+        snapshot = concrete_method(cs, "effective_snapshot")
+        if snapshot is not None:
             try:
-                version, values = snapshot(cs)
+                version, values = snapshot()
                 if type(version) is int and isinstance(values, dict):
                     return self._compose_judge_cfg(values.get), version
             except Exception:
@@ -3048,28 +3508,80 @@ class ChatSession:
             timeout=self.tool_timeout,
         )
 
-    def _resolve_rerank_client(self) -> RerankClient | None:
-        """Return a rerank client, or None when reranking is unconfigured.
+    def _resolve_rerank_lane(self) -> RerankLane | None:
+        """Return a fresh rerank lane, or None when reranking is unconfigured.
 
         The reranker is a **model definition** (capability ``supports_rerank``)
         selected via the Reranker role (``tools.reranker_alias``); its base_url
         is the full /rerank endpoint. There is no bundled rerank endpoint and no
-        global URL fallback, so reranking stays disabled until such a model is
-        selected.
+        global URL fallback. The registry owns the shared runtime; callers must
+        resolve per batch rather than retain this immutable binding.
         """
-        from turnstone.core.rerank_config import resolve_rerank_client_from
+        from turnstone.core.rerank_config import resolve_rerank_lane_from
 
-        return resolve_rerank_client_from(
+        return resolve_rerank_lane_from(
             getattr(self, "_config_store", None),
             getattr(self, "_registry", None),
-            timeout=min(self.tool_timeout, _RERANK_TIMEOUT_CAP_S),
         )
+
+    def _rerank_hits(
+        self,
+        query: str,
+        documents: list[str],
+        *,
+        origin_generation: int = 0,
+    ) -> list[RerankHit] | None:
+        """Resolve and dispatch one batch, preserving its cancellation owner.
+
+        ``None`` means no live reranker is configured; callers return identity
+        order so long-lived BM25/tool-search closures can observe a later role
+        selection without being rebuilt. Endpoint and circuit failures raise
+        through the existing retrieval fallback seams.
+        """
+        lane = self._resolve_rerank_lane()
+        if lane is None:
+            return None
+
+        from turnstone.core.deadline import DeadlineCancelledError
+        from turnstone.core.rerank import rerank
+
+        task_scope = _active_task_agent_cancel_scope.get()
+        owner_generation = (
+            origin_generation
+            or _active_tool_origin_generation.get()
+            or _active_commit_origin_generation.get()
+        )
+        if task_scope is not None:
+            cancel_ref: Any = task_scope.cancel_ref
+        elif hasattr(self, "_cancel_event"):
+            cancel_ref = _CancelRef(self, owner_generation)
+        else:  # lightweight direct seam tests/embedders
+            cancel_ref = None
+
+        try:
+            return rerank(
+                lane,
+                query,
+                documents,
+                timeout=min(float(getattr(self, "tool_timeout", 30.0)), _RERANK_TIMEOUT_CAP_S),
+                cancel_ref=cancel_ref,
+            )
+        except DeadlineCancelledError:
+            # Retrieval fallbacks catch Exception. Translate the deadline seam
+            # back into GenerationCancelled (a BaseException) before they can
+            # mistake Stop/supersession for an endpoint outage.
+            if task_scope is not None:
+                task_scope.check()
+            check_cancelled = getattr(self, "_check_cancelled", None)
+            if callable(check_cancelled):
+                check_cancelled(owner_generation)
+            raise
 
     def _rerank_enabled_for(self, tool: str) -> bool:
         """Whether reranking is enabled for ``tool`` (currently: 'web_search', 'bm25').
 
         The per-tool toggles default on; the operative gate is whether an
-        endpoint is configured (``_resolve_rerank_client`` returns None when
+        endpoint is configured (``_resolve_rerank_lane`` returns None when
         not). A bare CLI without a ConfigStore inherits the on-by-default toggle.
         """
         cs = getattr(self, "_config_store", None)
@@ -3077,25 +3589,30 @@ class ChatSession:
             return bool(cs.get(f"tools.rerank_{tool}"))
         return True
 
-    def _web_search_reranker(self) -> Reranker | None:
-        """Build a web_search reranker callable, or None when disabled.
+    def _web_search_reranker(self) -> Reranker:
+        """Build a live-resolving web_search reranker callable.
 
-        Returns a ``(query, docs) -> ranked indices`` adapter over the configured
-        rerank endpoint; None when reranking is off or no endpoint is set.
+        The closure captures no concrete lane/runtime. Config changes are read
+        at each invocation; disabled/unconfigured state is identity order.
         """
-        if not self._rerank_enabled_for("web_search"):
-            return None
-        rc = self._resolve_rerank_client()
-        if rc is None:
-            return None
 
         def _rank(query: str, docs: list[str]) -> list[int]:
-            return [hit.index for hit in rc.rerank(query, docs)]
+            if not self._rerank_enabled_for("web_search"):
+                return list(range(len(docs)))
+            hits = self._rerank_hits(query, docs)
+            if hits is None:
+                return list(range(len(docs)))
+            return [hit.index for hit in hits]
 
         return _rank
 
-    def _bm25_reranker(self, threshold: float = 0.0) -> Reranker | None:
-        """Build a BM25 reranker callable, or None when disabled.
+    def _bm25_reranker(
+        self,
+        threshold: float = 0.0,
+        *,
+        origin_generation: int = 0,
+    ) -> Reranker:
+        """Build a live-resolving BM25 reranker callable.
 
         Mirrors ``_web_search_reranker``. ``threshold`` is a relevance FLOOR
         applied in this closure (where scores still exist); the BM25Index seam
@@ -3103,27 +3620,25 @@ class ChatSession:
         response for non-empty input is an endpoint failure (a conforming
         reranker scores every doc), NOT a floor result, so it raises
         ``RerankError`` -> BM25Index falls back to BM25 order regardless of
-        threshold. Only memory composition passes a configured threshold;
+        threshold. Only memory-pointer relevance filtering passes a configured threshold;
         reactive surfaces pass 0.
         """
-        if not self._rerank_enabled_for("bm25"):
-            return None
-        rc = self._resolve_rerank_client()
-        if rc is None:
-            return None
-
         from turnstone.core.rerank import RerankError, normalize_scores
 
         def _rank(query: str, docs: list[str]) -> list[int]:
-            hits = rc.rerank(query, docs)
+            if not self._rerank_enabled_for("bm25"):
+                return list(range(len(docs)))
+            hits = self._rerank_hits(
+                query,
+                docs,
+                origin_generation=origin_generation,
+            )
+            if hits is None:
+                return list(range(len(docs)))
             if docs and not hits:
-                # A conforming reranker scores every document; an empty result
-                # for non-empty input means the endpoint response was
-                # unparseable (rc.rerank -> _parse_hits returns [] without
-                # raising). That is an endpoint FAILURE -- a discrete branch
-                # from the relevance floor below -- so raise and let BM25Index
-                # fall back to BM25 order in BOTH modes, instead of the
-                # filter-mode floor honoring it as "nothing relevant".
+                # The managed dispatcher enforces this too. Keep the adapter
+                # fail-closed for alternate protocol implementations and
+                # lightweight test embedders that provide the seam directly.
                 raise RerankError("rerank endpoint returned no scores for non-empty input")
             # Normalise to a 0-1 relevance space (sigmoid for logit endpoints) so
             # ``threshold`` means the same on every reranker. Sigmoid is monotonic
@@ -3169,6 +3684,30 @@ class ChatSession:
     def _get_capabilities(self) -> ModelCapabilities:
         """Capabilities from the current coherent primary lane."""
         return require_lane_capabilities(self._primary_lane())
+
+    def _load_workstream_config(self, ws_id: str) -> dict[str, str]:
+        """Best-effort durable workstream configuration read."""
+        return load_workstream_config(ws_id)
+
+    def _load_message_turns(self, ws_id: str) -> list[Turn]:
+        """Best-effort durable resume read."""
+        return load_message_turns(ws_id, checkpointed=True)
+
+    def _save_last_error(self, ws_id: str, text: str) -> None:
+        """Best-effort fatal-error persistence."""
+        persist_last_error(ws_id, text)
+
+    def _clear_last_error(self, ws_id: str) -> None:
+        """Best-effort recovery clear."""
+        clear_last_error(ws_id)
+
+    def _get_skill_by_name(self, name: str) -> dict[str, Any] | None:
+        """Best-effort skill lookup."""
+        return get_skill_by_name(name)
+
+    def _list_default_skills(self) -> list[dict[str, Any]]:
+        """Best-effort default-skill catalog."""
+        return list_default_skills()
 
     def _config_for_save(self) -> dict[str, str]:
         """Snapshot the durable session configuration without writing it."""
@@ -3266,7 +3805,7 @@ class ChatSession:
         """
         skill_data: dict[str, Any] | None = None
         if self._skill_name:
-            skill_data = get_skill_by_name(self._skill_name)
+            skill_data = self._get_skill_by_name(self._skill_name)
             if skill_data:
                 self._skill_resources = self._load_skill_resources(
                     skill_data.get("template_id", "")
@@ -3306,7 +3845,7 @@ class ChatSession:
             # Named skill not found — resources already cleared above.
             self._skill_content = None
         else:
-            defaults = list_default_skills()
+            defaults = self._list_default_skills()
             if defaults:
                 # Defaults are always-on and take no invocation args, but env
                 # subs (``${TURNSTONE_SESSION_ID}`` / ``${TURNSTONE_EFFORT}``)
@@ -3489,7 +4028,7 @@ class ChatSession:
 
     # -- MCP tool refresh ----------------------------------------------------
 
-    def _on_mcp_tools_changed(self) -> None:
+    def _on_mcp_tools_changed(self) -> bool:
         """Callback from MCPClientManager when the tool list changes.
 
         Rebuilds merged tool lists and reconstructs ToolSearchManager.
@@ -3504,23 +4043,98 @@ class ChatSession:
         between turns is safe; mid-stream the LLM request already holds
         the old snapshot.
         """
-        if not self._mcp_client:
-            return
-        # Monotonic change marker: the constructor snapshots this around
-        # its authoritative post-registration read and re-runs this
-        # callback if it advanced — otherwise a notification landing
-        # between that read and its assignments is clobbered by the
-        # staler snapshot (its only notification already consumed).
-        self._mcp_tools_change_seq += 1
-        # Pass the effective user_id (acting user on shared workstreams,
-        # owner otherwise) so the merged tool list includes that user's
-        # pool catalog. The static path is included by ``get_tools``
-        # regardless; ``user_id=None`` would silently drop pool tools
-        # that the LLM is allowed to call.
-        mcp_tools = self._mcp_client.get_tools(user_id=self._mcp_effective_user_id)
-        self._set_session_tools(mcp_tools)
-        self._render_agent_tool_descriptions()
-        self._rebuild_tool_search()
+        with self._acting_user_bind_lock:
+            manager = self._mcp_client
+            callback = self._mcp_refresh_cb
+            if manager is None or callback is None:
+                return False
+            # Constructor convergence remains a separate sequencing job from
+            # actor publication; advance for every accepted callback start.
+            self._mcp_tools_change_seq += 1
+            change_seq = self._mcp_tools_change_seq
+            if self._publication_shutdown:
+                self._mcp_projection_dirty = True
+                return False
+            actor = self._mcp_effective_user_id
+            epoch = self._mcp_projection_epoch
+            current_search = getattr(self, "_tool_search", None)
+            expanded = current_search.get_expanded_names() if current_search is not None else []
+
+        # The manager read is intentionally outside every session lock.  A
+        # stalled A lookup must not prevent B from binding and publishing.
+        try:
+            mcp_tools = manager.get_tools(user_id=actor)
+        except Exception:
+            with self._acting_user_bind_lock:
+                if self._publication_shutdown or (
+                    self._mcp_client is manager
+                    and self._mcp_refresh_cb is callback
+                    and self._mcp_effective_user_id == actor
+                    and self._mcp_projection_epoch == epoch
+                    and self._mcp_tools_change_seq == change_seq
+                ):
+                    self._mcp_projection_dirty = True
+            raise
+        tools, task_tools = self._build_session_tool_lanes(mcp_tools)
+        tools = self._rendered_agent_tool_descriptions(tools)
+        tool_names = {str(tool.get("function", {}).get("name") or "") for tool in tools}
+
+        # Building BM25/reranker state stays outside the actor lock.  If a real
+        # tool_search expansion commits while the manager read is stalled, the
+        # publication pass observes it under the same lock and rebuilds once
+        # with the union before swapping the candidate.
+        while True:
+            tool_search = self._build_tool_search(tools, expanded)
+            with self._acting_user_bind_lock:
+                if self._publication_shutdown:
+                    self._mcp_projection_dirty = True
+                    return False
+                if (
+                    self._mcp_client is not manager
+                    or self._mcp_refresh_cb is not callback
+                    or self._mcp_effective_user_id != actor
+                    or self._mcp_projection_epoch != epoch
+                    or self._mcp_tools_change_seq != change_seq
+                ):
+                    return False
+                live_search = getattr(self, "_tool_search", None)
+                live_expanded = live_search.get_expanded_names() if live_search is not None else []
+                needed = [name for name in live_expanded if name in tool_names]
+                if tool_search is not None and any(
+                    not tool_search.is_expanded(name) for name in needed
+                ):
+                    expanded = list(dict.fromkeys([*expanded, *needed]))
+                    continue
+                # One actor lock protects the complete derived projection from
+                # actor changes, newer same-actor callbacks, and expansion
+                # commits. Readers therefore observe one coherent catalog.
+                self._tools = tools
+                self._task_tools = task_tools
+                self._tool_search = tool_search
+                self._mcp_projection_dirty = False
+                return True
+
+    def _refresh_dirty_mcp_projection(self) -> bool:
+        """Best-effort reconciliation after a suppressed catalog callback."""
+        with self._acting_user_bind_lock:
+            if not self._mcp_projection_dirty:
+                return True
+            if self._publication_shutdown or self._mcp_client is None:
+                return False
+        try:
+            refreshed = self._on_mcp_tools_changed()
+        except Exception:
+            log.warning("mcp.tool_projection_refresh_failed", exc_info=True)
+            return False
+        with self._acting_user_bind_lock:
+            return bool(refreshed and not self._mcp_projection_dirty)
+
+    def _ensure_mcp_projection_current(self) -> None:
+        """Fence provider admission behind a dirty MCP catalog refresh."""
+        with self._acting_user_bind_lock:
+            dirty = self._mcp_projection_dirty
+        if dirty and not self._refresh_dirty_mcp_projection():
+            raise RuntimeError("MCP tool catalog refresh is pending; retry after MCP recovers")
 
     # Tools whose ``persona`` parameter names an interactive-kind persona —
     # task_agent sub-agents and spawned children are always interactive.
@@ -3537,7 +4151,7 @@ class ChatSession:
         enumerates the live names, remains the self-correction path for lists
         rendered before a persona edit.
         """
-        from turnstone.core.storage import get_storage, is_storage_initialized
+        from turnstone.core.storage import is_storage_initialized
 
         if not is_storage_initialized():
             return ""
@@ -3592,12 +4206,19 @@ class ChatSession:
         fresh copy of the builtin base, so the no-client and drop paths
         reproduce the fixed kind base verbatim.
         """
+        self._tools, self._task_tools = self._build_session_tool_lanes(mcp_tools)
+
+    def _build_session_tool_lanes(
+        self,
+        mcp_tools: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Derive both MCP-merged lanes without publishing either one."""
         if self._kind == WorkstreamKind.COORDINATOR:
-            self._tools = merge_mcp_tools(COORDINATOR_TOOLS, mcp_tools)
-            self._task_tools: list[dict[str, Any]] = []
-            return
-        self._tools = self._apply_cwd_notes(merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools))
-        self._task_tools = self._apply_cwd_notes(merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools))
+            return merge_mcp_tools(COORDINATOR_TOOLS, mcp_tools), []
+        return (
+            self._apply_cwd_notes(merge_mcp_tools(INTERACTIVE_TOOLS, mcp_tools)),
+            self._apply_cwd_notes(merge_mcp_tools(TASK_AGENT_TOOLS, mcp_tools)),
+        )
 
     def _apply_cwd_notes(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Render per-process working-dir/workspace notes into fs-tool descriptions.
@@ -3665,6 +4286,13 @@ class ChatSession:
         not in ``self._task_tools``, which is what *sub-agents* see
         (sub-agents don't get delegation tools to avoid infinite recursion).
         """
+        self._tools = self._rendered_agent_tool_descriptions(self._tools)
+
+    def _rendered_agent_tool_descriptions(
+        self,
+        tools: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Return *tools* with the current alias/persona descriptions."""
         # Hide ``default`` from the alias list — the LLM reads the English
         # word and picks it explicitly, which routes to whichever model
         # carries that alias rather than the operator-configured per-role
@@ -3701,7 +4329,7 @@ class ChatSession:
 
         new_tools: list[dict[str, Any]] = []
         changed = False
-        for tool in self._tools:
+        for tool in tools:
             fn = tool.get("function") or {}
             name = fn.get("name", "")
             props = fn.get("parameters", {}).get("properties", {})
@@ -3739,8 +4367,7 @@ class ChatSession:
         # Reassign only when a description changed; a fully idempotent render
         # leaves ``self._tools`` (and any shared constant it points at)
         # untouched.
-        if changed:
-            self._tools = new_tools
+        return new_tools if changed else tools
 
     @staticmethod
     def _persona_property(props: dict[str, Any]) -> dict[str, Any] | None:
@@ -3785,6 +4412,10 @@ class ChatSession:
         Rebuilds the system message to update the resource catalog.
         Called on the MCP background thread.
         """
+        # Publish the invalidation before any catalog read.  If composition
+        # fails, or a soft-close shutdown suppresses its final swap, the next
+        # provider admission must still know that its cached prefix is stale.
+        self._invalidate_system_prefix()
         self._init_system_messages()
 
     def _on_mcp_prompts_changed(self) -> None:
@@ -3793,6 +4424,7 @@ class ChatSession:
         Rebuilds the system message to update the prompt catalog.
         Called on the MCP background thread.
         """
+        self._invalidate_system_prefix()
         self._init_system_messages()
 
     def _bind_model_from_registry(
@@ -4042,22 +4674,27 @@ class ChatSession:
     def _rebuild_tool_search(self) -> None:
         """Reconstruct ToolSearchManager, preserving expanded tools."""
         old_expanded = self._tool_search.get_expanded_names() if self._tool_search else []
+        self._tool_search = self._build_tool_search(self._tools, old_expanded)
+
+    def _build_tool_search(
+        self,
+        tools: list[dict[str, Any]],
+        old_expanded: list[str],
+    ) -> ToolSearchManager | None:
+        """Derive a tool-search corpus without mutating the live projection."""
         if self._persona_tool_search_blocked():
             # Hard persona set — the pathway stays disabled across MCP
             # catalog refreshes too (mirrors the constructor gate).
-            self._tool_search = None
+            return None
         elif (
             # Soft persona set — the authored escape hatch stays live
             # regardless of the global setting (mirrors the constructor).
             self._persona_tools is not None
             or self._tool_search_setting == "on"
-            or (
-                self._tool_search_setting == "auto"
-                and len(self._tools) > self._tool_search_threshold
-            )
+            or (self._tool_search_setting == "auto" and len(tools) > self._tool_search_threshold)
         ):
-            self._tool_search = ToolSearchManager(
-                self._tools,
+            tool_search = ToolSearchManager(
+                tools,
                 always_on_names=set(BUILTIN_TOOL_NAMES),
                 max_results=self._tool_search_max_results,
                 reranker=self._bm25_reranker(),
@@ -4065,9 +4702,9 @@ class ChatSession:
             )
             # Restore previously expanded tools that still exist
             if old_expanded:
-                self._tool_search.expand_visible(old_expanded)
-        else:
-            self._tool_search = None
+                tool_search.expand_visible(old_expanded)
+            return tool_search
+        return None
 
     def _mcp_status_snapshot(self) -> dict[str, dict[str, Any]]:
         """Per-server MCP status for this session's user, consumed by
@@ -4270,18 +4907,10 @@ class ChatSession:
         if main_stream is not None:
             with contextlib.suppress(Exception):
                 main_stream.close()
-        # Direct close paths do not all pass through the adapter cleanup that
-        # normally resolves UI gates first.  Wake every cycle that was already
-        # registered when the terminal latch landed; a gate still in its
-        # pre-registration window observes the epoch above immediately after
-        # inserting itself and self-denies.  Together those two arms make close
-        # exhaustive without coupling the UI lock to the generation lock.
-        resolve_all_approvals = getattr(self.ui, "resolve_all_approvals", None)
-        if resolve_all_approvals is not None:
-            try:
-                resolve_all_approvals(False, "Workstream closed")
-            except Exception:
-                log.debug("ui.resolve_all_approvals raised during close", exc_info=True)
+        # Direct close paths do not all pass through adapter cleanup.  Use the
+        # same workstream-wide sweep as soft-close preparation so registered
+        # cycles and pre-cycle Smart Approval waits cannot strand teardown.
+        self.resolve_close_approvals()
         # Refuse new child model calls and abort every registered child stream.
         # The shutdown latch shares the registration lock, so a racing run is
         # either included in this snapshot or born aborted.
@@ -4308,30 +4937,29 @@ class ChatSession:
             output_guard_cancel.set()
         if output_guard is not None:
             output_guard.retire()
-        if self._mcp_client and self._mcp_refresh_cb:
-            # ``user_id`` MUST match the value used at registration —
-            # the listener identity is ``(user_id, callback)``, not
-            # callback alone. ``bind_acting_user`` may have re-scoped
-            # the registrations since construction, so the tracked
-            # ``_mcp_listener_user_id`` (not ``_mcp_user_id``) is the
-            # registration identity.
-            self._mcp_client.remove_listener(
-                self._mcp_refresh_cb, user_id=self._mcp_listener_user_id
-            )
-            self._mcp_refresh_cb = None
-        if self._mcp_client and self._mcp_resource_cb:
-            # ``user_id`` MUST mirror the value passed at registration —
-            # the listener identity is ``(user_id, callback)`` and an
-            # unscoped removal would leave the registration in place.
-            self._mcp_client.remove_resource_listener(
-                self._mcp_resource_cb, user_id=self._mcp_listener_user_id
-            )
-            self._mcp_resource_cb = None
-        if self._mcp_client and self._mcp_prompt_cb:
-            self._mcp_client.remove_prompt_listener(
-                self._mcp_prompt_cb, user_id=self._mcp_listener_user_id
-            )
-            self._mcp_prompt_cb = None
+        with self._acting_user_bind_lock:
+            mcp = self._mcp_client
+            if mcp and self._mcp_refresh_cb:
+                # ``user_id`` MUST match the value used at registration —
+                # the listener identity is ``(user_id, callback)``, not
+                # callback alone. ``bind_acting_user`` may have re-scoped
+                # the registrations since construction, so the tracked
+                # ``_mcp_listener_user_id`` (not ``_mcp_user_id``) is the
+                # registration identity.
+                mcp.remove_listener(self._mcp_refresh_cb, user_id=self._mcp_listener_user_id)
+                self._mcp_refresh_cb = None
+            if mcp and self._mcp_resource_cb:
+                # ``user_id`` MUST mirror the value passed at registration —
+                # the listener identity is ``(user_id, callback)`` and an
+                # unscoped removal would leave the registration in place.
+                mcp.remove_resource_listener(
+                    self._mcp_resource_cb, user_id=self._mcp_listener_user_id
+                )
+                self._mcp_resource_cb = None
+            if mcp and self._mcp_prompt_cb:
+                mcp.remove_prompt_listener(self._mcp_prompt_cb, user_id=self._mcp_listener_user_id)
+                self._mcp_prompt_cb = None
+            self._mcp_projection_epoch += 1
         if self._watch_runner and self._watch_dispatch_fn is not None:
             # Owner-checked: a watch-restore shell and a reopened pane can
             # both have served this ws_id — tearing down one must not
@@ -4364,26 +4992,27 @@ class ChatSession:
         to COORDINATOR_TOOLS, never the interactive lanes.  The caller
         rebuilds tool search and recomposes the prompt.
         """
-        if self._mcp_client is None:
-            return
-        if self._mcp_refresh_cb:
-            self._mcp_client.remove_listener(
-                self._mcp_refresh_cb, user_id=self._mcp_listener_user_id
-            )
-            self._mcp_refresh_cb = None
-        if self._mcp_resource_cb:
-            self._mcp_client.remove_resource_listener(
-                self._mcp_resource_cb, user_id=self._mcp_listener_user_id
-            )
-            self._mcp_resource_cb = None
-        if self._mcp_prompt_cb:
-            self._mcp_client.remove_prompt_listener(
-                self._mcp_prompt_cb, user_id=self._mcp_listener_user_id
-            )
-            self._mcp_prompt_cb = None
-        self._mcp_client = None
-        self._set_session_tools([])
-        self._render_agent_tool_descriptions()
+        with self._acting_user_bind_lock:
+            if self._mcp_client is None:
+                return
+            manager = self._mcp_client
+            if self._mcp_refresh_cb:
+                manager.remove_listener(self._mcp_refresh_cb, user_id=self._mcp_listener_user_id)
+                self._mcp_refresh_cb = None
+            if self._mcp_resource_cb:
+                manager.remove_resource_listener(
+                    self._mcp_resource_cb, user_id=self._mcp_listener_user_id
+                )
+                self._mcp_resource_cb = None
+            if self._mcp_prompt_cb:
+                manager.remove_prompt_listener(
+                    self._mcp_prompt_cb, user_id=self._mcp_listener_user_id
+                )
+                self._mcp_prompt_cb = None
+            self._mcp_projection_epoch += 1
+            self._mcp_client = None
+            self._set_session_tools([])
+            self._render_agent_tool_descriptions()
 
     def set_model_mint_client(self, client: MCPClientManager | None) -> None:
         """Update the ungated model-auth manager after a runtime registry reload."""
@@ -4547,6 +5176,75 @@ class ChatSession:
         """Estimated token cost of the active tool definitions."""
         return int(self._tool_def_chars(caps) / self._chars_per_token)
 
+    @staticmethod
+    def _token_calibration_key(lane: ModelLane) -> _ModelCalibrationKey:
+        """Return the coherent registry identity whose tokenizer is in use."""
+        return (lane.alias, lane.model, lane.registry_generation)
+
+    @staticmethod
+    def _provenance_calibration_key(
+        provenance: TurnProvenance | None,
+    ) -> _ModelCalibrationKey | None:
+        """Project accepted-turn provenance onto its calibration identity."""
+        if provenance is None:
+            return None
+        key = (
+            provenance.model_alias,
+            provenance.backend_model_id,
+            provenance.registry_generation,
+        )
+        return key if any((key[0], key[1], key[2])) else None
+
+    def _calibration_anchor_valid(self, calibration: _TokenCalibration) -> bool:
+        """Whether a provider prompt count still names the live prefix."""
+        prefix = calibration.message_prefix_ids
+        if calibration.prompt_tokens is None or len(prefix) > len(self.messages):
+            return False
+        return prefix == tuple(id(turn) for turn in self.messages[: len(prefix)])
+
+    def _activate_token_calibration(self, lane: ModelLane) -> None:
+        """Activate *lane*'s ratio and coherent provider prompt anchor.
+
+        Lane activation happens before every main dispatch and before pre-send
+        budget checks.  Switching identities re-estimates the whole live
+        trajectory with that tokenizer ratio; staying on one identity preserves
+        exact completion-token counts already appended by the usage path.
+        """
+        key = self._token_calibration_key(lane)
+        calibration = self._token_calibrations.get(key)
+        ratio = calibration.chars_per_token if calibration is not None else 4.0
+        identity_changed = (
+            self._active_token_calibration_key != key or self._chars_per_token != ratio
+        )
+        self._active_token_calibration_key = key
+        self._chars_per_token = ratio
+
+        sys_chars = sum(self._msg_char_count(message) for message in self.system_messages)
+        self._system_tokens = max(1, int(sys_chars / ratio))
+        if identity_changed:
+            self._msg_tokens = [
+                max(1, int(self._msg_char_count(message) / ratio)) for message in self.messages
+            ]
+        if calibration is not None and self._calibration_anchor_valid(calibration):
+            self._calibrated_msg_count = len(calibration.message_prefix_ids)
+        else:
+            self._calibrated_msg_count = 0
+        if not self._manual_tool_truncation:
+            self.tool_truncation = int(self.context_window * ratio * 0.5)
+
+    def _invalidate_token_calibration_anchors(self) -> None:
+        """Forget prompt-prefix counts after changing history or its prefix.
+
+        Tokenizer ratios remain useful per model binding; only the provider
+        counts tied to the old Turn identities become invalid.
+        """
+        self._token_calibrations = {
+            key: dataclasses.replace(value, prompt_tokens=None, message_prefix_ids=())
+            for key, value in self._token_calibrations.items()
+        }
+        self._last_usage_calibration_key = None
+        self._calibrated_msg_count = 0
+
     def _estimated_prompt_tokens(self) -> int:
         """Best estimate of the current prompt size, in tokens.
 
@@ -4562,9 +5260,14 @@ class ChatSession:
         auto-compaction triggers all read it, so they cannot disagree about
         the fullness of the same state.
         """
-        if self._last_usage:
-            # Clamp the index: a stale _calibrated_msg_count must not
-            # over-slice after compaction or message-list mutations.
+        active_key = self._active_token_calibration_key
+        calibration = self._token_calibrations.get(active_key) if active_key is not None else None
+        if calibration is not None and self._calibration_anchor_valid(calibration):
+            start = len(calibration.message_prefix_ids)
+            return int(calibration.prompt_tokens or 0) + sum(self._msg_tokens[start:])
+        if self._last_usage and self._last_usage_calibration_key is None:
+            # Compatibility for direct seam callers/tests that populate the
+            # legacy usage slot without going through _update_token_table.
             start = min(self._calibrated_msg_count, len(self._msg_tokens))
             return self._last_usage["prompt_tokens"] + sum(self._msg_tokens[start:])
         # No provider anchor yet (e.g. a just-resumed session before its first
@@ -4585,9 +5288,7 @@ class ChatSession:
         auto-compaction triggers so truncation and compaction agree.
         """
         used = self._estimated_prompt_tokens()
-        response_reserve = min(self.max_tokens, self.context_window // 4)
-        safety_margin = int(self.context_window * 0.05)
-        return max(0, self.context_window - used - response_reserve - safety_margin)
+        return max(0, _usable_input_capacity(self.context_window, self.max_tokens) - used)
 
     def _maybe_compact_midturn(self, my_generation: int = 0) -> None:
         """Cooperative mid-turn compaction policy.
@@ -4906,6 +5607,7 @@ class ChatSession:
                 ],
                 max_tokens=_TITLE_MAX_TOKENS,
                 lane=title_lane,
+                principal_id=captured_principal,
             )
             raw = result.content or ""
             log.info("ws.title.llm_response", ws_id=ws_id[:8], raw=raw[:200])
@@ -5158,16 +5860,15 @@ class ChatSession:
         from turnstone.core.storage import ForkCloneExpectation
 
         storage = get_storage()
-        if storage is None:
-            raise RuntimeError("storage is not initialized")
         persona = self._current_persona_snapshot()
+        project_access = self._memory_access(principal_id)
         expected_session = ForkCloneExpectation(
             persona_config=(
                 tuple(sorted(persona.to_config().items())) if persona is not None else ()
             ),
-            project_id=self._project_id,
-            project_name=self._project_name,
-            project_writable=self._project_writable,
+            project_id=project_access.project_id,
+            project_name=project_access.project_name,
+            project_writable=project_access.project_writable,
             destination_reservation_token=self._fork_reservation_token,
             source_reservation_token=source_reservation_token,
         )
@@ -5209,7 +5910,9 @@ class ChatSession:
         if _fork_snapshot is not None and not fork:
             raise ValueError("a fork snapshot requires fork=True")
         turns = (
-            list(_fork_snapshot.turns) if _fork_snapshot is not None else load_message_turns(ws_id)
+            list(_fork_snapshot.turns)
+            if _fork_snapshot is not None
+            else self._load_message_turns(ws_id)
         )
         if not turns and _fork_snapshot is None:
             return False
@@ -5226,32 +5929,27 @@ class ChatSession:
         config = (
             dict(_fork_snapshot.config)
             if _fork_snapshot is not None
-            else load_workstream_config(ws_id)
+            else self._load_workstream_config(ws_id)
         )
-        resumed_project_id = ""
-        resumed_project_name = ""
-        resumed_project_writable = False
+        resumed_attached_project_id = ""
+        resumed_incarnation_token = ""
         if not fork:
             storage = get_storage()
-            target_row = storage.get_workstream(ws_id) if storage is not None else None
+            target_row = storage.ensure_workstream_incarnation_snapshot(ws_id)
             raw_project_id = target_row.get("project_id") if target_row is not None else None
             target_project_id = (
                 raw_project_id.strip()
                 if isinstance(raw_project_id, str) and raw_project_id.strip()
                 else ""
             )
-            if target_project_id and self._user_id:
-                from turnstone.core.auth import resolve_project_access
-
-                access = resolve_project_access(
-                    self._user_id,
-                    target_project_id,
-                    storage=storage,
-                )
-                if access.can_read and access.state != "archived":
-                    resumed_project_id = target_project_id
-                    resumed_project_name = access.name
-                    resumed_project_writable = access.can_write
+            resumed_attached_project_id = target_project_id
+            resumed_incarnation_token = (
+                str(target_row.get("fork_reservation_token") or "")
+                if target_row is not None
+                else ""
+            )
+            if target_row is not None and not resumed_incarnation_token:
+                raise RuntimeError(f"workstream {ws_id!r} has no durable incarnation token")
         # Parse every scalar that can reject persisted input before either
         # identity/history adoption or a fork's durable bulk copy. A corrupt
         # value must not leave a half-adopted live session, nor committed fork
@@ -5294,9 +5992,8 @@ class ChatSession:
                     "construction — open the workstream fresh instead"
                 )
             self._ws_id = ws_id
-            self._project_id = resumed_project_id
-            self._project_name = resumed_project_name
-            self._project_writable = resumed_project_writable
+            self._fork_reservation_token = resumed_incarnation_token
+            self._memory_attached_project_id = resumed_attached_project_id
             # A non-fork resume repoints this session at a DIFFERENT existing
             # workstream's identity (fork keeps self._ws_id, so its nonces stay
             # correctly scoped to the ws they were minted for). The sender-label
@@ -5311,20 +6008,20 @@ class ChatSession:
         # Shared-workstream state is per-workstream: this session object now
         # points at (possibly different) history, so forget and re-derive.
         self._reset_shared_state()
-        # Memory search results and touch bookkeeping are scoped by the
-        # workstream's project/user visibility.  A non-fork resume can adopt a
-        # different project context, while a fork adopts a newly cloned
-        # identity; neither may reuse cache entries or suppress touches from
-        # the prior context.
-        self._invalidate_memory_cache()
+        self._memory_index_snapshot = None
+        # A resume adopts another durable workstream identity. Its composed
+        # prefix cannot carry over.
+        self._invalidate_system_prefix()
         self._read_files.clear()
         self._repeat_detector.clear()
         self._last_usage = None
-        self._calibrated_msg_count = 0
+        self._invalidate_token_calibration_anchors()
         self._title_generated = True  # don't re-title resumed workstreams
         self._msg_tokens = [
             max(1, int(self._msg_char_count(m) / self._chars_per_token)) for m in self.messages
         ]
+        if not self._manual_tool_truncation:
+            self.tool_truncation = int(self.context_window * self._chars_per_token * 0.5)
         resume_diagnostics = lane_diagnostics(self._primary_lane())
         log.info(
             "Resuming ws=%s: %d messages, provider=%s, model=%s",
@@ -5485,6 +6182,7 @@ class ChatSession:
         if not fork:
             self._follow_watch_registration(old_ws_id)
         self._init_system_messages()
+        self._activate_token_calibration(self._primary_lane())
         return True
 
     def _follow_watch_registration(self, old_ws_id: str) -> None:
@@ -5538,7 +6236,13 @@ class ChatSession:
         if not self._mem_cfg.nudges:
             return False
         required = NUDGE_REQUIRED_TOOL.get(nudge_type)
-        return required is None or self._persona_tool_visible(required)
+        return required is None or self._tool_is_available(required)
+
+    def _tool_is_available(self, name: str) -> bool:
+        """Whether a named function is both registered and persona-visible."""
+        return self._persona_tool_visible(name) and any(
+            tool.get("function", {}).get("name") == name for tool in self._tools
+        )
 
     def _operator_prompt_addition(self, caps: ModelCapabilities) -> str:
         """Trust declaration required when operator turns use nonce fences."""
@@ -5566,8 +6270,12 @@ class ChatSession:
             if addition
         ]
 
-    def _system_messages_for_lane(self, caps: ModelCapabilities) -> list[dict[str, Any]]:
-        """Return the cached prefix plus additions required by *caps*.
+    def _system_messages_with_lane_additions(
+        self,
+        system_messages: list[dict[str, Any]],
+        caps: ModelCapabilities,
+    ) -> list[dict[str, Any]]:
+        """Return *system_messages* plus additions required by *caps*.
 
         The primary prefix stays cache-stable. A fallback can need stricter
         client-side posture than that prefix declares: nonce-fenced operator
@@ -5582,31 +6290,423 @@ class ChatSession:
             for addition in self._capability_prompt_additions(caps)
             if addition not in primary_additions
         ]
-        if not missing or not self.system_messages:
-            return self.system_messages
-        messages = list(self.system_messages)
+        if not missing or not system_messages:
+            return system_messages
+        messages = list(system_messages)
         head = messages[0]
         content = head.get("content")
         if not isinstance(content, str):
-            return self.system_messages
+            return system_messages
         messages[0] = {
             **head,
             "content": content + "\n\n" + "\n\n".join(missing),
         }
         return messages
 
-    def _init_system_messages(self, *, origin_generation: int = 0) -> bool:
-        """Build the system/developer prefix messages.
+    def _system_messages_for_lane(self, caps: ModelCapabilities) -> list[dict[str, Any]]:
+        """Return the cached prefix plus additions required by *caps*."""
+        return self._system_messages_with_lane_additions(self.system_messages, caps)
+
+    @staticmethod
+    def _render_prompt_components(
+        components: tuple[_PromptComponent, ...],
+        capabilities: frozenset[str],
+    ) -> list[dict[str, Any]]:
+        """Project tagged fragments into the single provider system block."""
+        parts = [
+            component.content
+            for component in components
+            if component.required_capabilities <= capabilities and component.content
+        ]
+        return [{"role": "system", "content": "\n\n".join(parts)}] if parts else []
+
+    def _agent_system_messages_for_capabilities(
+        self,
+        capabilities: frozenset[str],
+    ) -> list[dict[str, Any]]:
+        """Render the task-agent prefix for an explicit capability set."""
+        return self._render_prompt_components(self._agent_prompt_components, capabilities)
+
+    def _load_bound_memory_index(self) -> dict[str, Any] | None:
+        """Load this workstream's immutable index without creating one."""
+        cached = self._memory_index_snapshot
+        if cached is not None:
+            return cached
+        snapshot = get_storage().get_memory_index_snapshot(self._ws_id)
+        if snapshot is not None:
+            self._memory_index_snapshot = snapshot
+        return snapshot
+
+    def _context_window_for_lane(self, lane: ModelLane) -> int:
+        """Return the context window frozen into one serving lane."""
+        if same_model_lane_binding(lane, self._primary_lane()):
+            return self.context_window
+        if lane.alias and lane.backend_auth_config is not None:
+            return max(1, int(lane.backend_auth_config.context_window))
+        return max(1, int(require_lane_capabilities(lane).context_window))
+
+    def _memory_index_sizing(
+        self,
+        lane: ModelLane,
+    ) -> _MemoryIndexSizing:
+        """Freeze every non-prefix input to prefix-only sizing."""
+        calibration = self._token_calibrations.get(self._token_calibration_key(lane))
+        ratio = calibration.chars_per_token if calibration is not None else 4.0
+        caps = require_lane_capabilities(lane)
+        context_window = self._context_window_for_lane(lane)
+        return _MemoryIndexSizing(
+            capabilities=caps,
+            chars_per_token=ratio,
+            input_capacity=_usable_input_capacity(context_window, self.max_tokens),
+            context_window=context_window,
+        )
+
+    def _memory_index_prefix_estimate(
+        self,
+        system_messages: list[dict[str, Any]],
+        lane: ModelLane,
+        *,
+        sizing: _MemoryIndexSizing | None = None,
+    ) -> tuple[int, int, int]:
+        """Estimate prefix use and usable capacity without projecting tools/history."""
+        frozen = sizing or self._memory_index_sizing(lane)
+        prefix = self._system_messages_with_lane_additions(
+            system_messages,
+            frozen.capabilities,
+        )
+        if not prefix:
+            raise RuntimeError("memory-index admission requires a leading system prefix")
+        prefix_tokens = sum(
+            max(1, int(self._msg_char_count(message) / frozen.chars_per_token))
+            for message in prefix
+        )
+        return prefix_tokens, frozen.input_capacity, frozen.context_window
+
+    def _validate_memory_index_prefix(
+        self,
+        system_messages: list[dict[str, Any]],
+        snapshot: dict[str, Any],
+        lane: ModelLane,
+        *,
+        snapshot_committed: bool,
+        sizing: _MemoryIndexSizing | None = None,
+    ) -> None:
+        """Refuse a complete memory-bearing request that cannot fit."""
+        prefix_tokens, input_capacity, context_window = self._memory_index_prefix_estimate(
+            system_messages,
+            lane,
+            sizing=sizing,
+        )
+        if prefix_tokens <= input_capacity:
+            return
+        raise self._memory_index_context_error(
+            snapshot,
+            lane,
+            prefix_tokens=prefix_tokens,
+            input_capacity=input_capacity,
+            context_window=context_window,
+            snapshot_committed=snapshot_committed,
+        )
+
+    @staticmethod
+    def _memory_index_context_error(
+        snapshot: dict[str, Any],
+        lane: ModelLane,
+        *,
+        prefix_tokens: int,
+        input_capacity: int,
+        context_window: int,
+        snapshot_committed: bool,
+    ) -> _MemoryIndexContextError:
+        """Build the actionable, safe refusal for an oversized index."""
+        alias = lane.alias or lane.model or "selected model"
+        index_chars = int(snapshot.get("char_count") or len(str(snapshot.get("content") or "")))
+        if snapshot_committed:
+            remediation = (
+                "Choose a larger-context model; this workstream's immutable "
+                "memory-index snapshot is already bound."
+            )
+            snapshot_note = ""
+        else:
+            remediation = (
+                "Choose a larger-context model, or, if this workstream still has no "
+                "immutable snapshot, delete/consolidate memories and retry with a "
+                "smaller candidate."
+            )
+            # Another node may have won the first-capture race after this
+            # session's pre-load miss. This statement remains true for both an
+            # uncommitted local candidate and an already-durable winner.
+            snapshot_note = " This request did not commit a new memory-index snapshot."
+        return _MemoryIndexContextError(
+            f"Memory index cannot fit model={alias}: the complete final prefix is estimated at "
+            f"{prefix_tokens:,} prompt tokens, above its {input_capacity:,}-token usable "
+            f"input capacity ({context_window:,}-token context; memory index "
+            f"{index_chars:,} characters). {remediation}{snapshot_note}"
+        )
+
+    def _plan_first_memory_index_admission(
+        self,
+        *,
+        lane: ModelLane,
+        principal_id: str,
+        project_witness: dict[str, Any] | None,
+    ) -> _MemoryIndexAdmissionPlan:
+        """Plan every storage-backed prefix fact before capture starts."""
+        with self._system_prefix_lock:
+            self._system_prefix_epoch = getattr(self, "_system_prefix_epoch", 0) + 1
+            composition_epoch = self._system_prefix_epoch
+        prefix = self._build_system_prefix_plan(
+            principal_id=principal_id,
+            composition_epoch=composition_epoch,
+            bound_memory_index=None,
+            project_witness=project_witness,
+        )
+        return _MemoryIndexAdmissionPlan(
+            prefix=prefix,
+            lane=lane,
+            candidate_witness=(
+                str(
+                    project_witness.get("project_id") or ""
+                    if project_witness is not None
+                    else prefix.memory_signature[2]
+                ),
+                str(
+                    project_witness.get("project_name") or ""
+                    if project_witness is not None
+                    else prefix.memory_signature[3]
+                ),
+            ),
+            sizing=self._memory_index_sizing(lane),
+        )
+
+    def _attach_memory_index_to_plan(
+        self,
+        plan: _SystemPrefixPlan,
+        snapshot: dict[str, Any],
+    ) -> _SystemPrefixPlan:
+        """Attach exact candidate bytes without performing any storage reads."""
+        components = (
+            *plan.agent_prompt_components,
+            _PromptComponent(
+                str(snapshot["content"]),
+                required_capabilities=frozenset({"memory"}),
+            ),
+        )
+        rendered = self._render_prompt_components(components, frozenset({"memory"}))
+        return dataclasses.replace(
+            plan,
+            agent_prompt_components=components,
+            system_messages=[*rendered, *plan.system_messages[1:]],
+        )
+
+    @contextlib.contextmanager
+    def _memory_index_commit_context(
+        self,
+        my_generation: int,
+        admission: _MemoryIndexAdmissionPlan,
+        snapshot: dict[str, Any],
+    ) -> Iterator[None]:
+        """Validate before yield, then publish after the backend commits at yield."""
+        candidate_witness = (
+            str(snapshot.get("project_id") or ""),
+            str(snapshot.get("project_name") or ""),
+        )
+        if candidate_witness != admission.candidate_witness:
+            raise _MemoryIndexPlanStaleError(snapshot)
+        plan = self._attach_memory_index_to_plan(admission.prefix, snapshot)
+        self._validate_memory_index_prefix(
+            plan.system_messages,
+            snapshot,
+            admission.lane,
+            snapshot_committed=False,
+            sizing=admission.sizing,
+        )
+        with self._generation_lock, self._system_prefix_lock:
+            self._check_generation_admission(my_generation)
+            if plan.composition_epoch != self._system_prefix_epoch:
+                raise _MemoryIndexPlanStaleError(snapshot)
+            # Everything that can reasonably fail is prepared before yield.
+            # The backend executes its commit as the context body; the
+            # post-yield path below remains assignment-only while both
+            # publication locks exclude a superseding generation.
+            shared_state = self._resolved_shared_state_plan(*plan.shared_state)
+            prefix_changed = self.system_messages != plan.system_messages
+            token_calibrations = self._token_calibrations
+            if prefix_changed:
+                token_calibrations = {
+                    key: dataclasses.replace(value, prompt_tokens=None, message_prefix_ids=())
+                    for key, value in self._token_calibrations.items()
+                }
+            sys_chars = sum(self._msg_char_count(message) for message in plan.system_messages)
+            system_tokens = max(1, int(sys_chars / self._chars_per_token))
+            yield
+            (
+                self._known_senders,
+                self._shared_workstream,
+                self._db_senders_loaded,
+                self._senders_dirty,
+            ) = shared_state
+            self._memory_index_snapshot = snapshot
+            self._system_prefix_signature = plan.memory_signature
+            self._agent_prompt_components = plan.agent_prompt_components
+            self.system_messages = plan.system_messages
+            self._system_prefix_dirty = False
+            if prefix_changed:
+                self._last_usage = None
+                self._token_calibrations = token_calibrations
+                self._last_usage_calibration_key = None
+                self._calibrated_msg_count = 0
+            self._system_tokens = system_tokens
+
+    def _bind_existing_memory_index(
+        self,
+        snapshot: dict[str, Any],
+        *,
+        lane: ModelLane,
+        my_generation: int,
+        principal_id: str,
+    ) -> None:
+        """Validate and publish an already-durable immutable snapshot."""
+        for _attempt in range(3):
+            self._check_generation_admission(my_generation)
+            with self._system_prefix_lock:
+                self._system_prefix_epoch = getattr(self, "_system_prefix_epoch", 0) + 1
+                composition_epoch = self._system_prefix_epoch
+            plan = self._build_system_prefix_plan(
+                principal_id=principal_id,
+                composition_epoch=composition_epoch,
+                bound_memory_index=snapshot,
+            )
+            self._validate_memory_index_prefix(
+                plan.system_messages,
+                snapshot,
+                lane,
+                snapshot_committed=True,
+            )
+            with self._generation_lock, self._system_prefix_lock:
+                self._check_generation_admission(my_generation)
+                if plan.composition_epoch != self._system_prefix_epoch:
+                    continue
+                self._memory_index_snapshot = snapshot
+                self._install_system_prefix_plan_locked(plan)
+                return
+        raise RuntimeError("memory context could not be refreshed safely")
+
+    def _admit_memory_index_request(
+        self,
+        lane: ModelLane,
+        *,
+        my_generation: int,
+        principal_id: str,
+    ) -> None:
+        """Bind the first index, then compose the final cached prefix once."""
+        self._check_generation_admission(my_generation)
+        if not self._persona_memory or not self._tool_is_available("memory"):
+            self._ensure_system_prefix_fresh(
+                principal_id=principal_id,
+                origin_generation=my_generation,
+            )
+            return
+        if self._memory_index_admission_generation != my_generation:
+            self._ensure_system_prefix_fresh(
+                principal_id=principal_id,
+                origin_generation=my_generation,
+            )
+            return
+        snapshot = self._load_bound_memory_index()
+        if snapshot is not None and any(
+            component.required_capabilities == frozenset({"memory"})
+            for component in self._agent_prompt_components
+        ):
+            self._ensure_system_prefix_fresh(
+                principal_id=principal_id,
+                origin_generation=my_generation,
+            )
+            self._validate_memory_index_prefix(
+                self.system_messages,
+                snapshot,
+                lane,
+                snapshot_committed=True,
+            )
+            return
+        if snapshot is None:
+            project_witness: dict[str, Any] | None = None
+            for _attempt in range(3):
+                admission = self._plan_first_memory_index_admission(
+                    lane=lane,
+                    principal_id=principal_id,
+                    project_witness=project_witness,
+                )
+                try:
+                    snapshot = acquire_memory_index_snapshot(
+                        self._ws_id,
+                        principal_id,
+                        commit_context=functools.partial(
+                            self._memory_index_commit_context,
+                            my_generation,
+                            admission,
+                        ),
+                    )
+                    break
+                except _MemoryIndexPlanStaleError as stale:
+                    project_witness = stale.snapshot
+            else:
+                raise RuntimeError("memory context could not be refreshed safely")
+            if snapshot is None:
+                raise RuntimeError("memory index workstream is no longer active")
+            log.info(
+                "memory.index",
+                entries=int(snapshot["entry_count"]),
+                chars=int(snapshot["char_count"]),
+                invalid_descriptions=int(snapshot["invalid_description_count"]),
+            )
+            return
+        self._bind_existing_memory_index(
+            snapshot,
+            lane=lane,
+            my_generation=my_generation,
+            principal_id=principal_id,
+        )
+
+    def _init_system_messages(
+        self,
+        *,
+        origin_generation: int = 0,
+        principal_id: str | None = None,
+    ) -> bool:
+        """Compose and atomically publish the newest system-prefix attempt."""
+        with self._system_prefix_lock:
+            self._system_prefix_epoch = getattr(self, "_system_prefix_epoch", 0) + 1
+            composition_epoch = self._system_prefix_epoch
+        return self._compose_system_messages(
+            origin_generation=origin_generation,
+            principal_id=principal_id,
+            composition_epoch=composition_epoch,
+        )
+
+    def _build_system_prefix_plan(
+        self,
+        *,
+        principal_id: str | None,
+        composition_epoch: int,
+        bound_memory_index: dict[str, Any] | None,
+        project_witness: dict[str, Any] | None = None,
+    ) -> _SystemPrefixPlan:
+        """Render a complete prefix without publishing it.
 
         Developer message contains the composed system message (persona
-        base override included), plus any user-supplied instructions and
-        memory reminders.
+        base override included), plus user-supplied instructions and the
+        immutable memory index when one is bound.
 
-        Uses copy-on-write: builds new lists locally, then assigns
-        atomically so concurrent readers (e.g. background thread
-        callbacks) never see a partially-built system message.
+        Keeping planning separate from publication lets first-snapshot
+        admission validate the candidate prefix while its database insert is
+        still uncommitted, without exposing provisional state to another
+        generation.
         """
         new_system_messages: list[dict[str, Any]] = []
+        memory_access = self._memory_access(principal_id)
+        context_snapshot = bound_memory_index or project_witness
+        composition_principal_id = memory_access.principal_id or None
         shared_state_plan = self._plan_shared_state()
         owner = (self._mcp_user_id or "").strip()
         planned_senders = set(self._known_senders) | shared_state_plan[1]
@@ -5616,13 +6716,6 @@ class ChatSession:
             if turn.role is Role.USER and (s := (turn.meta.extra.get("sender") or "").strip())
         )
         planned_shared = self._shared_workstream or any(s != owner for s in planned_senders)
-        memory_cache_updates: dict[
-            tuple[str, str, int],
-            list[dict[str, str]],
-        ] = {}
-        planned_touch_keys: list[tuple[str, str, str]] = []
-        accepted_touch_keys: list[tuple[str, str, str]] = []
-
         # -- Developer message --
         # Compose system message from modular components.  The name set
         # runs through the persona visibility filter (levers 2+4) so the
@@ -5637,9 +6730,7 @@ class ChatSession:
         # Load DB prompt policies if storage is available
         db_policies: list[dict[str, Any]] = []
         try:
-            storage = get_storage()
-            if storage:
-                db_policies = storage.list_prompt_policies()
+            db_policies = get_storage().list_prompt_policies()
         except Exception:
             log.debug("Failed to load prompt policies from storage", exc_info=True)
         now = datetime.now().astimezone()
@@ -5652,10 +6743,18 @@ class ChatSession:
             current_datetime=now.strftime("%Y-%m-%dT%H:00"),
             timezone=now.tzname() or "UTC",
             username=self._username or self._user_id or "unknown",
-            project=self._project_name,
+            project=(
+                str(context_snapshot.get("project_name") or "")
+                if context_snapshot is not None
+                else memory_access.project_name
+            ),
             shared=planned_shared,
             ws_id=self._ws_id,
-            project_id=self._project_id,
+            project_id=(
+                str(context_snapshot.get("project_id") or "")
+                if context_snapshot is not None
+                else memory_access.project_id
+            ),
         )
         composed = compose_system_message(
             client_type=self._client_type,
@@ -5707,7 +6806,7 @@ class ChatSession:
             # Per-user merge: pool entries for the effective user (acting
             # user on shared workstreams, owner otherwise) are included;
             # other users' pool resources are not.
-            all_resources = self._mcp_client.get_resources(user_id=self._mcp_effective_user_id)
+            all_resources = self._mcp_client.get_resources(user_id=composition_principal_id)
             concrete = [r for r in all_resources if not r.get("template")]
             templates = [r for r in all_resources if r.get("template")]
             if concrete or templates:
@@ -5736,7 +6835,7 @@ class ChatSession:
             # Per-user merge: pool entries for the effective user (acting
             # user on shared workstreams, owner otherwise) are included;
             # other users' pool prompts are not.
-            prompts = self._mcp_client.get_prompts(user_id=self._mcp_effective_user_id)
+            prompts = self._mcp_client.get_prompts(user_id=composition_principal_id)
             if prompts:
                 lines = ["<mcp-prompts>"]
                 for p in prompts[:30]:
@@ -5833,83 +6932,84 @@ class ChatSession:
         if self.instructions:
             dev_parts.append("")
             dev_parts.append(self.instructions)
-        context = extract_recent_context(dicts_from_turns(self.messages))
-        composed_with_context = bool(context.strip())
-        # Persona lever 4: memory-off suppresses recalled-memory injection
-        # here, the nudges at their producer sites, and the memory tool via the
-        # visibility filter.  Sub-agents (task_agent) are persona-filtered at
-        # the delegation edge too now (see _exec_task), so a memory-off persona
-        # drops their memory tool as well; compaction spill/markers are session
-        # mechanics — never gated.
-        visible_mems, candidate_source = (
-            self._select_memory_candidates(
-                context,
-                cache_updates=memory_cache_updates,
-            )
-            if self._persona_memory
-            else ([], "")
+        index_required = self._persona_memory and "memory" in tool_names
+        base_system_messages = [{"role": "system", "content": "\n".join(dev_parts)}]
+        new_agent_prompt_components: tuple[_PromptComponent, ...] = (
+            _PromptComponent(str(base_system_messages[0]["content"])),
         )
-        if visible_mems:
-            thr = self._bm25_rerank_threshold()
-            relevant = score_memories(
-                visible_mems,
-                context,
-                k=self._mem_cfg.relevance_k,
-                reranker=self._bm25_reranker(thr),
-                rerank_filters=thr > 0,
+        if index_required and bound_memory_index is not None:
+            new_agent_prompt_components = (
+                new_agent_prompt_components[0],
+                _PromptComponent(
+                    str(bound_memory_index["content"]),
+                    required_capabilities=frozenset({"memory"}),
+                ),
             )
-            log.info(
-                "memory.composition",
-                source=candidate_source,
-                candidates=len(visible_mems),
-                injected=len(relevant),
-            )
-            # Access metadata tracks what the model actually saw — touch the
-            # injected top-k, not the candidate pool.
-            planned_touch_keys = self._memory_keys(relevant)
-            if relevant:
-                dev_parts.append("")
-                dev_parts.append(build_memory_context(relevant))
-            # Only advertise the memory(...) tool invocations when the
-            # memory tool is actually in the session's schema.  The
-            # coordinator kind doesn't register memory; the preamble
-            # previously told the model to call a tool it doesn't have,
-            # producing "I don't have access to a memory tool" apologies
-            # or hallucinated calls.
-            if "memory" in tool_names:
-                dev_parts.append("")
-                dev_parts.append(
-                    f"You have {len(visible_mems)} memories in scope. "
-                    "Use memory(action='search') or memory(action='list') for more."
-                )
-        new_system_messages.append({"role": "system", "content": "\n".join(dev_parts)})
+        new_system_messages = self._render_prompt_components(
+            new_agent_prompt_components,
+            frozenset({"memory"}) if index_required else frozenset(),
+        )
         # Agent prefix: the identity system block only (snapshotted BEFORE the
         # skill block below) — a task_agent supplies its own persona identity
         # and any skill as capability (see _exec_task), so the parent's applied
         # skill no longer leaks into the sub-agent base.
-        new_agent_system_messages = list(new_system_messages)
         # Applied-skill body rides its own capability message, off the cached
         # identity prefix (see skill_context above).  PRE-MERGE GATE: the
         # model-adherence eval this-vs-main (design §7 Q1) is not run in-tree.
         if skill_context:
             new_system_messages.append({"role": "user", "content": skill_context})
 
+        return _SystemPrefixPlan(
+            composition_epoch=composition_epoch,
+            memory_signature=memory_access.signature,
+            shared_state=shared_state_plan,
+            agent_prompt_components=new_agent_prompt_components,
+            system_messages=new_system_messages,
+        )
+
+    def _install_system_prefix_plan_locked(self, plan: _SystemPrefixPlan) -> None:
+        """Install *plan* while generation and prefix publication locks are held."""
+        prefix_changed = self.system_messages != plan.system_messages
+        self._apply_shared_state_plan(*plan.shared_state)
+        self._system_prefix_signature = plan.memory_signature
+        self._agent_prompt_components = plan.agent_prompt_components
+        self.system_messages = plan.system_messages
+        self._system_prefix_dirty = False
+        if prefix_changed:
+            # ``_last_usage`` carries the same provider prompt count as the
+            # keyed calibration.  Leaving it populated would activate the
+            # legacy fallback after clearing its key and reuse an anchor that
+            # predates this prefix.
+            self._last_usage = None
+            self._invalidate_token_calibration_anchors()
+        sys_chars = sum(self._msg_char_count(message) for message in self.system_messages)
+        self._system_tokens = max(1, int(sys_chars / self._chars_per_token))
+
+    def _publish_system_prefix_plan(
+        self,
+        plan: _SystemPrefixPlan,
+        *,
+        origin_generation: int,
+    ) -> bool:
+        """Atomically publish a rendered prefix if its witnesses remain current."""
+        installed = False
+
         def _install() -> None:
-            self._apply_shared_state_plan(*shared_state_plan)
-            self._mem_search_cache.update(memory_cache_updates)
-            fresh_touch_keys = [
-                key for key in planned_touch_keys if key not in self._touched_memory_keys
-            ]
-            self._touched_memory_keys.update(fresh_touch_keys)
-            accepted_touch_keys.extend(fresh_touch_keys)
-            # Atomic swaps — readers see either old or new, never partial.
-            self._agent_system_messages = new_agent_system_messages
-            self.system_messages = new_system_messages
-            if composed_with_context:
-                # Composed against a real user-message query at least once;
-                # send() uses this to know the deferred first-turn recompose is
-                # done.  Publish this latch with the prefix it describes.
-                self._system_composed_with_context = True
+            nonlocal installed
+            # Resource/prompt callbacks may finish after close.  Share the
+            # terminal publication rail used by generation-owned composition,
+            # then take the established generation -> prefix lock order so a
+            # close either follows this complete swap or rejects it.  A failed
+            # soft-close can reopen the session; retain the dirty bit so its
+            # next provider request retries the catalog composition.
+            with self._generation_lock, self._system_prefix_lock:
+                if self._publication_shutdown:
+                    self._system_prefix_dirty = True
+                    return
+                if plan.composition_epoch != getattr(self, "_system_prefix_epoch", 0):
+                    return
+                self._install_system_prefix_plan_locked(plan)
+                installed = True
 
         if origin_generation:
             published = self._publish_for_generation(
@@ -5920,9 +7020,62 @@ class ChatSession:
         else:
             _install()
             published = True
-        if published and accepted_touch_keys:
-            touch_structured_memories(accepted_touch_keys)
+        published = published and installed
         return published
+
+    def _compose_system_messages(
+        self,
+        *,
+        origin_generation: int = 0,
+        principal_id: str | None = None,
+        composition_epoch: int | None = None,
+    ) -> bool:
+        """Build and atomically publish the newest system-prefix attempt."""
+        if composition_epoch is None:
+            with self._system_prefix_lock:
+                self._system_prefix_epoch = getattr(self, "_system_prefix_epoch", 0) + 1
+                composition_epoch = self._system_prefix_epoch
+        plan = self._build_system_prefix_plan(
+            principal_id=principal_id,
+            composition_epoch=composition_epoch,
+            bound_memory_index=self._load_bound_memory_index(),
+        )
+        return self._publish_system_prefix_plan(
+            plan,
+            origin_generation=origin_generation,
+        )
+
+    def _ensure_system_prefix_fresh(
+        self,
+        *,
+        principal_id: str | None = None,
+        origin_generation: int = 0,
+    ) -> None:
+        """Refresh the cached prefix when its actor/project witness changed."""
+        if principal_id is None:
+            principal_id = (self._mcp_effective_user_id or self._user_id or "").strip()
+        for _attempt in range(2):
+            access = self._memory_access(principal_id)
+            with self._system_prefix_lock:
+                if (
+                    not self._system_prefix_dirty
+                    and self._system_prefix_signature == access.signature
+                ):
+                    return
+                self._system_prefix_dirty = True
+            if not self._init_system_messages(
+                origin_generation=origin_generation,
+                principal_id=principal_id,
+            ):
+                break
+            current_signature = self._memory_access(principal_id).signature
+            with self._system_prefix_lock:
+                if (
+                    not self._system_prefix_dirty
+                    and self._system_prefix_signature == current_signature
+                ):
+                    return
+        raise RuntimeError("memory context could not be refreshed safely")
 
     def _full_messages(self) -> list[dict[str, Any]]:
         """System messages + conversation history as wire dicts.
@@ -5982,7 +7135,8 @@ class ChatSession:
             else:
                 missing.append(att_id)
         if missing:
-            for att in get_attachments(missing):
+            stored_attachments = get_attachments(missing)
+            for att in stored_attachments:
                 if cancel_ref is not None and cancel_ref.aborted:
                     raise GenerationCancelled
                 part = _neutralize_attachment_part(
@@ -6356,20 +7510,18 @@ class ChatSession:
             return cached
         name = user_id
         try:
-            storage = get_storage()
-            if storage:
-                row = storage.get_user(user_id)
-                if row:
-                    # username-first (unlike auth.py's display_name-first for the
-                    # UI): sender labels must read as the SAME identity kind the
-                    # owner gets in the banner (``self._username`` = users.username),
-                    # so owner and participants are labelled consistently.
-                    name = row.get("username") or row.get("display_name") or user_id
-                # Cache hits and definite misses (row is None). A transient
-                # storage error, by contrast, skips the cache and falls through
-                # to return the raw id, so a later call can retry rather than
-                # pinning the sender to their id for the session's lifetime.
-                self._sender_name_cache[user_id] = name
+            row = get_storage().get_user(user_id)
+            if row:
+                # username-first (unlike auth.py's display_name-first for the
+                # UI): sender labels must read as the SAME identity kind the
+                # owner gets in the banner (``self._username`` = users.username),
+                # so owner and participants are labelled consistently.
+                name = row.get("username") or row.get("display_name") or user_id
+            # Cache hits and definite misses (row is None). A transient
+            # storage error, by contrast, skips the cache and falls through
+            # to return the raw id, so a later call can retry rather than
+            # pinning the sender to their id for the session's lifetime.
+            self._sender_name_cache[user_id] = name
         except Exception:
             log.debug("display-name lookup failed for user=%s", user_id, exc_info=True)
         return name
@@ -6415,15 +7567,10 @@ class ChatSession:
         set, and the flag stays False so the correct workstream is read next."""
         ws_id = self._ws_id
         try:
-            storage = get_storage()
-            if storage is not None:
-                senders = {s for s in storage.list_message_senders(ws_id) if s}
-                if self._ws_id == ws_id:
-                    self._db_senders_loaded = True
-                return senders
-            # No storage configured (ephemeral session): nothing to read, ever.
+            senders = {s for s in get_storage().list_message_senders(ws_id) if s}
             if self._ws_id == ws_id:
                 self._db_senders_loaded = True
+            return senders
         except Exception:
             log.debug("persisted-sender load failed for ws=%s", ws_id, exc_info=True)
         return set()
@@ -6434,13 +7581,37 @@ class ChatSession:
         if self._db_senders_loaded:
             return ws_id, set(), True
         try:
-            storage = get_storage()
-            if storage is None:
-                return ws_id, set(), True
-            return ws_id, {s for s in storage.list_message_senders(ws_id) if s}, True
+            return ws_id, {s for s in get_storage().list_message_senders(ws_id) if s}, True
         except Exception:
             log.debug("persisted-sender load failed for ws=%s", ws_id, exc_info=True)
             return ws_id, set(), False
+
+    def _resolved_shared_state_plan(
+        self,
+        ws_id: str,
+        persisted_senders: set[str],
+        read_complete: bool,
+    ) -> tuple[set[str], bool, bool, bool]:
+        """Return the sender state produced by one pre-read snapshot."""
+        known_senders = set(self._known_senders)
+        shared_workstream = self._shared_workstream
+        db_senders_loaded = self._db_senders_loaded
+        senders_dirty = self._senders_dirty
+        if self._ws_id == ws_id:
+            owner = (self._mcp_user_id or "").strip()
+            live_senders = {
+                s
+                for turn in self.messages
+                if turn.role is Role.USER and (s := (turn.meta.extra.get("sender") or "").strip())
+            }
+            known_senders |= persisted_senders | live_senders
+            if not shared_workstream:
+                shared_workstream = any(s != owner for s in known_senders)
+            if read_complete:
+                db_senders_loaded = True
+            if db_senders_loaded:
+                senders_dirty = False
+        return known_senders, shared_workstream, db_senders_loaded, senders_dirty
 
     def _apply_shared_state_plan(
         self,
@@ -6449,21 +7620,12 @@ class ChatSession:
         read_complete: bool,
     ) -> None:
         """Apply one pre-read sender snapshot at an owner-fenced seam."""
-        if self._ws_id != ws_id:
-            return
-        owner = (self._mcp_user_id or "").strip()
-        live_senders = {
-            s
-            for turn in self.messages
-            if turn.role is Role.USER and (s := (turn.meta.extra.get("sender") or "").strip())
-        }
-        self._known_senders |= persisted_senders | live_senders
-        if not self._shared_workstream:
-            self._shared_workstream = any(s != owner for s in self._known_senders)
-        if read_complete:
-            self._db_senders_loaded = True
-        if self._db_senders_loaded:
-            self._senders_dirty = False
+        (
+            self._known_senders,
+            self._shared_workstream,
+            self._db_senders_loaded,
+            self._senders_dirty,
+        ) = self._resolved_shared_state_plan(ws_id, persisted_senders, read_complete)
 
     def _recompute_shared_state(self) -> None:
         """Refresh shared-workstream state from history — monotonically.
@@ -6712,19 +7874,18 @@ class ChatSession:
                 )
 
         if state in ("idle", "running") and self._has_persisted_error:
-            from turnstone.core.memory import clear_last_error
-
             persist_ws_id = self._ws_id
             error_revision = self._persisted_error_revision
             if deferred_persistence is None:
-                clear_last_error(persist_ws_id)
+                self._clear_last_error(persist_ws_id)
                 self._has_persisted_error = False
+                self._conversation_persistence_fatal_revision = None
             else:
 
                 def _clear_if_owned() -> None:
                     if not _owner_valid():
                         return
-                    clear_last_error(persist_ws_id)
+                    self._clear_last_error(persist_ws_id)
                     # Storage stays outside the generation lock.  Re-check
                     # after it returns so a successor or a newer same-owner
                     # fatal error keeps the latch set and receives its own
@@ -6736,6 +7897,7 @@ class ChatSession:
                             and self._persisted_error_revision == error_revision
                         ):
                             self._has_persisted_error = False
+                            self._conversation_persistence_fatal_revision = None
 
                 deferred_persistence.append(_clear_if_owned)
         # Surface the acting user (turn initiator) to the UI so web clients can
@@ -6769,6 +7931,80 @@ class ChatSession:
             deferred_persistence.append(_publish_legacy_if_owned)
         else:
             self.ui.on_state_change(state)
+
+    def _remember_serving_failure_context(
+        self,
+        exc: BaseException,
+        lane: ModelLane,
+    ) -> None:
+        """Associate *exc* with the value-only lane that actually failed."""
+        model_alias = lane.alias
+        backend_model_id = lane.model
+        registry_generation = lane.registry_generation
+        provider_label = "?"
+        base_url = "?"
+        try:
+            diagnostics = lane_diagnostics(lane)
+            provider_label = diagnostics.provider_name or diagnostics.provider_type
+            # Query parameters are never diagnostic and can carry API keys.
+            base_url = diagnostics.base_url.split("?", 1)[0].rstrip("/")
+        except Exception:
+            log.debug("session.fatal.serving_lane_snapshot_failed", exc_info=True)
+        context = _ServingFailureContext(
+            model_alias=model_alias,
+            backend_model_id=backend_model_id,
+            registry_generation=registry_generation,
+            provider_label=provider_label,
+            base_url=base_url,
+        )
+        with self._serving_failure_context_lock:
+            # Bound abandoned/recovered retry objects.  Entries are normally
+            # consumed synchronously by _record_fatal_error.
+            while len(self._serving_failure_contexts) >= 32:
+                self._serving_failure_contexts.pop(next(iter(self._serving_failure_contexts)))
+            # Retain object identity beside the id: a recovered exception can
+            # otherwise be collected and its integer id reused before a stale
+            # bounded entry is evicted, misattributing an unrelated failure.
+            self._serving_failure_contexts[id(exc)] = (exc, context)
+
+    def _take_serving_failure_context(
+        self,
+        exc: BaseException,
+    ) -> _ServingFailureContext | None:
+        """Consume the lane snapshot associated with *exc*, if any."""
+        with self._serving_failure_context_lock:
+            stored = self._serving_failure_contexts.pop(id(exc), None)
+        if stored is None or stored[0] is not exc:
+            return None
+        return stored[1]
+
+    def _forget_serving_failure_context(self, exc: BaseException | None) -> None:
+        """Drop a recovered retry's no-longer-actionable lane snapshot."""
+        if exc is None:
+            return
+        with self._serving_failure_context_lock:
+            stored = self._serving_failure_contexts.get(id(exc))
+            if stored is not None and stored[0] is exc:
+                self._serving_failure_contexts.pop(id(exc), None)
+
+    @contextlib.contextmanager
+    def _recovered_serving_failures(self) -> Iterator[list[BaseException]]:
+        """Own the lane snapshots a retry ladder takes, and drop the dead ones.
+
+        The ladder appends every failure it remembered to the yielded list.
+        Leaving the block forgets all of them EXCEPT an exception that is still
+        escaping: that one's snapshot is what ``_record_fatal_error`` consumes
+        to name the lane that actually failed.
+        """
+        recovered: list[BaseException] = []
+        try:
+            yield recovered
+        except BaseException as escaping:
+            recovered = [failure for failure in recovered if failure is not escaping]
+            raise
+        finally:
+            for failure in recovered:
+                self._forget_serving_failure_context(failure)
 
     def _record_fatal_error(
         self,
@@ -6804,9 +8040,13 @@ class ChatSession:
         the URL is wrong, or the model isn't loaded.  Unknown exceptions
         fall through to the default formatting unchanged.
         """
-        from turnstone.core.memory import persist_last_error, sanitize_error_text
-
-        raw = self._format_backend_error(exc) or f"{type(exc).__name__}: {exc}"
+        take_context = getattr(self, "_take_serving_failure_context", None)
+        serving_context = take_context(exc) if callable(take_context) else None
+        raw = (
+            self._format_backend_error(exc)
+            if serving_context is None
+            else self._format_backend_error(exc, serving_context=serving_context)
+        ) or f"{type(exc).__name__}: {exc}"
         safe = sanitize_error_text(raw)
         # The one journal trace of a fatal turn — UI sinks and the config row
         # are invisible to log scrapers.  Sanitized text only (same
@@ -6814,12 +8054,18 @@ class ChatSession:
         # through this chokepoint too; it is a user action, not a fault, so it
         # logs at INFO instead of ERROR.
         fatal_log = log.info if isinstance(exc, KeyboardInterrupt) else log.error
-        fatal_log(
-            "session.fatal.recorded",
-            ws=self._ws_id,
-            error_type=type(exc).__name__,
-            error=safe,
-        )
+        fatal_fields: dict[str, Any] = {
+            "ws": self._ws_id,
+            "error_type": type(exc).__name__,
+            "error": safe,
+        }
+        if serving_context is not None:
+            fatal_fields.update(
+                model_alias=serving_context.model_alias,
+                backend_model_id=serving_context.backend_model_id,
+                registry_generation=serving_context.registry_generation,
+            )
+        fatal_log("session.fatal.recorded", **fatal_fields)
         # Frames only — ``exc_info=True`` would render the raw exception
         # message, which can carry credentials verbatim (the sanitize floor
         # the lines above exist to hold); format_tb renders the stack
@@ -6839,11 +8085,23 @@ class ChatSession:
             log.debug("session.on_error_dispatch_failed", exc_info=True)
         persist_ws_id = self._ws_id
         if deferred_persistence is None:
-            persist_last_error(persist_ws_id, safe)
+            self._save_last_error(persist_ws_id, safe)
         else:
-            deferred_persistence.append(functools.partial(persist_last_error, persist_ws_id, safe))
-        self._persisted_error_revision = getattr(self, "_persisted_error_revision", 0) + 1
-        self._has_persisted_error = True
+            deferred_persistence.append(
+                functools.partial(self._save_last_error, persist_ws_id, safe)
+            )
+        # Manager-owned persistence recovery reads and retires this exact
+        # revision under the generation lock. Publish the revision and both
+        # ownership latches as one atomic snapshot so a concurrent maintenance
+        # pass cannot observe a new revision with stale ownership metadata.
+        with self._generation_lock:
+            self._persisted_error_revision = getattr(self, "_persisted_error_revision", 0) + 1
+            self._has_persisted_error = True
+            self._conversation_persistence_fatal_revision = (
+                self._persisted_error_revision
+                if isinstance(exc, ConversationPersistenceError)
+                else None
+            )
         self._emit_state("error", deferred_persistence=deferred_persistence)
 
     def ensure_error_recorded(self, exc: BaseException) -> None:
@@ -6883,7 +8141,12 @@ class ChatSession:
             return
         self._record_fatal_error(exc)
 
-    def _format_backend_error(self, exc: BaseException) -> str | None:
+    def _format_backend_error(
+        self,
+        exc: BaseException,
+        *,
+        serving_context: _ServingFailureContext | None = None,
+    ) -> str | None:
         """Return an enriched message for known backend boundary errors.
 
         Returns ``None`` for exceptions outside the recognised set so the
@@ -6892,7 +8155,7 @@ class ChatSession:
         can arrive as several exception classes); everything else is matched by
         class name (see the ``_BACKEND_*_EXC_NAMES`` sets above) so the same
         helper covers
-        httpx ``ReadTimeout`` / ``ConnectError``, OpenAI SDK
+        HTTPX/HTTPX2 ``ReadTimeout`` / ``ConnectError``, OpenAI SDK
         ``APITimeoutError`` / ``APIConnectionError`` /
         ``NotFoundError`` / ``RateLimitError`` / ``AuthenticationError``,
         and the Anthropic SDK equivalents (which share names).
@@ -6913,8 +8176,14 @@ class ChatSession:
         # The backend id (what the server was actually asked for) rides as a
         # labeled annotation for the operator, collapsing to one token when the
         # two coincide. Both labels derive from the frozen session binding.
-        alias = self._model_alias or ""
-        backend_id = self.model or ""
+        alias = (
+            serving_context.model_alias
+            if serving_context is not None
+            else (self._model_alias or "")
+        )
+        backend_id = (
+            serving_context.backend_model_id if serving_context is not None else (self.model or "")
+        )
         if alias and backend_id and alias != backend_id:
             model_label = f"{alias} (id={backend_id})"
         else:
@@ -6923,6 +8192,11 @@ class ChatSession:
         raw_tail = f" raw={raw_msg!r}" if raw_msg else ""
 
         name = type(exc).__name__
+
+        if isinstance(exc, ModelAdmissionError) and isinstance(
+            exc.__cause__, _MemoryIndexContextError
+        ):
+            return str(exc.__cause__)
 
         # A wire-preparation failure is the session's own data at fault, not
         # the backend's.  Checked FIRST: the overflow text-match below must
@@ -6974,8 +8248,13 @@ class ChatSession:
         # the turn. Remediation is PER-LANE: /model is routable only on the
         # CLI and node-interactive command lanes, so the console coordinator
         # — which routes no slash commands — gets recreate-or-adjust wording.
-        if self._registry_alias_removed or (
-            self._rebind_failed_key is not None and self._rebind_failed_key[0] == self._model_alias
+        context_is_primary = serving_context is None or alias == (self._model_alias or "")
+        if context_is_primary and (
+            self._registry_alias_removed
+            or (
+                self._rebind_failed_key is not None
+                and self._rebind_failed_key[0] == self._model_alias
+            )
         ):
             available = ""
             if self._registry is not None and self._registry.count:
@@ -6999,23 +8278,38 @@ class ChatSession:
                 f"{available}{raw_tail}"
             )
 
-        if name not in _BACKEND_KNOWN_EXC_NAMES:
+        try:
+            status_code = getattr(exc, "status_code", None)
+        except Exception:
+            log.debug("session.fatal.status_code_failed", exc_info=True)
+            status_code = None
+        is_http_status_error = (
+            isinstance(status_code, int)
+            and not isinstance(status_code, bool)
+            and 400 <= status_code <= 599
+        )
+        if (
+            name not in _BACKEND_KNOWN_EXC_NAMES
+            and name not in _BACKEND_REPORTED_EXC_NAMES
+            and not is_http_status_error
+        ):
             return None
 
         # Pull backend identity — every branch swallows so a bad
         # accessor on a partially-initialised session can't hide the
         # original exception behind a NoneType error.
-        base_url = "?"
-        provider_label = "?"
-        try:
-            # The PRIMARY binding, deliberately: endpoint, model label, and
-            # provider must describe one coherent lane even if a fallback
-            # produced the terminal error.
-            diagnostics = lane_diagnostics(self._primary_lane())
-            base_url = diagnostics.base_url.split("?")[0].rstrip("/")
-            provider_label = diagnostics.provider_name or diagnostics.provider_type
-        except Exception:
-            log.debug("session.fatal.lane_diagnostics_failed", exc_info=True)
+        if serving_context is not None:
+            base_url = serving_context.base_url
+            provider_label = serving_context.provider_label
+        else:
+            base_url = "?"
+            provider_label = "?"
+            try:
+                diagnostics = lane_diagnostics(self._primary_lane())
+                base_url = diagnostics.base_url.split("?")[0].rstrip("/")
+                provider_label = diagnostics.provider_name or diagnostics.provider_type
+            except Exception:
+                log.debug("session.fatal.lane_diagnostics_failed", exc_info=True)
         if name in _BACKEND_TIMEOUT_EXC_NAMES:
             return (
                 f"Backend timeout ({name}): no response from {provider_label} "
@@ -7050,6 +8344,31 @@ class ChatSession:
                 f"Backend rate-limited ({name}): {provider_label} "
                 f"at {base_url} (model={model_label})."
                 f"{raw_tail}"
+            )
+        if name in _BACKEND_TRANSIENT_EXC_NAMES:
+            return (
+                f"Backend returned a transient application error ({name}): "
+                f"{provider_label} at {base_url} (model={model_label}); retries "
+                f"did not recover it.{raw_tail}"
+            )
+        if name in _BACKEND_REPORTED_EXC_NAMES:
+            return (
+                f"Backend returned an error instead of a usable stream ({name}): "
+                f"{provider_label} at {base_url} (model={model_label})."
+                f"{raw_tail}"
+            )
+        if is_http_status_error:
+            status_label = f"HTTP {status_code}"
+            try:
+                reason = getattr(getattr(exc, "response", None), "reason_phrase", "")
+                if isinstance(reason, str) and reason.strip():
+                    status_label += f" {reason.strip()}"
+            except Exception:
+                log.debug("session.fatal.status_reason_failed", exc_info=True)
+            return (
+                f"Backend request failed ({status_label}): {provider_label} "
+                f"at {base_url} (model={model_label}). The upstream server returned "
+                f"an application error before generation started.{raw_tail}"
             )
         if name in _BACKEND_STREAM_EXC_NAMES:
             # First sentence kept short so Discord's message[:500] cut keeps
@@ -7122,14 +8441,18 @@ class ChatSession:
         resolved dict rather than resolved separately — one config
         generation, as ``resolve_lane`` intends.
 
-        ``principal_id`` pins dynamic backend authentication for work that
-        outlives the caller's mutable session binding (compaction and parallel
-        tool extraction).  ``None`` preserves the lane's existing resolver for
-        direct and already-pinned callers such as title generation.
+        ``principal_id`` pins dynamic backend authentication and accepted-turn
+        audit identity for work that outlives the caller's mutable session
+        binding (compaction, title generation, and parallel tool extraction).
+        ``None`` snapshots the session's effective principal at entry.
         """
         lane = lane or self._primary_lane()
-        if principal_id is not None:
-            lane = self._lane_for_backend_auth_principal(lane, principal_id)
+        effective_principal_id = (
+            (self._mcp_effective_user_id or "").strip()
+            if principal_id is None
+            else principal_id.strip()
+        )
+        lane = self._lane_for_backend_auth_principal(lane, effective_principal_id)
         caps = require_lane_capabilities(lane)
         clamped = min(max_tokens, caps.max_output_tokens) if caps.max_output_tokens else max_tokens
         suppress_reasoning = lane_thinking_suppressed(lane)
@@ -7147,6 +8470,7 @@ class ChatSession:
             # parallel web-fetch calls each pass an independent
             # StreamAbortRef that never publishes into the main stream slot.
             cancel_ref=cancel_ref,
+            acting_principal_id=effective_principal_id,
         )
         # Utility completions (title gen, compaction, web-fetch extraction)
         # bypass the streaming on_status path — record their usage so the
@@ -7602,6 +8926,10 @@ class ChatSession:
         """
         if principal_id is not None:
             lane = self._lane_for_backend_auth_principal(lane, principal_id)
+        # Wire preparation, attachment materialization, and tool-output budget
+        # helpers all read the session estimator.  Activate the exact lane
+        # before any of them can run.
+        self._activate_token_calibration(lane)
         diagnostics = lane_diagnostics(lane)
         safe_url = diagnostics.base_url.split("?")[0]  # query params may contain keys
         caps = require_lane_capabilities(lane)
@@ -7622,6 +8950,7 @@ class ChatSession:
             attachment_ref = _CancelRef(self, my_generation)
             consumer.begin_attempt(ref, tracker, lane)
             try:
+                self._ensure_mcp_projection_current()
                 return model_turn(
                     lane,
                     self.messages,
@@ -7629,6 +8958,11 @@ class ChatSession:
                     max_tokens=self.max_tokens,
                     deferred_names=self._get_deferred_names(caps),
                     prepare_wire=prepare_wire,
+                    admit_request=functools.partial(
+                        self._admit_memory_index_request,
+                        my_generation=my_generation,
+                        principal_id=principal_id or "",
+                    ),
                     resolve_attachments=functools.partial(
                         self._resolve_attachments,
                         caps=caps,
@@ -7636,6 +8970,7 @@ class ChatSession:
                         principal_id=principal_id,
                     ),
                     cancel_ref=ref,
+                    acting_principal_id=principal_id or "",
                     on_chunk=consumer,
                 )
             except Exception as e:
@@ -7737,6 +9072,84 @@ class ChatSession:
         for scope in scopes:
             scope.abort()
 
+    def _capture_worker_claim(self, principal_id: str = "") -> WorkerClaim | None:
+        """Capture one fresh worker slot's immutable session admission.
+
+        ``session_worker.send`` calls this immediately before entering the
+        workstream slot lock.  Capturing in that order avoids the inverse of a
+        generation commit's generation-lock -> UI -> workstream-lock path.
+        Stop/close publish their monotonic edge under the same generation lock
+        used here; if one lands between this snapshot and slot installation,
+        send entry rejects the conservatively stale epoch.
+
+        Internal workers omit an authenticated principal; pin the current
+        effective actor at claim time so wake/init continuations cannot later
+        borrow a mutable actor changed by another request.
+        """
+
+        with self._generation_lock:
+            if self._publication_shutdown:
+                raise RuntimeError("Cannot claim a worker on a closed session")
+            if self._soft_close_preparing:
+                raise RuntimeError("Cannot claim a worker while the session is closing")
+            if self._tool_structural_debt is not None and self._cancel_event.is_set():
+                # An exceptional cancellation/close window still owes TOOL
+                # receipts. Refuse a fresh/reuse dispatch until its owner has
+                # journaled them; normal in-flight tool execution keeps the
+                # event clear and therefore retains interjection behavior.
+                raise RuntimeError("Cannot claim a worker while tool cleanup is pending")
+            principal = principal_id.strip() or (self._mcp_effective_user_id or "").strip()
+            cancel_event = self._cancel_event
+            return WorkerClaim(
+                session=self,
+                principal_id=principal,
+                cancel_epoch=self._approval_cancel_epoch,
+                cancel_event=cancel_event,
+                cancel_event_was_set=cancel_event.is_set(),
+            )
+
+    def _worker_claim_is_current(self, claim: WorkerClaim) -> bool:
+        """Revalidate a captured worker witness without acquiring any lock.
+
+        ``session_worker.send`` calls this while holding the workstream lock,
+        so this method MUST remain a bounded read of fields published under
+        ``_generation_lock``. The predecessor releases its workstream slot
+        only after those writes, making the enqueue/spawn crossing coherent
+        without introducing a workstream -> generation lock inversion.
+
+        Event identity deliberately is not compared: a normal first worker
+        rotates the session Event when it claims its generation, while a
+        concurrent sender captured just before that rotation must still be
+        allowed to enqueue. An unset-to-set transition on the exact captured
+        Event is the monotonic evidence that cancellation/structural poison
+        overtook the claim. An Event already set at capture can be the valid
+        post-truncation state that the fresh worker is expected to rotate.
+        """
+        return bool(
+            claim.session is self
+            and claim.cancel_epoch == getattr(self, "_approval_cancel_epoch", -1)
+            and (claim.cancel_event_was_set or not claim.cancel_event.is_set())
+            and not getattr(self, "_publication_shutdown", False)
+            and not self._soft_close_preparing
+            and not (self._tool_structural_debt is not None and self._cancel_event.is_set())
+        )
+
+    def _poison_tool_structural_debt_locked(self, generation: int | None = None) -> bool:
+        """Publish one fail-stop edge for an incomplete accepted tool block.
+
+        Caller holds ``_generation_lock``. Advancing the existing monotonic
+        worker epoch only on the Event's unset-to-set transition invalidates a
+        claim captured before the poison without repeatedly advancing it when
+        force and send-finally observe the same retained debt.
+        """
+        debt = self._tool_structural_debt
+        if debt is None or (generation is not None and debt.generation != generation):
+            return False
+        if not self._cancel_event.is_set():
+            self._approval_cancel_epoch = getattr(self, "_approval_cancel_epoch", 0) + 1
+            self._cancel_event.set()
+        return True
+
     def cancel(self) -> None:
         """Request cancellation of the current generation.
 
@@ -7808,6 +9221,34 @@ class ChatSession:
                 with contextlib.suppress(OSError, ProcessLookupError):
                     proc.kill()
 
+    def resolve_close_approvals(self, feedback: str = "Workstream closed") -> None:
+        """Deny every approval wait that could otherwise strand close.
+
+        ``resolve_all_approvals`` covers both registered cycles and the
+        pre-cycle Smart Approval verdict wait. Older single-slot UIs retain
+        their event wake as a compatibility floor. The sweep is idempotent
+        because soft-close preparation, adapter cleanup, and direct ``close()``
+        can all converge on the same terminal session.
+        """
+        ui: Any = self.ui
+        resolve_all = getattr(ui, "resolve_all_approvals", None)
+        if callable(resolve_all):
+            try:
+                resolve_all(False, feedback)
+            except Exception:
+                log.debug("ui.resolve_all_approvals raised during close", exc_info=True)
+            return
+
+        approval_event = getattr(ui, "_approval_event", None)
+        if approval_event is None:
+            return
+        try:
+            if hasattr(ui, "_approval_result"):
+                ui._approval_result = (False, None)
+            approval_event.set()
+        except Exception:
+            log.debug("legacy approval wake raised during close", exc_info=True)
+
     def _check_cancelled(self, my_generation: int = 0) -> None:
         """Raise ``GenerationCancelled`` if cancellation has been requested
         or if this thread belongs to an orphaned generation (force cancel).
@@ -7824,7 +9265,76 @@ class ChatSession:
         if _generation_superseded(self, my_generation):
             raise GenerationCancelled()
 
-    def _claim_generation(self, *, principal_id: str | None = None) -> int:
+    def _check_generation_admission(self, my_generation: int) -> None:
+        """Fence pre-turn setup against Stop, force-successor, and close.
+
+        This deliberately does not dispatch through ``_check_cancelled``.
+        That later cooperative probe is an established lightweight-session
+        test seam and also includes task-agent-local cancellation.  The setup
+        path needs the narrower, non-overridable session ownership invariant:
+        once a generation loses its event, number, or publication latch it may
+        not bind an actor, refresh configuration, or admit a user row.
+        """
+
+        if (
+            self._publication_shutdown
+            or self._cancel_event.is_set()
+            or _generation_superseded(self, my_generation)
+        ):
+            raise GenerationCancelled()
+
+    def _admit_tool_structural_debt_locked(
+        self,
+        generation: int,
+        call_ids: tuple[str, ...],
+    ) -> None:
+        """Record an accepted assistant tool block under generation ownership."""
+        if not call_ids:
+            return
+        if self._tool_structural_debt is not None:
+            raise RuntimeError("Cannot accept a new tool block before completing the prior block")
+        self._tool_structural_debt = _ToolStructuralDebt(
+            generation=generation,
+            call_ids=call_ids,
+        )
+
+    def has_tool_structural_debt(self) -> bool:
+        """Whether an accepted assistant block still needs TOOL receipts."""
+        with self._generation_lock:
+            return self._tool_structural_debt is not None
+
+    def _complete_tool_structural_debt_locked(
+        self,
+        generation: int,
+        completed_call_ids: list[str] | tuple[str, ...],
+    ) -> bool:
+        """Clear exact generation debt only after every TOOL row is journaled."""
+        debt = self._tool_structural_debt
+        if debt is None:
+            return False
+        if debt.generation != generation:
+            raise RuntimeError("Tool structural debt belongs to another generation")
+        expected = collections.Counter(debt.call_ids)
+        observed = collections.Counter(completed_call_ids)
+        if observed != expected:
+            missing = expected - observed
+            unexpected = observed - expected
+            details: list[str] = []
+            if missing:
+                details.append(f"missing: {', '.join(sorted(missing.elements()))}")
+            if unexpected:
+                details.append(f"unexpected: {', '.join(sorted(unexpected.elements()))}")
+            raise RuntimeError(f"Tool structural debt mismatch ({'; '.join(details)})")
+        self._tool_structural_debt = None
+        self._tool_structural_condition.notify_all()
+        return True
+
+    def _claim_generation(
+        self,
+        *,
+        principal_id: str | None = None,
+        expected_cancel_epoch: int | None = None,
+    ) -> int:
         """Claim the next generation and install its fresh cancel event.
 
         The entry half of the per-generation cancel discipline shared by
@@ -7849,6 +9359,18 @@ class ChatSession:
         with self._generation_transition_lock, self._generation_lock:
             if self._publication_shutdown:
                 raise RuntimeError("Cannot claim a generation on a closed session")
+            if self._soft_close_preparing:
+                raise RuntimeError("Cannot claim a generation while the session is closing")
+            if self._tool_structural_debt is not None:
+                raise RuntimeError("Cannot claim a generation before tool cleanup completes")
+            if (
+                expected_cancel_epoch is not None
+                and self._approval_cancel_epoch != expected_cancel_epoch
+            ):
+                # This worker slot predates a Stop/force/terminal admission.
+                # Never replace the edge it was meant to observe with a fresh
+                # event: a successor may already own the workstream slot.
+                raise GenerationCancelled()
             self._generation += 1
             generation = self._generation
             self._cancel_event = threading.Event()
@@ -7898,9 +9420,11 @@ class ChatSession:
         zero generation is the legacy/direct-call unscoped form and remains
         publishable.
         """
-        with self._generation_lock:
+        with self._history_truncation_condition:
+            self._history_truncation_condition.wait_for(lambda: not self._history_truncation_active)
             if (
                 self._publication_shutdown
+                or (not origin_generation and self._soft_close_preparing)
                 or (origin_generation and self._generation != origin_generation)
                 or (not allow_cancelled and self._cancel_event.is_set())
             ):
@@ -7908,12 +9432,917 @@ class ChatSession:
             publish()
             return True
 
+    def _history_handoff_token_locked(self) -> str:
+        """Return the opaque token for the currently accepted row prefix."""
+        return f"{self._history_handoff_epoch}.{self._history_handoff_revision}"
+
+    def capture_history_handoff(
+        self,
+        load_messages: Callable[[int], list[dict[str, Any]]],
+    ) -> tuple[list[dict[str, Any]], str]:
+        """Load durable history and merge accepted conversation rows once.
+
+        ``load_messages`` runs while the per-session visibility lane is held.
+        Every conversation-row persistence closure uses the same lane through
+        durable commit and journal acknowledgement, so the result linearizes on one side of
+        that transition:
+
+        * reader first: old durable prefix plus the pending immutable row;
+        * writer first: new durable prefix with the journal entry removed.
+
+        A backend commit whose acknowledgement was lost is identified by its
+        stable ``_commit_key`` and reconciled during this read.  The accepted
+        revision does not change when a row moves from journal to storage — the
+        two representations are visibility-equivalent.
+
+        The loader receives the pending-journal size and must widen any
+        tail-bounded window by that many rows.  Within one live session every
+        durable write flows through the journal in admission order and the
+        visibility lane freezes the durable snapshot across this whole
+        capture, so a pending key's committed twin — acknowledged or lost —
+        is always among the newest ``journal size`` durable rows: the widened
+        window necessarily contains it, and a journal row missing from the
+        window is genuinely not yet durable and appends at the tail in
+        admission order.  (A second writer — cross-node re-home overlap or a
+        legacy NULL-key append — can in principle push a twin beyond the
+        widened window; that residual degrades to the same tail append and
+        self-heals on reconcile.)  The caller keeps ownership of the loaded
+        rows — they are merged without copying, so the loader must return
+        rows nothing else retains; only journal overlay entries are copied.
+        No storage call ever runs under the handoff lock here: the journal
+        size is sampled first, the load runs outside it, and the merge is
+        pure in-memory work.
+        """
+        notify_state_change = False
+        with self._history_visibility_lock:
+            with self._history_handoff_lock:
+                if self._workstream_gone_ws == self._ws_id:
+                    # The durable parent is deleted: there is no authoritative
+                    # transcript to verify a handoff against, and minting a
+                    # token over the empty load is exactly the silent-wipe
+                    # mechanism (round-3 review). Raising routes /history to
+                    # its fail-closed 503 arm, which keeps the pane's stale
+                    # transcript visible.
+                    raise ConversationCommitWorkstreamGoneError(
+                        "workstream was deleted; no history handoff can be verified"
+                    )
+                overscan = len(self._pending_conversation_commits)
+            loaded = load_messages(overscan)
+            if not isinstance(loaded, list):
+                raise TypeError("history loader must return a list")
+            with self._history_handoff_lock:
+                previous_state = self._conversation_persistence_state_locked()
+                durable_indexes = {
+                    str(message.get("_commit_key")): index
+                    for index, message in enumerate(loaded)
+                    if isinstance(message, dict) and message.get("_commit_key")
+                }
+                for commit_key, pending in list(self._pending_conversation_commits.items()):
+                    if commit_key in durable_indexes and pending.ack_from_durable_row:
+                        self._pending_conversation_commits.pop(commit_key, None)
+                if not self._pending_conversation_commits:
+                    self._clear_conversation_persistence_failure_locked()
+                notify_state_change = self._conversation_persistence_state_needs_notification(
+                    previous_state,
+                    self._conversation_persistence_state_locked(),
+                )
+
+                merged = list(loaded)
+                for commit_key, pending in self._pending_conversation_commits.items():
+                    durable_index = durable_indexes.get(commit_key)
+                    if durable_index is not None:
+                        # A non-atomic extension may expose a keyed row before
+                        # its full closure ACKs — and a conflicted entry
+                        # (``ack_from_durable_row`` False) deliberately renders
+                        # the journal's version in place, fail-visible beside
+                        # its persistence banner.
+                        merged[durable_index] = copy.deepcopy(pending.message)
+                    else:
+                        merged.append(copy.deepcopy(pending.message))
+                result = merged, self._history_handoff_token_locked()
+        if notify_state_change:
+            self._notify_conversation_persistence_state_changed()
+        return result
+
+    def register_listener_for_history_handoff(
+        self,
+        token: str,
+        *,
+        last_event_id: int | None = None,
+        maxsize: int = 500,
+    ) -> tuple[Any, list[dict[str, Any]], str, int, int, dict[str, Any]] | None:
+        """Validate a history token and atomically register its SSE listener.
+
+        Every conversation-row admission takes the same short handoff lock
+        while journaling a complete row and publishing the corresponding live
+        transition.  Therefore a commit either changes the token before this
+        comparison or reaches the listener registered here; it cannot fall
+        between those operations.  A mismatched epoch/revision returns ``None``
+        and callers must refetch history rather than trusting numeric ring
+        coverage.
+        """
+        with self._history_handoff_lock:
+            if not token or token != self._history_handoff_token_locked():
+                return None
+            ui_base: Any = self.ui
+            if last_event_id is not None:
+                return cast(
+                    "tuple[Any, list[dict[str, Any]], str, int, int, dict[str, Any]]",
+                    ui_base.register_listener_with_replay(last_event_id, maxsize=maxsize),
+                )
+            client_queue, snapshot = ui_base.register_listener_with_in_progress_snapshot(
+                maxsize=maxsize
+            )
+            return client_queue, [], "fresh", 0, 0, snapshot
+
+    def has_unresolved_conversation_persistence(self) -> bool:
+        """Whether an accepted row lacks a confirmed complete durable commit.
+
+        Blocking form — only for callers holding NO workstream or manager
+        lock (reconcile scans, delete-ambiguity arms). Scans that probe while
+        holding ``ws._lock`` / the manager lock must use
+        :meth:`has_unresolved_conversation_persistence_nowait` instead: this
+        method acquires the generation and handoff locks, which inverts the
+        generation→workstream/manager order those scans hold.
+        """
+        with self._generation_lock:
+            if self._tool_structural_debt is not None:
+                return True
+        with self._history_handoff_lock:
+            return bool(self._pending_conversation_commits)
+
+    def has_unresolved_conversation_persistence_nowait(self) -> bool | None:
+        """Non-blocking probe for retirement scans holding ws/manager locks.
+
+        Returns ``None`` when either session lock is momentarily held —
+        callers treat that as "busy, skip this candidate this sweep": a busy
+        session is never closed or evicted on a stale answer, and never
+        blocked on. Blocking here from under ``ws._lock`` deadlocks against
+        force-cancel's finalizer, which publishes under the generation lock
+        and then takes the workstream lock (round-4 review).
+        """
+        if not self._generation_lock.acquire(blocking=False):
+            return None
+        try:
+            if self._tool_structural_debt is not None:
+                return True
+        finally:
+            self._generation_lock.release()
+        if not self._history_handoff_lock.acquire(blocking=False):
+            return None
+        try:
+            return bool(self._pending_conversation_commits)
+        finally:
+            self._history_handoff_lock.release()
+
+    def is_workstream_gone(self) -> bool:
+        """True once a keyed save observed THIS workstream's parent deleted.
+
+        The latch records the ws_id that died and is never cleared; readers
+        compare it against the current identity, so an identity swap (/new,
+        ``resume``) to a different workstream reads False structurally.
+        While it matches, new conversation admissions refuse (the
+        finalizer/force-abandon lanes still converge via
+        ``allow_workstream_gone``) and ``capture_history_handoff`` refuses to
+        mint tokens, so a pane keeps its stale transcript rather than
+        rendering a silently wiped one.
+        """
+        with self._history_handoff_lock:
+            return self._workstream_gone_ws == self._ws_id
+
+    def conversation_persistence_status(self) -> dict[str, object]:
+        """Return a content-free live projection of durable journal health."""
+        with self._generation_lock:
+            structural_pending = (
+                len(self._tool_structural_debt.call_ids)
+                if self._tool_structural_debt is not None
+                else 0
+            )
+        with self._history_handoff_lock:
+            pending_rows = len(self._pending_conversation_commits) + structural_pending
+            # One classifier, shared with the notification edge. Structural
+            # tool debt widens an otherwise-healthy journal to ``pending``:
+            # its receipts will re-journal but are not yet in the commit map.
+            state = self._conversation_persistence_state_locked()
+            if state == "healthy" and structural_pending:
+                state = "pending"
+            return {
+                "state": state,
+                "pending_rows": pending_rows,
+                "attempts": self._conversation_persistence_attempts,
+                "first_failure_at": (
+                    self._conversation_persistence_first_failure_at.isoformat()
+                    if self._conversation_persistence_first_failure_at is not None
+                    else None
+                ),
+                "last_failure_at": (
+                    self._conversation_persistence_last_failure_at.isoformat()
+                    if self._conversation_persistence_last_failure_at is not None
+                    else None
+                ),
+                "next_retry_at": (
+                    self._conversation_persistence_next_retry_wall_at.isoformat()
+                    if self._conversation_persistence_next_retry_wall_at is not None
+                    else None
+                ),
+            }
+
+    def conversation_persistence_fatal_revision(self) -> int | None:
+        """Return the current fatal-error revision only when persistence owns it."""
+        with self._generation_lock:
+            revision = self._conversation_persistence_fatal_revision
+            if (
+                revision is None
+                or not self._has_persisted_error
+                or revision != self._persisted_error_revision
+            ):
+                return None
+            return revision
+
+    def acknowledge_conversation_persistence_state_recovery(self, revision: int) -> bool:
+        """Retire one exact in-memory fatal latch after manager recovery.
+
+        The sanitized durable ``last_error`` remains as an audit record; public
+        readers expose it only while the workstream state is ``error``. A later
+        fatal error therefore cannot be deleted by a stale repair callback.
+        """
+        with self._generation_lock:
+            if (
+                self._conversation_persistence_fatal_revision != revision
+                or self._persisted_error_revision != revision
+                or not self._has_persisted_error
+            ):
+                return False
+            self._conversation_persistence_fatal_revision = None
+            self._has_persisted_error = False
+            return True
+
+    def _clear_conversation_persistence_failure_locked(self) -> None:
+        """Reset failure metadata after the complete accepted prefix ACKs."""
+        self._conversation_persistence_error = None
+        self._conversation_persistence_failure_kind = None
+        self._conversation_persistence_attempts = 0
+        self._conversation_persistence_first_failure_at = None
+        self._conversation_persistence_last_failure_at = None
+        self._conversation_persistence_next_retry_at = None
+        self._conversation_persistence_next_retry_wall_at = None
+        self._conversation_persistence_resync_commit_key = None
+
+    def _conversation_persistence_retry_delay(self, attempt: int) -> float:
+        """Return equal-jitter exponential backoff for one transient failure."""
+        ceiling = min(
+            _CONVERSATION_PERSISTENCE_RETRY_CAP_SECONDS,
+            _CONVERSATION_PERSISTENCE_RETRY_BASE_SECONDS * (2.0 ** min(30, max(0, attempt - 1))),
+        )
+        return random.uniform(ceiling / 2.0, ceiling)
+
+    def _conversation_persistence_state_locked(self) -> str:
+        if not self._pending_conversation_commits:
+            return "healthy"
+        return self._conversation_persistence_failure_kind or "pending"
+
+    @staticmethod
+    def _conversation_persistence_state_needs_notification(
+        previous_state: str,
+        current_state: str,
+    ) -> bool:
+        failure_states = {"retrying", "conflict"}
+        return previous_state != current_state and (
+            previous_state in failure_states or current_state in failure_states
+        )
+
+    def _notify_conversation_persistence_state_changed(self) -> None:
+        """Best-effort operator projection refresh, always outside journal locks."""
+        callback = concrete_method(self.ui, "on_persistence_state_changed")
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            log.debug("ui.on_persistence_state_changed raised", exc_info=True)
+
+    def _prepare_direct_conversation_mutation(
+        self,
+        deferred_persistence: list[Callable[[], None]] | None,
+    ) -> None:
+        """Fence an unbatched row mutation behind the accepted FIFO prefix.
+
+        Generation commits already serialize their durable closures through
+        the ticket lane. Direct command/test helpers have no such batch, so
+        they must reconcile an older pending row *before* changing in-memory
+        history. Otherwise a successful direct save could persist a causal
+        suffix after an unresolved accepted predecessor.
+        """
+        if deferred_persistence is None:
+            try:
+                self._reconcile_pending_conversation_commits()
+            except GenerationCancelled as exc:
+                raise RuntimeError("Cannot mutate a closed session") from exc
+
+    def _journal_conversation_row_locked(
+        self,
+        *,
+        commit_key: str,
+        message: dict[str, Any],
+        persist: Callable[[], int],
+        event_id: int | None,
+    ) -> _PendingConversationCommit:
+        """Admit one immutable row while the history handoff lock is held."""
+        pending_message = copy.deepcopy(message)
+        pending_message["_commit_key"] = commit_key
+        pending_message["_event_id"] = event_id
+        pending_message["_pending_durability"] = True
+        pending = _PendingConversationCommit(
+            commit_key=commit_key,
+            message=pending_message,
+            persist=persist,
+        )
+        self._pending_conversation_commits[commit_key] = pending
+        self._history_handoff_revision += 1
+        return pending
+
+    def _rollback_live_journal_admission_locked(
+        self,
+        *,
+        turn: Turn,
+        commit_key: str,
+        history_revision_before: int,
+        reason: str,
+    ) -> None:
+        """Undo a live-tail append whose journal admission raised.
+
+        Shared by the USER, SYSTEM, and TOOL admission sites so a raise inside
+        ``_journal_conversation_row_locked`` can never leave a live turn that
+        no journal entry or durable row will ever represent.
+        """
+        if not self.messages or self.messages[-1] is not turn:
+            raise RuntimeError("journal rollback lost live-tail ownership")
+        self.messages.pop()
+        self._msg_tokens.pop()
+        self._pending_conversation_commits.pop(commit_key, None)
+        self._history_handoff_revision = history_revision_before
+        self._request_history_resync_locked(reason)
+
+    def _schedule_conversation_persistence(
+        self,
+        pending: _PendingConversationCommit,
+        deferred_persistence: list[Callable[[], None]] | None,
+    ) -> None:
+        """Put a journal entry on its generation batch or persist directly."""
+        if deferred_persistence is not None:
+            deferred_persistence.append(lambda: self._persist_pending_conversation_commit(pending))
+            return
+        self._persist_pending_conversation_commit(pending)
+
+    def _request_history_resync_locked(self, reason: str) -> int | None:
+        """Best-effort repair event for an accepted row handoff.
+
+        Current UIs return the exact enqueued event id, which callers persist
+        directly. A custom legacy hook returning ``None`` retains the previous
+        immediate high-water sample as a best-effort compatibility fallback.
+        """
+        request_resync = concrete_method(self.ui, "on_history_resync")
+        if request_resync is None:
+            return None
+        try:
+            event_id = _coerce_event_id(request_resync(reason))
+        except Exception:
+            log.debug("ui.on_history_resync raised", exc_info=True)
+            return None
+        return event_id if event_id is not None else self._ui_event_id()
+
+    def _publish_user_turn_locked(
+        self,
+        *,
+        content: str,
+        attachments: list[dict[str, Any]],
+        sender: str | None,
+        source: str | None,
+        client_send_ids: list[str],
+    ) -> int | None:
+        """Publish one accepted user row, falling back to a repair refetch.
+
+        The caller holds ``_history_handoff_lock`` across the in-memory append,
+        journal admission, and this publication.  A listener registered before
+        that boundary therefore receives the complete ``user_turn`` event;
+        one attempting to register afterwards must present the new history
+        revision.  Older/custom UIs without the hook retain the exceptional
+        ``history_resync`` repair path instead of silently missing the row.
+        """
+        publish = concrete_method(self.ui, "on_user_turn")
+        if publish is not None:
+            try:
+                event_id = _coerce_event_id(
+                    publish(
+                        content,
+                        attachments=attachments,
+                        sender=sender,
+                        source=source,
+                        client_send_ids=client_send_ids,
+                    )
+                )
+                if event_id is not None:
+                    return event_id
+                log.debug("ui.on_user_turn returned no event id; using repair fallback")
+            except Exception:
+                log.debug("ui.on_user_turn raised", exc_info=True)
+        return self._request_history_resync_locked("user_turn_accepted")
+
+    def _publish_tool_turn_locked(
+        self,
+        *,
+        call_id: str,
+        name: str,
+        output: str,
+        is_error: bool,
+        preview: dict[str, Any] | None,
+        effect_status: str | None,
+        projection_safe: bool,
+    ) -> int | None:
+        """Publish one accepted TOOL row or request exceptional repair.
+
+        The executor's earlier ``on_tool_result`` is deliberately provisional:
+        output guarding and context truncation can still change the text that
+        enters history. A capable UI receives this final scalar projection and
+        upserts it by provider call id. Duplicate or blank ids within one
+        accepted assistant batch are not an unambiguous browser key, so they
+        retain the strong history-repair path.
+
+        The caller holds the history handoff lock across append, publication,
+        and journal admission. A listener therefore sees either the canonical
+        event or a newer REST revision, never an unrepresented accepted row.
+        """
+        if projection_safe:
+            publish = concrete_method(self.ui, "on_tool_turn_accepted")
+            if publish is not None:
+                try:
+                    event_id = _coerce_event_id(
+                        publish(
+                            call_id,
+                            name,
+                            output,
+                            is_error=is_error,
+                            preview=preview,
+                            effect_status=effect_status,
+                        )
+                    )
+                    if event_id is not None:
+                        return event_id
+                    log.debug(
+                        "ui.on_tool_turn_accepted returned no event id; using repair fallback"
+                    )
+                except Exception:
+                    log.debug("ui.on_tool_turn_accepted raised", exc_info=True)
+            repair_reason = "tool_turn_accepted"
+        else:
+            repair_reason = "tool_turn_projection_ambiguous"
+        return self._request_history_resync_locked(repair_reason)
+
+    def _persist_pending_conversation_commit(
+        self,
+        entry: _PendingConversationCommit,
+        *,
+        _retry_admitted: bool = False,
+    ) -> None:
+        """Attempt one idempotent save and either ACK or classify the head."""
+        error: ConversationPersistenceError | None = None
+        error_cause: Exception | None = None
+        notify_state_change = False
+        request_resync = False
+        resync_reason = "conversation_persistence_unresolved"
+        with self._history_visibility_lock:
+            with self._history_handoff_lock:
+                if entry.commit_key not in self._pending_conversation_commits:
+                    return
+                if (
+                    self._conversation_persistence_failure_kind == "conflict"
+                    and self._conversation_persistence_error is not None
+                ):
+                    raise self._conversation_persistence_error
+                if (
+                    not _retry_admitted
+                    and self._conversation_persistence_failure_kind == "retrying"
+                    and self._conversation_persistence_error is not None
+                ):
+                    raise self._conversation_persistence_error
+                previous_state = self._conversation_persistence_state_locked()
+
+            row_id = 0
+            conflict: ConversationCommitConflictError | None = None
+            gone: ConversationCommitWorkstreamGoneError | None = None
+            try:
+                row_id = int(entry.persist() or 0)
+            except ConversationCommitConflictError as exc:
+                conflict = exc
+                error_cause = exc
+            except ConversationCommitWorkstreamGoneError as exc:
+                gone = exc
+                error_cause = exc
+            except Exception as exc:
+                error_cause = exc
+
+            with self._history_handoff_lock:
+                if row_id > 0:
+                    self._pending_conversation_commits.pop(entry.commit_key, None)
+                    if not self._pending_conversation_commits:
+                        self._clear_conversation_persistence_failure_locked()
+                    notify_state_change = self._conversation_persistence_state_needs_notification(
+                        previous_state,
+                        self._conversation_persistence_state_locked(),
+                    )
+                elif gone is not None:
+                    # The durable parent row was hard-deleted after these rows
+                    # were accepted; keyed saves never recreate it, so no retry
+                    # can succeed. The delete is the newer authoritative ruling
+                    # on this workstream: discard the journal so close and
+                    # eviction stop waiting on rows that can never land, and
+                    # return NORMALLY — the deletion, not this persist, is the
+                    # user-facing event, and raising here would only re-latch a
+                    # phantom error over an empty journal. The revision bump
+                    # invalidates every token minted over the discarded rows.
+                    # The latch makes the discovery terminal: new conversation
+                    # admissions refuse (finalizer lanes still converge) and
+                    # capture_history_handoff stops minting tokens, so panes
+                    # keep their stale-but-real transcript instead of a
+                    # silently wiped one. Re-entry with the latch already set
+                    # (further in-flight saves of the same generation) is
+                    # idempotent. The forensic log carries commit keys and
+                    # roles only — never message content.
+                    discarded = [
+                        (key, str(entry.message.get("role", "")))
+                        for key, entry in self._pending_conversation_commits.items()
+                    ]
+                    self._pending_conversation_commits.clear()
+                    self._clear_conversation_persistence_failure_locked()
+                    self._history_handoff_revision += 1
+                    self._workstream_gone_ws = self._ws_id
+                    request_resync = True
+                    resync_reason = "workstream_gone"
+                    log.error(
+                        "session.conversation_rows_discarded_workstream_gone ws=%s rows=%d discarded=%s",
+                        self._ws_id[:8],
+                        len(discarded),
+                        discarded,
+                    )
+                    notify_state_change = self._conversation_persistence_state_needs_notification(
+                        previous_state,
+                        self._conversation_persistence_state_locked(),
+                    )
+                else:
+                    failed_at = datetime.now(UTC)
+                    self._conversation_persistence_attempts += 1
+                    if self._conversation_persistence_first_failure_at is None:
+                        self._conversation_persistence_first_failure_at = failed_at
+                    self._conversation_persistence_last_failure_at = failed_at
+                    if conflict is not None:
+                        current = self._pending_conversation_commits.get(entry.commit_key)
+                        if current is not None and current.ack_from_durable_row:
+                            self._pending_conversation_commits[entry.commit_key] = (
+                                dataclasses.replace(current, ack_from_durable_row=False)
+                            )
+                        self._conversation_persistence_failure_kind = "conflict"
+                        self._conversation_persistence_next_retry_at = None
+                        self._conversation_persistence_next_retry_wall_at = None
+                        error = ConversationPersistenceError(
+                            "Accepted conversation row has an immutable durable commit conflict"
+                        )
+                    else:
+                        self._conversation_persistence_failure_kind = "retrying"
+                        delay = self._conversation_persistence_retry_delay(
+                            self._conversation_persistence_attempts
+                        )
+                        self._conversation_persistence_next_retry_at = time.monotonic() + delay
+                        self._conversation_persistence_next_retry_wall_at = failed_at + timedelta(
+                            seconds=delay
+                        )
+                        error = ConversationPersistenceError(
+                            "Accepted conversation row is awaiting durable storage reconciliation"
+                        )
+                    if error_cause is not None:
+                        error.__cause__ = error_cause
+                    self._conversation_persistence_error = error
+                    request_resync = (
+                        self._conversation_persistence_resync_commit_key != entry.commit_key
+                    )
+                    if request_resync:
+                        self._conversation_persistence_resync_commit_key = entry.commit_key
+                    notify_state_change = self._conversation_persistence_state_needs_notification(
+                        previous_state,
+                        self._conversation_persistence_state_locked(),
+                    )
+        if notify_state_change:
+            self._notify_conversation_persistence_state_changed()
+        # A listener can atomically register immediately before a tool-only
+        # assistant is accepted. Its inflight snapshot is empty, and failure
+        # prevents the later tool-info event that would reconstruct the row.
+        # Force those already-connected panes through the authoritative
+        # history overlay. Keep this outside both history locks: enqueue takes
+        # UI locks and browser callbacks may immediately start a new request.
+        # The repair fires for the non-raising workstream-gone discard too —
+        # its panes must leave the discarded rows for the (deleted)
+        # authoritative history.
+        if request_resync:
+            request_resync_hook = concrete_method(self.ui, "on_history_resync")
+            if request_resync_hook is not None:
+                try:
+                    request_resync_hook(resync_reason)
+                except Exception:
+                    log.debug("ui.on_history_resync raised", exc_info=True)
+        if error is not None:
+            if error_cause is not None:
+                raise error from error_cause
+            raise error
+        return
+
+    def _reconcile_pending_conversation_commits(
+        self,
+        *,
+        _terminal_admitted_repair: bool = False,
+        _force_retry: bool = False,
+    ) -> None:
+        """Retry every unresolved row in total acceptance order.
+
+        Ordinary callers enter the history-visibility lane and then recheck
+        publication admission.  This is the un-ticketed repair equivalent of
+        durability admission: if hard-delete's terminal barrier wins first,
+        no repair write can start after it; if reconciliation wins first, the
+        barrier waits for its acknowledgement before deletion proceeds.
+
+        ``_terminal_admitted_repair`` is deliberately private and narrow.  A
+        soft close must repair the accepted prefix after installing its latch
+        so it can decide whether unloading is safe; an already-admitted
+        durability ticket may likewise finish its ordered predecessor repair
+        while hard-delete waits for that ticket. No unadmitted caller may
+        write conversation storage after publication shutdown.
+        """
+
+        with self._history_visibility_lock:
+            with self._generation_lock:
+                if self._publication_shutdown and not _terminal_admitted_repair:
+                    raise GenerationCancelled()
+            with self._history_handoff_lock:
+                persistence_error = self._conversation_persistence_error
+                failure_kind = self._conversation_persistence_failure_kind
+                next_retry_at = self._conversation_persistence_next_retry_at
+                if failure_kind == "conflict" and persistence_error is not None:
+                    raise persistence_error
+                if (
+                    not _force_retry
+                    and failure_kind == "retrying"
+                    and next_retry_at is not None
+                    and time.monotonic() < next_retry_at
+                    and persistence_error is not None
+                ):
+                    raise persistence_error
+                pending = list(self._pending_conversation_commits.values())
+            for entry in pending:
+                self._persist_pending_conversation_commit(entry, _retry_admitted=True)
+
+    def reconcile_unresolved_persistence_if_due(self, *, now: float | None = None) -> bool:
+        """Run one due transient repair pass for manager-owned maintenance.
+
+        Returns whether a due pass was admitted. Expected persistence failures
+        remain represented by the journal state and are not allowed to tear
+        down the shared maintenance thread.
+        """
+        check_at = time.monotonic() if now is None else now
+        with self._history_visibility_lock:
+            with self._generation_lock:
+                if self._publication_shutdown:
+                    return False
+            with self._history_handoff_lock:
+                failure_kind = self._conversation_persistence_failure_kind
+                next_retry_at = self._conversation_persistence_next_retry_at
+                if not self._pending_conversation_commits or failure_kind == "conflict":
+                    return False
+                if failure_kind == "retrying" and (
+                    next_retry_at is None or check_at < next_retry_at
+                ):
+                    return False
+            try:
+                self._reconcile_pending_conversation_commits(_force_retry=True)
+            except GenerationCancelled:
+                return False
+            except ConversationPersistenceError:
+                return True
+            return True
+
+    def _await_prior_conversation_persistence(self, my_generation: int) -> None:
+        """Fence a new user turn behind all prior accepted durability batches."""
+        with self._durability_cond:
+            high_water = self._durability_next_ticket
+            already_drained = self._durability_serving_ticket >= high_water
+        with self._history_handoff_lock:
+            needs_reconciliation = bool(
+                self._pending_conversation_commits or self._conversation_persistence_error
+            )
+        # Preserve the historical first-send sequencing (including lightweight
+        # test/CLI sessions whose cancellation probe begins after user append).
+        # The fence is needed only when a predecessor ticket or unresolved row
+        # actually exists.
+        if already_drained and not needs_reconciliation:
+            return
+        while True:
+            with self._durability_cond:
+                if self._durability_serving_ticket >= high_water:
+                    break
+                self._durability_cond.wait(timeout=0.05)
+            self._check_cancelled(my_generation)
+        self._check_cancelled(my_generation)
+        self._reconcile_pending_conversation_commits()
+        self._check_cancelled(my_generation)
+
+    def prepare_soft_close(self) -> bool:
+        """Cancel, close structural debt, then reconcile the durable prefix.
+
+        Preparing is a short admission latch distinct from terminal shutdown:
+        it blocks fresh generations and unscoped mutations while the accepted
+        worker retains ownership long enough to journal any owed TOOL receipts.
+        A wedged worker gets a bounded grace period; refusal keeps the live
+        session loaded for an operator force-cancel instead of unloading an
+        invalid USER/ASSISTANT prefix.
+        """
+        with self._generation_transition_lock, self._generation_lock:
+            if self._publication_shutdown:
+                return not self.has_unresolved_conversation_persistence()
+            if self._soft_close_preparing:
+                return False
+            self._soft_close_preparing = True
+
+        # Use the complete cooperative cancellation path so provider streams,
+        # tool subprocesses, judges, and task-agent scopes all receive the
+        # close edge. Fresh claims remain fenced by the preparing latch while
+        # cancel() briefly reacquires the transition lock.
+        try:
+            self.cancel()
+        except BaseException:
+            with self._tool_structural_condition:
+                self._soft_close_preparing = False
+                self._tool_structural_condition.notify_all()
+            raise
+
+        # Cancellation advances every gate's monotonic witness, while this
+        # sweep supplies the wake edge.  Run it before waiting for structural
+        # debt: the owning worker cannot journal denied TOOL receipts until its
+        # approval wait returns.  "requested" remains truthful if later
+        # durability reconciliation refuses the close and keeps the session.
+        self.resolve_close_approvals("Workstream close requested")
+
+        deadline = time.monotonic() + _SOFT_CLOSE_STRUCTURAL_WAIT_SECONDS
+        with self._tool_structural_condition:
+            while self._tool_structural_debt is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._soft_close_preparing = False
+                    self._tool_structural_condition.notify_all()
+                    return False
+                self._tool_structural_condition.wait(timeout=remaining)
+
+            self._publication_shutdown = True
+            self._soft_close_preparing = False
+            # Invalidate worker slots captured before this close attempt even
+            # when durability reconciliation refuses the close and the terminal
+            # latch is rolled back. Fresh slots admitted after rollback capture
+            # this newer edge and remain usable.
+            durability_high_water = self._durability_next_ticket
+
+        with self._durability_cond:
+            self._durability_cond.wait_for(
+                lambda: self._durability_serving_ticket >= durability_high_water
+            )
+
+        try:
+            self._reconcile_pending_conversation_commits(
+                _terminal_admitted_repair=True,
+                _force_retry=True,
+            )
+        except ConversationPersistenceError:
+            durable_prefix_settled = False
+        else:
+            durable_prefix_settled = not self.has_unresolved_conversation_persistence()
+        if durable_prefix_settled:
+            return True
+        with self._generation_lock:
+            self._generation += 1
+            self._cancel_event = threading.Event()
+            self._publication_shutdown = False
+            self._soft_close_preparing = False
+        # A callback suppressed by the temporary shutdown latch marked the
+        # projection dirty. Reconcile outside lifecycle/actor locks so a local
+        # manager read cannot block Stop or actor handoff. Failure is retained
+        # and provider admission retries before deriving its next tool wire.
+        self._refresh_dirty_mcp_projection()
+        return False
+
+    def force_abandon_generation(
+        self,
+        *,
+        target_is_current: Callable[[], bool],
+        clear_target: Callable[[], bool],
+        publish_abandoned: Callable[[], None],
+    ) -> tuple[bool, ConversationPersistenceError | None]:
+        """Supersede one pinned worker after closing its accepted tool block.
+
+        The caller supplies two tiny workstream-slot callbacks so this method
+        can preserve the global lock order (generation -> workstream) without
+        importing manager state. While the generation lock is held,
+        ``session_worker`` cannot capture a successor claim: an exact target
+        check therefore stays authoritative through supersession, UNKNOWN
+        receipt journaling, and the owner-conditional slot clear. TOOL storage
+        closures enter the ordinary FIFO ticket and remain poison-gated behind
+        any unresolved predecessor row. The terminal UI callback then runs
+        after that FIFO settles but before the transition lock releases, so a
+        successor cannot publish thinking ahead of the predecessor's
+        stream-end/idle edge.
+        """
+        abandoned = False
+        persistence_error: ConversationPersistenceError | None = None
+
+        def _finalize_force_abandon(durable: list[Callable[[], None]]) -> None:
+            nonlocal abandoned
+            if not target_is_current():
+                return
+            debt = self._tool_structural_debt
+            self._cancel_event.set()
+            self._generation += 1
+            self._clear_agent_contexts_before_generation(self._generation)
+            self._cancel_event = threading.Event()
+            if debt is not None:
+                try:
+                    self._synthesize_cancelled_results(
+                        "Force-cancelled before the tool outcome could be observed.",
+                        deferred_persistence=durable,
+                        structural_generation=debt.generation,
+                    )
+                except BaseException:
+                    # Force installed a fresh generation event above. If its
+                    # own structural finalizer fails, no send-finally hook will
+                    # poison that new event for us; keep dispatcher admission
+                    # closed until a later force retry repairs the same debt.
+                    self._poison_tool_structural_debt_locked(debt.generation)
+                    raise
+            try:
+                self._drain_pending_advisories()
+            except Exception:
+                # Advisory cleanup is best-effort and historically could not
+                # defeat the force escape hatch. Structural completion above
+                # remains fail-closed; only this ancillary latch is demoted.
+                log.debug(
+                    "session.force_abandon.advisory_cleanup_failed ws=%s",
+                    self._ws_id[:8],
+                    exc_info=True,
+                )
+            abandoned = clear_target()
+
+        with self._generation_transition_lock:
+            # Destructive history/lifecycle workers advertise a non-abandonable
+            # slot. Refuse before entering the truncation/durability admission
+            # path so force remains a prompt cooperative cancel instead of
+            # waiting on the very transaction whose ownership must be kept.
+            if not target_is_current():
+                return False, None
+            try:
+                admitted = self._commit_for_generation(
+                    0,
+                    _finalize_force_abandon,
+                    allow_cancelled=True,
+                    allow_soft_close_preparing=True,
+                    allow_workstream_gone=True,
+                    allow_tool_structural_debt=True,
+                )
+            except ConversationPersistenceError as exc:
+                # The structural rows were journaled and the exact slot was
+                # already cleared before the FIFO batch observed its poisoned
+                # predecessor. Preserve the typed result for the route/log and
+                # let the normal retry/conflict state own later reconciliation.
+                persistence_error = exc
+            else:
+                if not admitted:
+                    return False, None
+            if abandoned:
+                try:
+                    publish_abandoned()
+                except Exception:
+                    # Structural and slot ownership are already settled. The
+                    # terminal event remains best-effort, but attempting it on
+                    # this side of generation admission preserves ordering.
+                    log.debug(
+                        "session.force_abandon.terminal_publish_failed ws=%s",
+                        self._ws_id[:8],
+                        exc_info=True,
+                    )
+        return abandoned, persistence_error
+
     def _commit_for_generation(
         self,
         origin_generation: int,
         commit: Callable[[list[Callable[[], None]]], None],
         *,
         allow_cancelled: bool = True,
+        allow_persistence_poison: bool = False,
+        allow_soft_close_preparing: bool = False,
+        allow_tool_structural_debt: bool = False,
+        allow_workstream_gone: bool = False,
     ) -> bool:
         """Commit live state atomically, then run its durable batch in FIFO order.
 
@@ -7926,19 +10355,65 @@ class ChatSession:
         The caller retains the historical synchronous durability contract: it
         returns only after its batch finishes (or raises), but Stop/close/claim
         remain free to acquire the lifecycle locks while storage is blocked.
+        ``allow_soft_close_preparing`` and ``allow_tool_structural_debt`` are
+        reserved for force-abandon's exact structural finalizer. Ordinary
+        origin-zero mutations remain fenced by both latches.
+
+        ``allow_workstream_gone`` marks the convergence lanes (the
+        cancel/interrupt/failure finalizers and force-abandon) that must still
+        run after a keyed save observed the durable parent hard-deleted; every
+        other admission refuses so a deleted workstream cannot keep accepting
+        turns whose rows silently discard.
         """
         durable: list[Callable[[], None]] = []
         ticket: int | None = None
-        with self._generation_lock:
+        commit_error: BaseException | None = None
+        # This method and the terminal drain below are the two ChatSession
+        # entry points BORROWED UNBOUND by resource shells that own only the
+        # durability lane and none of the admission fields, so their lifecycle
+        # reads stay defensive where the rest of the file reads directly.
+        truncation_condition = getattr(self, "_history_truncation_condition", None)
+        commit_guard = truncation_condition or self._generation_lock
+        with commit_guard:
+            if truncation_condition is not None:
+                truncation_condition.wait_for(lambda: not self._history_truncation_active)
             if (
                 self._publication_shutdown
+                or (
+                    not origin_generation
+                    and getattr(self, "_soft_close_preparing", False)
+                    and not allow_soft_close_preparing
+                )
+                or (
+                    not origin_generation
+                    and getattr(self, "_tool_structural_debt", None) is not None
+                    and not allow_tool_structural_debt
+                )
                 or (origin_generation and self._generation != origin_generation)
                 or (not allow_cancelled and self._cancel_event.is_set())
+                or (
+                    not allow_workstream_gone
+                    and getattr(self, "_workstream_gone_ws", None) is not None
+                    and self._workstream_gone_ws == self._ws_id
+                )
             ):
                 return False
             owner_token = _active_commit_origin_generation.set(origin_generation)
             try:
                 commit(durable)
+            except BaseException as exc:
+                # Journal admission can precede a later callback failure. Its
+                # already-collected persistence closures still own a place in
+                # the FIFO; dropping them here leaves a pending-only overlay
+                # with no due retry and can expose an invalid durable prefix.
+                commit_error = exc
+                if getattr(self, "_tool_structural_debt", None) is not None:
+                    # Poison dispatcher admission before releasing the same
+                    # generation lock that protects structural debt. Relying
+                    # on send()'s later _consume_cancel finally leaves a race
+                    # where another request captures a nominal worker claim
+                    # against an invalid ASSISTANT-without-TOOL prefix.
+                    self._poison_tool_structural_debt_locked()
             finally:
                 _active_commit_origin_generation.reset(owner_token)
             if durable:
@@ -7946,21 +10421,49 @@ class ChatSession:
                 self._durability_next_ticket += 1
 
         if ticket is None:
+            if commit_error is not None:
+                raise commit_error
             return True
 
         with self._durability_cond:
             self._durability_cond.wait_for(lambda: self._durability_serving_ticket == ticket)
+        durability_error: BaseException | None = None
         try:
+            history_lock = getattr(self, "_history_handoff_lock", None)
+            if history_lock is None:
+                poison = None
+            else:
+                with history_lock:
+                    poison = self._conversation_persistence_error
+            if poison is not None and not allow_persistence_poison:
+                # Tickets admitted behind an unresolved conversation boundary
+                # must settle without executing.  Waiting for a future repair
+                # would pin their owner threads indefinitely; executing would
+                # persist a causal suffix after a missing assistant row.
+                raise poison
             for persist in durable:
                 persist()
+        except BaseException as exc:
+            # ConversationPersistenceError needs no special arm: the retrying
+            # and conflict classifiers latch ``_conversation_persistence_error``
+            # before raising, and the workstream-gone discard returns without
+            # raising — re-latching here could only recreate a phantom error
+            # over an empty journal.
+            durability_error = exc
         finally:
             with self._durability_cond:
                 self._durability_serving_ticket += 1
                 self._durability_cond.notify_all()
+        if durability_error is not None:
+            if commit_error is not None:
+                raise durability_error from commit_error
+            raise durability_error
+        if commit_error is not None:
+            raise commit_error
         return True
 
     def shutdown_publication_and_drain_durability(self) -> None:
-        """Close durable admission and wait for every accepted batch.
+        """Close admission, cancel resources, and drain admitted batches.
 
         Hard deletion needs a stronger boundary than cooperative worker
         cancellation: a generation commit may already have published its
@@ -7976,14 +10479,55 @@ class ChatSession:
         after the lifecycle outcome is known.
         """
         with self._generation_lock:
+            structural_debt = getattr(self, "_tool_structural_debt", None)
+            # Install the terminal latch before cooperative cancellation.
+            # A worker that observes the cancel edge must not synthesize a
+            # new ws-id-only TOOL storage closure: the authorized durable
+            # incarnation may already have been replaced on another node.
+            # Successful exact deletion erases the debt; an ambiguous
+            # same/unknown outcome retains it in the manager tombstone.
             self._publication_shutdown = True
             self._cancel_event.set()
+            self._approval_cancel_epoch = getattr(self, "_approval_cancel_epoch", 0) + 1
+            self._soft_close_preparing = False
+            structural_condition = getattr(self, "_tool_structural_condition", None)
+            if structural_condition is not None:
+                structural_condition.notify_all()
             durability_high_water = self._durability_next_ticket
+
+        # Hard delete is terminal even when its durable outcome is ambiguous.
+        # Wake registered cycles and pre-cycle Smart Approval waits here: the
+        # retained-tombstone path deliberately skips ordinary UI cleanup.
+        self.resolve_close_approvals()
+
+        terminal_error: BaseException | None = None
+        if structural_debt is not None:
+            try:
+                # Abort provider streams, task scopes, judges, and subprocesses
+                # after the latch. Their owner can unwind but cannot publish a
+                # fresh TOOL suffix across a remote same-id replacement.
+                self.cancel()
+            except BaseException as exc:
+                # The terminal admission edge above remains authoritative.
+                terminal_error = exc
 
         with self._durability_cond:
             self._durability_cond.wait_for(
                 lambda: self._durability_serving_ticket >= durability_high_water
             )
+
+        # Un-ticketed lost-ACK reconciliation uses the visibility lane.  Take
+        # it once after the terminal latch and ticket drain: a repair that won
+        # before the latch completes first, while a waiter that lost the latch
+        # rechecks publication shutdown and exits without writing.  The caller
+        # may now delete storage without a late reconciliation resurrecting a
+        # conversation row.
+        history_visibility_lock = getattr(self, "_history_visibility_lock", None)
+        if history_visibility_lock is not None:
+            with history_visibility_lock:
+                pass
+        if terminal_error is not None:
+            raise terminal_error
 
     def _consume_cancel(self, my_generation: int) -> bool:
         """Clear this generation's cancel signal on exit; report if one landed.
@@ -7998,6 +10542,13 @@ class ChatSession:
         with self._generation_transition_lock, self._generation_lock:
             if self._generation != my_generation:
                 return False
+            if self._poison_tool_structural_debt_locked(my_generation):
+                # An abnormal structural finalizer can itself fail (for
+                # example, journal admission rejects its TOOL receipt). Keep
+                # this generation poisoned at the dispatcher boundary: a new
+                # worker must not report successful admission only to fail its
+                # later generation claim behind the still-incomplete prefix.
+                return True
             landed = self._cancel_event.is_set()
             if not self._publication_shutdown:
                 self._cancel_event.clear()
@@ -8028,6 +10579,33 @@ class ChatSession:
             raise GenerationCancelled() from None
         self._check_cancelled(my_generation)
 
+    def _direct_commit_reentry(
+        self,
+        closed_error: str,
+        reenter: Callable[[list[Callable[[], None]]], Any],
+    ) -> Any:
+        """THE direct-mutation admission frame, expressed once.
+
+        Wraps a re-entrant call in the full direct-commit discipline:
+        ``_prepare_direct_conversation_mutation`` (the reconcile poison
+        gate), admission through ``_commit_for_generation(0, ...)``, and
+        the closed-session refusal (``closed_error`` verbatim).  Every
+        direct path (``deferred_persistence is None``) takes this frame,
+        so an admission precondition added here reaches ALL direct
+        mutations at once instead of three of four hand-synced copies —
+        a path skipping a tightened gate would mutate conversation state
+        outside the discipline.  Returns the re-entrant call's value.
+        """
+        self._prepare_direct_conversation_mutation(None)
+        result: list[Any] = []
+
+        def _admit_direct(durable: list[Callable[[], None]]) -> None:
+            result.append(reenter(durable))
+
+        if not self._commit_for_generation(0, _admit_direct):
+            raise RuntimeError(closed_error)
+        return result[0] if result else None
+
     def _append_user_turn(
         self,
         user_input: str,
@@ -8037,7 +10615,9 @@ class ChatSession:
         from_wake: bool = False,
         source: str | None = None,
         deferred_persistence: list[Callable[[], None]] | None = None,
-    ) -> int:
+        sender_user_id: str | None = None,
+        client_send_ids: tuple[str, ...] = (),
+    ) -> None:
         """Append a user turn (plain or multipart) and persist it.
 
         When ``attachments`` is non-empty the in-memory message carries
@@ -8046,17 +10626,31 @@ class ChatSession:
         bytes are written content-addressed + reference-counted into
         ``workstream_attachments`` (``attachment_id`` = the content hash) and
         the ordered id-list is recorded on the row's ``attachments`` ref-list
-        column — the sole message->blob link.  Returns the saved conversations
-        row id (0 on save failure, per the storage wrapper's no-raise
-        contract).
+        column — the sole message->blob link.  An unresolved save raises
+        :class:`ConversationPersistenceError` while the exact row remains in
+        the live handoff journal.
 
-        ``send_id`` (when provided) is the end-to-end send token; it no longer
-        gates a DB reservation (the upload buffer is the pending store — the
-        bytes were already drained from it before this call).
+        ``send_id`` identifies a web-staged attachment send. Its scoped buffer
+        references transfer atomically at journal admission, after every
+        pre-admission rejection boundary and before any later send can select
+        them again. Direct/internal callers without ``send_id`` may supply
+        immutable unstaged attachments.
         """
-        # New user content invalidates the per-turn memory-search cache
-        # (composition will see a different recent-context string).
-        self._invalidate_memory_cache()
+        if deferred_persistence is None:
+            self._direct_commit_reentry(
+                "Cannot append a user turn to a closed session",
+                lambda durable: self._append_user_turn(
+                    user_input,
+                    attachments,
+                    send_id=send_id,
+                    from_wake=from_wake,
+                    source=source,
+                    deferred_persistence=durable,
+                    sender_user_id=sender_user_id,
+                    client_send_ids=client_send_ids,
+                ),
+            )
+            return
         user_content: str | list[dict[str, Any]]
         if attachments:
             # Attachments ride by reference (``{type: kind, attachment_id}`` →
@@ -8084,6 +10678,10 @@ class ChatSession:
         else:
             user_content = user_input
 
+        # Every live user row receives the same idempotent storage identity as
+        # an accepted assistant row.  It is independent of ``send_id`` (a UI
+        # tracking token) and survives ambiguous storage acknowledgement.
+        commit_key = uuid.uuid4().hex
         user_msg: dict[str, Any] = {"role": "user", "content": user_content}
         if from_wake and self._wake_source_tag:
             # Sibling tag for audit / replay: the synthetic empty user
@@ -8110,9 +10708,17 @@ class ChatSession:
         # / ``from_wake`` and stay unstamped so they never get a speaker label.
         # Rides the wire-invisible ``_sender`` side channel and, below, the
         # persisted ``meta`` column so history replay re-attributes correctly.
-        sender = "" if (from_wake or source) else (self._mcp_effective_user_id or "").strip()
+        effective_sender = (
+            (self._mcp_effective_user_id or "") if sender_user_id is None else sender_user_id
+        )
+        sender = "" if (from_wake or source) else effective_sender.strip()
         if sender:
             user_msg["_sender"] = sender
+        stable_client_send_ids = tuple(
+            client_send_id for client_send_id in client_send_ids if client_send_id
+        )
+        if stable_client_send_ids:
+            user_msg["_client_send_ids"] = list(stable_client_send_ids)
         if attachments:
             # Sibling metadata so live history replay has the same shape
             # as reloaded-from-DB (filenames are not recoverable from an
@@ -8120,6 +10726,7 @@ class ChatSession:
             # underscore keys before the wire call so this is safe.
             user_msg["_attachments_meta"] = [
                 {
+                    "attachment_id": a.attachment_id,
                     "kind": a.kind,
                     "filename": a.filename,
                     "mime_type": a.mime_type,
@@ -8129,18 +10736,17 @@ class ChatSession:
                 }
                 for a in attachments
             ]
-        self.messages.append(turn_from_dict(user_msg))
-        if sender:
-            # A newly recorded sender can change shared-workstream state; let
-            # the next system-prompt compose re-derive it (memoized otherwise).
-            self._invalidate_shared_state()
-        self._msg_tokens.append(max(1, int(self._msg_char_count(user_msg) / self._chars_per_token)))
+        user_turn = turn_from_dict(user_msg)
+        user_token_estimate = max(
+            1,
+            int(self._msg_char_count(user_msg) / self._chars_per_token),
+        )
         # DB row stores the raw text only; attachment bytes are written
         # content-addressed into workstream_attachments and the ordered id-list
         # is recorded on this row's ``attachments`` ref-list column (the sole
-        # message->blob link), joined back in on load.  ``send_id`` no longer
-        # gates a reservation — the bytes were drained from the upload buffer
-        # before this call.
+        # message->blob link), joined back in on load. A web-staged send moves
+        # the matching upload-buffer ownership into this immutable closure at
+        # admission; direct/internal calls may supply unstaged bytes.
         #
         # The wake's synthesised empty turn carries ``_source`` onto the
         # row so reconnecting tabs render the marker instead of an
@@ -8152,78 +10758,122 @@ class ChatSession:
         # column already carries opaque per-row metadata). ``reconstruct_turns``
         # restores it to ``Turn.meta.extra["sender"]`` so a worker rehydrating a
         # shared workstream re-attributes each user turn.
-        meta_json = json.dumps({"sender": sender}) if sender else None
+        meta_envelope: dict[str, Any] = {}
+        if sender:
+            meta_envelope["sender"] = sender
+        if stable_client_send_ids:
+            meta_envelope["client_send_ids"] = list(stable_client_send_ids)
+        meta_json = json.dumps(meta_envelope) if meta_envelope else None
         persist_ws_id = self._ws_id
         persist_user_id = self._user_id
-        persist_event_id = self._ui_event_id()
-        persist_attachments = tuple(attachments)
+        attachment_writes = _attachment_writes(attachments)
+        persist_event_id: int | None = None
 
         def _persist_user_turn() -> int:
-            message_id = save_message(
-                persist_ws_id,
-                "user",
-                user_input,
-                source=source if isinstance(source, str) and source else None,
-                event_id=persist_event_id,
-                meta=meta_json,
-            )
-            if persist_attachments and message_id:
-                self._persist_attachment_refs(
-                    message_id,
-                    persist_attachments,
-                    ws_id=persist_ws_id,
+            persist_source = source if isinstance(source, str) and source else None
+            if attachment_writes:
+                message_id = save_user_message_with_attachments(
+                    persist_ws_id,
+                    user_input,
+                    attachment_writes,
+                    source=persist_source,
+                    event_id=persist_event_id,
+                    meta=meta_json,
+                    commit_key=commit_key,
                 )
-                # Drain the now-committed handles from the per-node upload
-                # buffer.  Capture both identities at admission: a force
-                # successor or resume may rebind the live session before this
-                # ordered durable closure runs.
-                buffer = get_attachment_buffer()
-                for att in persist_attachments:
-                    buffer.discard(
-                        att.attachment_id,
-                        ws_id=persist_ws_id,
-                        user_id=persist_user_id,
-                    )
+            else:
+                message_id = save_message(
+                    persist_ws_id,
+                    "user",
+                    user_input,
+                    source=persist_source,
+                    event_id=persist_event_id,
+                    meta=meta_json,
+                    commit_key=commit_key,
+                )
             return message_id
 
-        if deferred_persistence is not None:
+        event_attachments = [
+            {
+                "attachment_id": write.attachment_id,
+                "kind": write.kind,
+                "filename": write.filename,
+                "mime_type": write.mime_type,
+            }
+            for write in attachment_writes
+        ]
 
-            def _persist_user_turn_deferred() -> None:
-                _persist_user_turn()
-
-            deferred_persistence.append(_persist_user_turn_deferred)
-            return 0
-        return _persist_user_turn()
-
-    def _persist_attachment_refs(
-        self,
-        message_id: int,
-        attachments: list[Attachment] | tuple[Attachment, ...],
-        *,
-        origin: str = "upload",
-        ws_id: str | None = None,
-    ) -> None:
-        """Write each attachment's bytes content-addressed and record the ref-list.
-
-        ``attachment_id`` is the content hash, so identical bytes dedupe to one
-        blob and each reference bumps its refcount; the ordered id-list is
-        recorded on the conversations row's ``attachments`` column.  Used by
-        the user-turn commit (``origin='upload'``) and the tool-image persist
-        (``origin='tool'``).
-        """
-        ref_ids: list[str] = []
-        for att in attachments:
-            save_attachment(
-                att.attachment_id,
-                att.filename,
-                att.mime_type,
-                len(att.content),
-                att.kind,
-                att.content,
-                origin,
+        # Admission, journal/revision advance, and event publication are one atomic
+        # REST-history -> SSE transition.  A listener registered before this
+        # lock receives ``user_turn``; an old-token registration after it is
+        # rejected.  Journal the immutable accepted row before making it
+        # externally visible, then stamp that same row with the event cursor.
+        with self._history_handoff_lock:
+            # The buffer transfer and all accepted-row mutations share this
+            # admission point. A failed claim leaves both staging and history
+            # untouched; a successful claim is backed by the immutable writes
+            # captured in ``_persist_user_turn``.
+            history_revision_before = self._history_handoff_revision
+            self.messages.append(user_turn)
+            if sender:
+                # A newly recorded sender can change shared-workstream state;
+                # let the next system-prompt compose re-derive it.
+                self._invalidate_shared_state()
+            self._msg_tokens.append(user_token_estimate)
+            try:
+                pending = self._journal_conversation_row_locked(
+                    commit_key=commit_key,
+                    message=user_msg,
+                    persist=_persist_user_turn,
+                    event_id=None,
+                )
+            except BaseException:
+                self._rollback_live_journal_admission_locked(
+                    turn=user_turn,
+                    commit_key=commit_key,
+                    history_revision_before=history_revision_before,
+                    reason="user_turn_admission_rolled_back",
+                )
+                raise
+            if send_id and attachment_writes:
+                # Drain staging only AFTER the journal claim succeeded:
+                # ``attachment_writes`` already carries the resolved bytes; the
+                # staged buffer is only the double-spend guard for a second
+                # send racing this one, and both sends serialize on this lock.
+                # A raise above therefore leaves the handles staged, so the
+                # client's retry of the same send resolves them again instead
+                # of being rejected as unknown/expired (round-3 review).
+                # Entries can legitimately be gone by now (TTL expiry while
+                # queued behind the durability fence), so a missing handle
+                # must not fail a turn whose payload is fully in hand — but
+                # every surviving sibling is still consumed so no staged owner
+                # outlives this admission.
+                unique_ids = tuple(
+                    dict.fromkeys(write.attachment_id for write in attachment_writes)
+                )
+                transferred = get_attachment_buffer().consume_all(
+                    unique_ids,
+                    ws_id=persist_ws_id,
+                    user_id=persist_user_id,
+                )
+                if len(transferred) < len(unique_ids):
+                    log.debug(
+                        "session.user_turn.staged_attachments_partially_released ws=%s missing=%d",
+                        persist_ws_id[:8],
+                        len(unique_ids) - len(transferred),
+                    )
+            persist_event_id = self._publish_user_turn_locked(
+                content=user_input,
+                attachments=event_attachments,
+                sender=sender or None,
+                source=source if isinstance(source, str) and source else None,
+                client_send_ids=list(stable_client_send_ids),
             )
-            ref_ids.append(att.attachment_id)
-        set_message_attachments(ws_id or self._ws_id, message_id, ref_ids)
+            user_msg["_event_id"] = persist_event_id
+            user_turn.meta.event_id = persist_event_id
+            pending.message["_event_id"] = persist_event_id
+
+        self._schedule_conversation_persistence(pending, deferred_persistence)
 
     @staticmethod
     def _decode_image_part(part: Any, tool_name: str) -> Attachment | None:
@@ -8322,40 +10972,77 @@ class ChatSession:
         live mirror both rebuild the same per-kind bubble.  It is stripped before
         the LLM wire (``_source_meta`` is a ``_``-prefixed key).
         """
-        turn = make_system_turn(source, content, **meta)
-        self.messages.append(turn_from_dict(turn))
-        self._msg_tokens.append(max(1, int(self._msg_char_count(turn) / self._chars_per_token)))
-        meta_json = json.dumps(meta) if meta else None
-        # Fire the live SSE hook BEFORE persisting so the row carries the SAME
-        # event_id its ``system_turn`` event carries.  ``on_system_turn``
-        # returns the id ``_enqueue`` assigned (``None`` for non-SSE UIs / test
-        # doubles).  The hook stays best-effort: on failure the persist below
-        # still runs and the row falls back to the current cursor (no live
-        # event was delivered to double anyway).
-        emitted_event_id: int | None = None
-        try:
-            emitted_event_id = _coerce_event_id(
-                self.ui.on_system_turn(content, source, meta or None)
+        if deferred_persistence is None:
+            self._direct_commit_reentry(
+                "Cannot append a system turn to a closed session",
+                lambda durable: self._append_system_turn(
+                    source,
+                    content,
+                    deferred_persistence=durable,
+                    **meta,
+                ),
             )
-        except Exception:
-            log.warning("ui.on_system_turn failed; system turn still appended", exc_info=True)
+            return
+        turn = make_system_turn(source, content, **meta)
+        system_turn = turn_from_dict(turn)
+        token_estimate = max(1, int(self._msg_char_count(turn) / self._chars_per_token))
+        meta_json = json.dumps(meta) if meta else None
         persist_ws_id = self._ws_id
-        persist_event_id = emitted_event_id if emitted_event_id is not None else self._ui_event_id()
+        commit_key = uuid.uuid4().hex
+        persist_event_id: int | None = None
 
-        def _persist_system_turn() -> None:
-            save_message(
+        def _persist_system_turn() -> int:
+            return save_message(
                 persist_ws_id,
                 "system",
                 content,
                 source=source,
                 event_id=persist_event_id,
                 meta=meta_json,
+                commit_key=commit_key,
             )
 
-        if deferred_persistence is None:
-            _persist_system_turn()
-        else:
-            deferred_persistence.append(_persist_system_turn)
+        # The semantic event and row admission are one handoff transition. A
+        # throwing hook falls back to an explicit history repair before the
+        # revision changes, so already-connected panes cannot miss the row.
+        with self._history_handoff_lock:
+            history_revision_before = self._history_handoff_revision
+            self.messages.append(system_turn)
+            self._msg_tokens.append(token_estimate)
+            hook_completed = False
+            emitted_event_id: int | None = None
+            try:
+                emitted_event_id = _coerce_event_id(
+                    self.ui.on_system_turn(content, source, meta or None)
+                )
+                hook_completed = True
+            except Exception:
+                log.warning(
+                    "ui.on_system_turn failed; requesting authoritative history",
+                    exc_info=True,
+                )
+            if not hook_completed:
+                self._request_history_resync_locked("system_turn_accepted")
+            persist_event_id = (
+                emitted_event_id if emitted_event_id is not None else self._ui_event_id()
+            )
+            try:
+                pending = self._journal_conversation_row_locked(
+                    commit_key=commit_key,
+                    message=turn,
+                    persist=_persist_system_turn,
+                    event_id=persist_event_id,
+                )
+            except BaseException:
+                self._rollback_live_journal_admission_locked(
+                    turn=system_turn,
+                    commit_key=commit_key,
+                    history_revision_before=history_revision_before,
+                    reason="system_turn_admission_rolled_back",
+                )
+                raise
+
+        self._schedule_conversation_persistence(pending, deferred_persistence)
 
     # -- Main generation loop ------------------------------------------------
 
@@ -8444,21 +11131,72 @@ class ChatSession:
             mint_client=self._mcp_mint_client,
         )
 
-    def _history_scope_user_id(self) -> str | None:
-        """Identity that scopes conversation-history reads (recall tool,
-        ``/history``).
+    def _tool_prepare_principal_id(self) -> str:
+        """Principal pinned for the current tool-preparation batch."""
+        prepared_principal = _active_tool_prepare_principal.get()
+        if prepared_principal is not None:
+            return prepared_principal.strip()
+        return (getattr(self, "_acting_user_id", "") or getattr(self, "_user_id", "") or "").strip()
 
-        The acting user when one is bound — on a shared workstream the
-        search runs with the visibility of whoever is driving the turn —
-        otherwise the session owner.  ``None`` (CLI / eval / internal
-        single-user lanes) leaves history unscoped.  Deliberately no
-        admin/service bypass: the model-facing recall tool always reads as
-        a plain user, even when an admin is driving — bypass is a surface
-        property (cluster inspect), not a principal property.
-        """
-        return self._acting_user_id or self._user_id or None
+    def _prepare_tool_for_principal(
+        self,
+        tc: dict[str, Any],
+        principal_id: str,
+        *,
+        safe: bool = False,
+    ) -> dict[str, Any]:
+        """Prepare any tool under one immutable turn principal."""
+        principal = principal_id.strip()
+        token = _active_tool_prepare_principal.set(principal)
+        try:
+            item = self._safe_prepare_tool(tc) if safe else self._prepare_tool(tc)
+        finally:
+            _active_tool_prepare_principal.reset(token)
+        # The safe path can synthesize an error item after a preparer raises;
+        # every issued tool still carries the same execution authority field.
+        item["_principal_id"] = principal
+        return item
 
     def bind_acting_user(self, user_id: str) -> None:
+        """Bind directly, or defer a worker-thread bind until generation claim.
+
+        HTTP/coordinator worker closures historically call this immediately
+        before :meth:`send`.  A slot-time :class:`WorkerClaim` is authoritative
+        in that window: applying the bind here would let an abandoned worker
+        overwrite its successor before the old claim is rejected.  ``send``
+        performs the generation-owned bind after validating that claim.
+
+        Direct CLI/tests have no active worker claim and retain the synchronous
+        behavior.
+        """
+
+        requested = user_id.strip()
+        claim = current_worker_claim(self)
+        if claim is not None:
+            if claim.principal_id and requested and requested != claim.principal_id:
+                raise RuntimeError("Worker principal does not match acting user")
+            return
+        with self._acting_user_bind_lock:
+            refresh = self._bind_acting_user_unfenced(requested)
+        self._refresh_mcp_for_actor_transition(refresh)
+
+    def _bind_acting_user_for_generation(self, user_id: str, my_generation: int) -> None:
+        """Install one actor projection while *my_generation* still owns it."""
+
+        with self._acting_user_bind_lock:
+            self._check_generation_admission(my_generation)
+            refresh = self._bind_acting_user_unfenced(user_id)
+        self._refresh_mcp_for_actor_transition(refresh)
+        with self._acting_user_bind_lock:
+            # A force successor can claim while the lock-free catalog read
+            # runs. Its bind publishes the final actor; this predecessor's
+            # epoch-witnessed refresh is discarded before this owner check.
+            self._check_generation_admission(my_generation)
+
+    def _bind_acting_user_unfenced(
+        self,
+        user_id: str,
+    ) -> tuple[MCPClientManager, str | None] | None:
         """Bind the authenticated initiator of the current turn.
 
         Called from the HTTP send path with the caller's authenticated
@@ -8479,12 +11217,17 @@ class ChatSession:
         under the user whose turn they continue. It intentionally does
         NOT rebind mid-turn: queued interjections fold into the current
         turn under the initiator's identity, and prepared tool items pin
-        the identity at prepare time (see ``_prepare_mcp_tool``).
+        the identity through the generic ``_principal_id`` field.
         """
+        old_effective = self._mcp_effective_user_id
         if not user_id or user_id == (self._acting_user_id or self._user_id):
             self._acting_user_id = self._acting_user_id or user_id
-            return
-        self._acting_user_id = user_id
+            return None
+        with self._system_prefix_lock:
+            self._acting_user_id = user_id
+            self._invalidate_system_prefix()
+        if self._mcp_effective_user_id != old_effective:
+            self._mcp_projection_epoch += 1
         mcp = self._mcp_client
         # Coordinators participate fully (#725): they are multi-sender by
         # design (any admin.coordinator operator with project visibility
@@ -8493,7 +11236,7 @@ class ChatSession:
         # pools below; otherwise operator B would dispatch against
         # operator A's primed pool catalog.
         if not mcp:
-            return
+            return None
         old_listener_uid = self._mcp_listener_user_id
         new_listener_uid: str | None = self._mcp_effective_user_id
         if new_listener_uid != old_listener_uid:
@@ -8507,22 +11250,21 @@ class ChatSession:
                 mcp.remove_prompt_listener(self._mcp_prompt_cb, user_id=old_listener_uid)
                 mcp.add_prompt_listener(self._mcp_prompt_cb, user_id=new_listener_uid)
             self._mcp_listener_user_id = new_listener_uid
-        try_prime_user_pools(mcp, new_listener_uid, context="acting-user-change")
-        # Rebuild the merged tool list and resource/prompt-dependent
-        # state under the new identity NOW — the prime above completes
-        # asynchronously and only notifies on catalog changes, while
-        # already-warm pool entries for this user produce no
-        # notification at all.  ONE _init_system_messages() covers both
-        # the resource and prompt catalogs: the _on_mcp_resources_changed
-        # / _on_mcp_prompts_changed wrappers are pure passthroughs to it
-        # (they exist for the manager's separate notification channels,
-        # which still fire them independently), and it rebuilds the full
-        # system message copy-on-write — calling it twice per handoff was
-        # a redundant list_prompt_policies() read + compose per rebind.
-        # The persona-catalog read inside the tools rebuild stays as-is:
-        # sender-independent but handoff-frequency, not worth memoizing.
+        return mcp, new_listener_uid
+
+    def _refresh_mcp_for_actor_transition(
+        self,
+        refresh: tuple[MCPClientManager, str | None] | None,
+    ) -> None:
+        """Prime and rebuild after a bind, outside the actor publication lock."""
+        if refresh is None:
+            return
+        mcp, user_id = refresh
+        try_prime_user_pools(mcp, user_id, context="acting-user-change")
+        # Already-warm pools emit no notification, so synchronously project
+        # their local cached catalog. The callback's manager/actor/epoch
+        # witnesses discard it if another bind or surface drop wins meanwhile.
         self._on_mcp_tools_changed()
-        self._init_system_messages()
 
     def _initialize_send_generation(
         self,
@@ -8533,6 +11275,7 @@ class ChatSession:
         send_id: str | None,
         from_wake: bool,
         turn_principal_id: str,
+        client_send_ids: tuple[str, ...] = (),
         wire_part_cache: dict[
             tuple[str, tuple[bool, bool, bool]],
             dict[str, Any] | list[dict[str, Any]],
@@ -8550,15 +11293,19 @@ class ChatSession:
         # force successor wins while one of these reads is blocked, the commit
         # below rejects every old mutation.  The participant lookup is cached so
         # the in-lock apply path performs no storage access.
-        planned_nudge_memory_count = (
-            self._visible_memory_count()
-            if not self._wake_source_tag and self._nudges_enabled("start")
-            else 0
+        planned_user_turn = (
+            self._plan_genuine_user_turn(
+                user_input,
+                turn_principal_id,
+                origin_generation=my_generation,
+            )
+            if not from_wake
+            else None
         )
         shared_state_plan = self._plan_shared_state()
         participant_name: str | None = None
         if not from_wake:
-            participant_id = (self._mcp_effective_user_id or "").strip()
+            participant_id = turn_principal_id
             owner_id = (self._mcp_user_id or "").strip()
             if participant_id and participant_id != owner_id:
                 participant_name = self._resolve_display_name(participant_id)
@@ -8575,30 +11322,44 @@ class ChatSession:
 
             self._apply_shared_state_plan(*shared_state_plan)
 
-            planned_nudge = self._plan_metacognitive_nudge(
-                user_input,
-                memory_count=planned_nudge_memory_count,
-            )
+            planned_nudge = self._plan_metacognitive_nudge(user_input)
             if planned_nudge:
                 self._queue_user_advisory(*planned_nudge)
                 record_nudge(planned_nudge[0], self._metacog_state)
 
-            self._append_user_turn(
-                user_input,
-                attachments or (),
-                send_id=send_id,
-                from_wake=from_wake,
-                deferred_persistence=durable,
-            )
-            if not from_wake:
-                became_shared = self._maybe_note_new_participant(
-                    self._mcp_effective_user_id,
+            if planned_user_turn is None:
+                self._append_user_turn(
+                    user_input,
+                    attachments or (),
+                    send_id=send_id,
+                    from_wake=True,
                     deferred_persistence=durable,
-                    recompose_system=False,
-                    resolved_name=participant_name,
+                    sender_user_id=turn_principal_id,
+                    client_send_ids=client_send_ids,
                 )
-            else:
                 became_shared = False
+            else:
+                shared_out: list[bool] = []
+
+                def _after_user() -> None:
+                    shared_out.append(
+                        self._maybe_note_new_participant(
+                            turn_principal_id,
+                            deferred_persistence=durable,
+                            recompose_system=False,
+                            resolved_name=participant_name,
+                        )
+                    )
+
+                self._append_genuine_user_turn(
+                    planned_user_turn,
+                    attachments or (),
+                    send_id=send_id,
+                    deferred_persistence=durable,
+                    client_send_ids=client_send_ids,
+                    after_user=_after_user,
+                )
+                became_shared = bool(shared_out and shared_out[0])
             self._emit_pending_user_nudges(deferred_persistence=durable)
 
             self._wire_part_cache = wire_part_cache
@@ -8631,16 +11392,7 @@ class ChatSession:
 
                 durable.append(_launch_title)
 
-            # A fresh session composed with no query uses recency-only memory.
-            # Recompose once after the first real contextual turn so the
-            # opening request receives query-relevant memory.
-            recompose_out.append(
-                became_shared
-                or (
-                    not self._system_composed_with_context
-                    and bool(extract_recent_context(dicts_from_turns(self.messages)).strip())
-                )
-            )
+            recompose_out.append(became_shared)
 
         if not self._commit_for_generation(
             my_generation,
@@ -8649,8 +11401,11 @@ class ChatSession:
         ):
             raise GenerationCancelled()
         if recompose_out and recompose_out[0]:
-            self._check_cancelled(my_generation)
-            if not self._init_system_messages(origin_generation=my_generation):
+            self._check_generation_admission(my_generation)
+            if not self._init_system_messages(
+                origin_generation=my_generation,
+                principal_id=turn_principal_id,
+            ):
                 raise GenerationCancelled()
 
     def send(
@@ -8661,6 +11416,7 @@ class ChatSession:
         *,
         from_wake: bool = False,
         acting_user_id: str | None = None,
+        client_send_ids: tuple[str, ...] = (),
     ) -> None:
         """Send user input and handle the response loop (including tool calls).
 
@@ -8672,56 +11428,99 @@ class ChatSession:
         column.
 
         ``send_id`` is an end-to-end tracking token only; it no longer gates a
-        DB reservation (the upload buffer is the pending store, and the bytes
-        in ``attachments`` were already drained/peeked from it by the caller).
+        DB reservation. The caller only peeks at the upload buffer; admission
+        of the immutable pending user row atomically transfers staged bytes.
 
         ``acting_user_id`` is the authenticated caller who initiated this
         turn (HTTP send / retry paths). It rebinds per-user MCP credential
         resolution to that user for this and subsequent turns — see
         :meth:`bind_acting_user`. ``None`` (internal callers: wake nudges,
         auto-resume, CLI) leaves the current binding untouched.
+
+        ``client_send_ids`` are browser-generated correlation tokens for the
+        accepted user-row event. They are deliberately not idempotency keys:
+        two sends carrying the same token remain two distinct conversation
+        rows and are distinguished by their monotonic event ids.
         """
-        if acting_user_id is not None:
-            self.bind_acting_user(acting_user_id)
-        turn_principal_id = (self._mcp_effective_user_id or "").strip()
-        # A dead binding diagnosed by the refresh does NOT fail fast here:
-        # the send proceeds so the fallback chain can carry the turn, and
-        # ``_format_backend_error`` surfaces the latched cause if it cannot.
-        self._refresh_model_from_registry()
-        # Token budget approval gate
-        if self._budget_exhausted:
-            budget_cancel_witness = _ApprovalCancelWitness(self)
-            approved, _ = self.ui.approve_tools(
-                [
-                    {
-                        "func_name": "__budget_override__",
-                        "preview": (
-                            f"Token budget ({self._token_budget:,}) exhausted. Approve to continue."
-                        ),
-                        "needs_approval": True,
-                        # Synchronization-only state.  SessionUIBase projects
-                        # approval items through an explicit wire allowlist, so
-                        # this witness never crosses SSE / persistence.
-                        "_approval_cancel_witness": budget_cancel_witness,
-                    }
-                ]
-            )
-            if not approved:
-                # A Stop is not a budget-policy rejection.  The approval cycle
-                # already emitted its cancelled resolution; return quietly and
-                # let the worker's normal convergence restore idle state.
-                if budget_cancel_witness.aborted:
-                    return
-                self.ui.on_error("Token budget exhausted. Approval required to continue.")
-                return
-            self._budget_exhausted = False
-            self._budget_warned = False
-        my_generation = self._claim_generation()
+        worker_claim = current_worker_claim(self)
+        requested_principal = (acting_user_id or "").strip()
+        if worker_claim is not None and worker_claim.principal_id:
+            if requested_principal and requested_principal != worker_claim.principal_id:
+                raise RuntimeError("Worker principal does not match acting user")
+            turn_principal_id = worker_claim.principal_id
+        else:
+            turn_principal_id = requested_principal or (self._mcp_effective_user_id or "").strip()
+        # Worker-slot admission is the first lifecycle action.  In particular,
+        # do not bind an actor, refresh a registry, or enter an approval gate
+        # before validating the slot-time cancellation edge: a force successor
+        # may already own this same ChatSession.
+        my_generation = self._claim_generation(
+            principal_id=turn_principal_id or None,
+            expected_cancel_epoch=(worker_claim.cancel_epoch if worker_claim is not None else None),
+        )
         wire_part_cache: dict[
             tuple[str, tuple[bool, bool, bool]],
             dict[str, Any] | list[dict[str, Any]],
         ] = {}
         try:
+            with self._generation_lock:
+                if self._generation != my_generation:
+                    raise GenerationCancelled()
+                generation_cancel_event = self._cancel_event
+            if turn_principal_id:
+                self._bind_acting_user_for_generation(turn_principal_id, my_generation)
+            self._check_generation_admission(my_generation)
+            # A dead binding diagnosed by the refresh does NOT fail fast here:
+            # the send proceeds so the fallback chain can carry the turn, and
+            # ``_format_backend_error`` surfaces the latched cause if it cannot.
+            self._refresh_model_from_registry()
+            self._check_generation_admission(my_generation)
+            # Context checks and the user-row estimate below must use the primary
+            # binding's tokenizer even when the preceding accepted turn came from
+            # a fallback lane.
+            self._activate_token_calibration(self._primary_lane())
+            self._check_generation_admission(my_generation)
+            # Token budget approval gate.  The generation-local event is captured
+            # at claim time; consulting ``self._cancel_event`` here could pick up a
+            # force successor's fresh event and strand this stale approval.
+            if self._budget_exhausted:
+                budget_cancel_witness = _ApprovalCancelWitness(
+                    self,
+                    generation_cancel_event,
+                )
+                approved, _ = self.ui.approve_tools(
+                    [
+                        {
+                            "func_name": "__budget_override__",
+                            "preview": (
+                                f"Token budget ({self._token_budget:,}) exhausted. "
+                                "Approve to continue."
+                            ),
+                            "needs_approval": True,
+                            # Synchronization-only state. SessionUIBase projects
+                            # approval items through an explicit wire allowlist,
+                            # so these fields never cross SSE / persistence.
+                            "_approval_cancel_witness": budget_cancel_witness,
+                            "_approval_wait_seconds": self._approval_wait_seconds(),
+                        }
+                    ]
+                )
+                if not approved:
+                    # A Stop is not a budget-policy rejection. The approval cycle
+                    # already emitted its cancelled resolution; return quietly.
+                    if budget_cancel_witness.aborted:
+                        return
+                    self.ui.on_error("Token budget exhausted. Approval required to continue.")
+                    return
+                self._budget_exhausted = False
+                self._budget_warned = False
+            # A force successor may claim while its predecessor's accepted
+            # assistant row is still waiting on storage.  Claim/cancel remains
+            # responsive, but the successor may not append its user row until
+            # that causal boundary is durably reconciled.  Otherwise a failed
+            # assistant save can leave a later user/tool row behind a permanent
+            # hole in the transcript.
+            self._await_prior_conversation_persistence(my_generation)
             # Install every post-claim, pre-stream mutation only after this
             # cleanup bracket is live.  The helper publishes the user turn,
             # nudges/context, principal, and send-owned attachment cache as one
@@ -8733,6 +11532,7 @@ class ChatSession:
                 send_id=send_id,
                 from_wake=from_wake,
                 turn_principal_id=turn_principal_id,
+                client_send_ids=client_send_ids,
                 wire_part_cache=wire_part_cache,
             )
             # Bail an orphaned/superseded send BEFORE the pre-send compaction below
@@ -8818,73 +11618,78 @@ class ChatSession:
                 ):
                     raise GenerationCancelled()
                 try:
-                    try:
-                        result = self._stream_response(my_generation)
-                    except Exception as ctx_err:
-                        # Context overflow recovery: if the API rejects the
-                        # request due to exceeding the context window, compact
-                        # the conversation and retry once.
-                        if not _is_ctx_overflow(ctx_err):
-                            raise
-                        log.warning(
-                            "Context overflow detected (%s), compacting and retrying",
-                            type(ctx_err).__name__,
-                        )
-                        # The notice and spinner handoff are one generation
-                        # publication.  A force successor/close/Stop that wins
-                        # after the overflow must not let this old worker paint
-                        # over the live UI before compaction's own owner fence.
-                        with self._generation_lock:
-                            if (
-                                self._publication_shutdown
-                                or self._generation != my_generation
-                                or self._cancel_event.is_set()
-                            ):
-                                raise GenerationCancelled() from None
-                            self.ui.on_info("\n[Context overflow — auto-compacting and retrying]")
-                            # Stop thinking indicator before compact (which has
-                            # its own start/stop) to avoid nested spinners.
-                            self.ui.on_thinking_stop()
-                        try:
-                            # my_generation: without it a stale send that hits
-                            # overflow here could compact-and-swap the LIVE
-                            # generation's history after a force-cancel started
-                            # a newer one — the same race every other compaction
-                            # site already guards.
-                            self._compact_messages(auto=True, my_generation=my_generation)
-                        except Exception:
-                            # RECOVERY-machinery failure: the overflow error
-                            # is still the actionable one, and its wording
-                            # already anticipates this case ("compaction
-                            # could not reduce it enough").
-                            log.warning(
-                                "Compact-and-retry failed, raising original error",
-                                exc_info=True,
-                            )
-                            raise ctx_err from None
-                        if not self._publish_for_generation(
-                            my_generation,
-                            self.ui.on_thinking_start,
-                            allow_cancelled=False,
-                        ):
-                            raise GenerationCancelled() from None
+                    with self._recovered_serving_failures() as recovered_failures:
                         try:
                             result = self._stream_response(my_generation)
-                        except Exception as retry_err:
-                            if not _is_ctx_overflow(retry_err):
-                                # A post-compaction failure that is NOT a
-                                # recurring overflow surfaces as ITSELF
-                                # (implicitly chained to ctx_err): masking
-                                # a dead wire or bad credentials behind
-                                # "Context window exceeded" sends the
-                                # operator to shrink a conversation that
-                                # already compacted fine.
+                        except Exception as ctx_err:
+                            recovered_failures.append(ctx_err)
+                            # Context overflow recovery: if the API rejects the
+                            # request due to exceeding the context window, compact
+                            # the conversation and retry once.
+                            if not _is_ctx_overflow(ctx_err):
                                 raise
                             log.warning(
-                                "Compact-and-retry re-overflowed, raising original error",
-                                exc_info=True,
+                                "Context overflow detected (%s), compacting and retrying",
+                                type(ctx_err).__name__,
                             )
-                            raise ctx_err from None
+                            # The notice and spinner handoff are one generation
+                            # publication.  A force successor/close/Stop that wins
+                            # after the overflow must not let this old worker paint
+                            # over the live UI before compaction's own owner fence.
+                            with self._generation_lock:
+                                if (
+                                    self._publication_shutdown
+                                    or self._generation != my_generation
+                                    or self._cancel_event.is_set()
+                                ):
+                                    raise GenerationCancelled() from None
+                                self.ui.on_info(
+                                    "\n[Context overflow — auto-compacting and retrying]"
+                                )
+                                # Stop thinking indicator before compact (which has
+                                # its own start/stop) to avoid nested spinners.
+                                self.ui.on_thinking_stop()
+                            try:
+                                # my_generation: without it a stale send that hits
+                                # overflow here could compact-and-swap the LIVE
+                                # generation's history after a force-cancel started
+                                # a newer one — the same race every other compaction
+                                # site already guards.
+                                self._compact_messages(auto=True, my_generation=my_generation)
+                            except Exception:
+                                # RECOVERY-machinery failure: the overflow error
+                                # is still the actionable one, and its wording
+                                # already anticipates this case ("compaction
+                                # could not reduce it enough").
+                                log.warning(
+                                    "Compact-and-retry failed, raising original error",
+                                    exc_info=True,
+                                )
+                                raise ctx_err from None
+                            if not self._publish_for_generation(
+                                my_generation,
+                                self.ui.on_thinking_start,
+                                allow_cancelled=False,
+                            ):
+                                raise GenerationCancelled() from None
+                            try:
+                                result = self._stream_response(my_generation)
+                            except Exception as retry_err:
+                                recovered_failures.append(retry_err)
+                                if not _is_ctx_overflow(retry_err):
+                                    # A post-compaction failure that is NOT a
+                                    # recurring overflow surfaces as ITSELF
+                                    # (implicitly chained to ctx_err): masking
+                                    # a dead wire or bad credentials behind
+                                    # "Context window exceeded" sends the
+                                    # operator to shrink a conversation that
+                                    # already compacted fine.
+                                    raise
+                                log.warning(
+                                    "Compact-and-retry re-overflowed, raising original error",
+                                    exc_info=True,
+                                )
+                                raise ctx_err from None
                 finally:
                     # Only clear if this generation is still active —
                     # an orphaned thread must not clobber a newer stream.
@@ -8933,31 +11738,29 @@ class ChatSession:
                     self._update_token_table(
                         msgs=completed_result.wire_msgs,
                         tool_def_chars=completed_result.tool_def_chars,
+                        provenance=completed_result.provenance,
                     )
                     # Report usage for every completed API call that this
                     # generation still owns.
                     self._print_status_line(
-                        model=completed_result.serving_model or None,
+                        model=(
+                            completed_result.provenance.backend_model_id
+                            or completed_result.serving_model
+                            or None
+                        ),
                         deferred_persistence=durable,
                     )
                     # The canonical Turn: minted tool ids, finalized native
                     # lane, and the SERVING lane's producer, so a
                     # fallback-served turn is not labeled with the primary's.
-                    self.messages.append(completed_result.turn)
-                    # Clear per-turn inflight buffers — the assistant message
-                    # is now in history, so the next execution/stream window
-                    # must not replay the same in-progress text.
-                    self.ui.on_turn_committed()
-                    self._msg_tokens.append(
-                        self._assistant_pending_tokens
-                        or max(
-                            1,
-                            int(
-                                self._msg_char_count(completed_result.turn) / self._chars_per_token
-                            ),
-                        )
+                    accepted_tool_call_ids = tuple(
+                        call.id for call in completed_result.turn.tool_calls if call.id
                     )
 
+                    assistant_token_estimate = self._assistant_pending_tokens or max(
+                        1,
+                        int(self._msg_char_count(completed_result.turn) / self._chars_per_token),
+                    )
                     # Save assistant message atomically (content + tool_calls
                     # in one row).  The persisted mirror and executed call list
                     # are derived from the same completed result above.
@@ -8967,20 +11770,125 @@ class ChatSession:
                         or completed_tool_calls_json
                     ):
                         persist_ws_id = self._ws_id
-                        persist_event_id = self._ui_event_id()
+                        persist_producer = completed_result.producer or None
+                        provenance = TurnProvenance.from_meta(
+                            completed_result.turn.meta.extra.get(PROVENANCE_META_KEY)
+                        )
+                        persist_meta = (
+                            json.dumps({PROVENANCE_META_KEY: provenance.to_meta()})
+                            if provenance is not None
+                            else None
+                        )
+                        commit_key = uuid.uuid4().hex
+                        # The journal takes the one isolating copy and stamps
+                        # it: its pending-durability mark is what keeps the
+                        # history orphan trimmer from dropping a complete
+                        # tool-call-only row whose storage write is still in
+                        # flight (the ring does not carry its native structure
+                        # until later tool-info events).
+                        pending_message = turn_to_dict(completed_result.turn)
 
-                        def _persist_assistant_turn() -> None:
-                            save_message(
-                                persist_ws_id,
-                                "assistant",
-                                completed_content,
-                                provider_data=completed_provider_data,
-                                tool_calls=completed_tool_calls_json,
-                                event_id=persist_event_id,
-                                producer=completed_result.producer or None,
+                        # Journal admission, accepted-revision advance, and
+                        # inflight-buffer clear are one bootstrap transition.
+                        # An initial SSE registration sharing this lock either
+                        # precedes the transition (and receives the live tail)
+                        # or observes the new token/pending row.
+                        with self._history_handoff_lock:
+                            try:
+                                self.ui.on_turn_committed()
+                            except Exception:
+                                log.warning(
+                                    "ui.on_turn_committed failed; requesting authoritative history",
+                                    exc_info=True,
+                                )
+                                self._request_history_resync_locked("assistant_turn_accepted")
+                            # ``on_turn_committed`` flushes a final pending
+                            # content batch before clearing the inflight
+                            # buffers. Stamp the row *after* that flush so its
+                            # durable cursor covers every event representing
+                            # this assistant turn.
+                            persist_event_id = self._ui_event_id()
+
+                            def _save_assistant_turn() -> int:
+                                return save_message(
+                                    persist_ws_id,
+                                    "assistant",
+                                    completed_content,
+                                    provider_data=completed_provider_data,
+                                    tool_calls=completed_tool_calls_json,
+                                    event_id=persist_event_id,
+                                    producer=persist_producer,
+                                    meta=persist_meta,
+                                    commit_key=commit_key,
+                                )
+
+                            # Structural acceptance is inseparable from journal
+                            # admission. If the in-memory journal itself rejects
+                            # the assistant row, roll back both the live turn and
+                            # its TOOL debt before generic exception cleanup can
+                            # manufacture a durable suffix without its parent.
+                            history_revision_before = self._history_handoff_revision
+                            self._admit_tool_structural_debt_locked(
+                                my_generation,
+                                accepted_tool_call_ids,
                             )
+                            self.messages.append(completed_result.turn)
+                            self._msg_tokens.append(assistant_token_estimate)
+                            try:
+                                pending = self._journal_conversation_row_locked(
+                                    commit_key=commit_key,
+                                    message=pending_message,
+                                    persist=_save_assistant_turn,
+                                    event_id=persist_event_id,
+                                )
+                            except BaseException:
+                                # The shared rollback undoes the live tail; the
+                                # structural-debt admission above is the one
+                                # assistant-specific extra it cannot know about.
+                                self._rollback_live_journal_admission_locked(
+                                    turn=completed_result.turn,
+                                    commit_key=commit_key,
+                                    history_revision_before=history_revision_before,
+                                    reason="assistant_turn_admission_rolled_back",
+                                )
+                                if accepted_tool_call_ids:
+                                    expected_debt = _ToolStructuralDebt(
+                                        generation=my_generation,
+                                        call_ids=accepted_tool_call_ids,
+                                    )
+                                    if self._tool_structural_debt != expected_debt:
+                                        raise RuntimeError(
+                                            "Assistant journal rollback lost structural-debt "
+                                            "ownership"
+                                        ) from None
+                                    self._tool_structural_debt = None
+                                    self._tool_structural_condition.notify_all()
+                                raise
 
-                        durable.append(_persist_assistant_turn)
+                            def _persist_assistant_turn() -> None:
+                                self._persist_pending_conversation_commit(pending)
+
+                            durable.append(_persist_assistant_turn)
+                    else:
+                        # No durable assistant row exists for a structurally
+                        # empty result, but the live inflight buffers still end
+                        # at this accepted turn boundary. Record that decision
+                        # on the turn itself: a later tail cut must not count
+                        # this live-only row when translating removed turns
+                        # into durable rows (a raw count would delete an older
+                        # committed row in its place).
+                        completed_result.turn.meta.extra["no_durable_row"] = True
+                        with self._history_handoff_lock:
+                            self._admit_tool_structural_debt_locked(
+                                my_generation,
+                                accepted_tool_call_ids,
+                            )
+                            self.messages.append(completed_result.turn)
+                            self._msg_tokens.append(assistant_token_estimate)
+                            try:
+                                self.ui.on_turn_committed()
+                            except Exception:
+                                log.warning("ui.on_turn_committed failed", exc_info=True)
                     if not completed_tool_calls:
                         compaction_stop_out.append(self._compaction_advised)
                         self._compaction_advised = False
@@ -9001,6 +11909,11 @@ class ChatSession:
                     allow_cancelled=True,
                 ):
                     return
+                # Fallback B produced the accepted result, but every new
+                # agentic round starts at primary A.  Restore A's estimator
+                # before tool-result admission or end-of-turn compaction reads
+                # the remaining budget.
+                self._activate_token_calibration(self._primary_lane())
                 stopped_to_compact = stopped_to_compact_out[0] if stopped_to_compact_out else False
 
                 if not tool_calls:
@@ -9069,13 +11982,18 @@ class ChatSession:
                     # must not let this retired worker pop a successor's queue
                     # or repaint its state as idle.
                     flushed_out: list[bool] = []
+                    queued_flush = self._prepare_queued_flush(
+                        origin_generation=my_generation,
+                    )
 
                     def _drain_or_idle(
                         durable: list[Callable[[], None]],
                         out: list[bool] = flushed_out,
+                        plan: _QueuedFlushPlan = queued_flush,
                     ) -> None:
                         flushed = self._flush_queued_messages(
                             deferred_persistence=durable,
+                            prepared=plan,
                         )
                         out.append(flushed)
                         if not flushed:
@@ -9094,6 +12012,25 @@ class ChatSession:
                     if flushed_queued:
                         continue
                     break
+
+                # Keyed executor/guard side maps intentionally model one live
+                # occurrence per provider call id. Same-batch duplicate
+                # non-empty ids would cross-attribute names, output guards,
+                # effects, and previews. Fail before state publication or any
+                # executor can populate those maps; the generic structural
+                # finalizer below emits one definitely-unstarted TOOL receipt
+                # per assistant-call occurrence.
+                call_id_counts = collections.Counter(
+                    call.get("id", "") for call in tool_calls if call.get("id")
+                )
+                duplicate_call_ids = sorted(
+                    call_id for call_id, count in call_id_counts.items() if count > 1
+                )
+                if duplicate_call_ids:
+                    raise _MalformedToolBatchError(
+                        "Provider emitted duplicate tool call ids in one assistant batch: "
+                        + ", ".join(duplicate_call_ids)
+                    )
 
                 # Execute tool calls (potentially in parallel)
                 def _start_tools(durable: list[Callable[[], None]]) -> None:
@@ -9117,6 +12054,30 @@ class ChatSession:
                 # Bail if generation was superseded during tool execution.
                 if self._generation != my_generation:
                     return
+
+                # Same construction as the duplicate-id gate above; one
+                # comprehension serves both so the two checks can never
+                # disagree about the batch.
+                expected_result_counts = call_id_counts
+                observed_result_counts = collections.Counter(call_id for call_id, _ in results)
+                unexpected_results = observed_result_counts - expected_result_counts
+                if unexpected_results:
+                    # An executor receipt may answer only an occurrence in the
+                    # accepted assistant block. Fail before any TOOL row is
+                    # admitted; generic structural cleanup will conservatively
+                    # close every expected call. Clear keyed side maps so an
+                    # internal malformed receipt cannot bleed into a later
+                    # provider generation that reuses the same id.
+                    for unexpected_id in unexpected_results:
+                        self._cancelled_tool_results.pop(unexpected_id, None)
+                        self._tool_error_flags.pop(unexpected_id, None)
+                        self._tool_status.pop(unexpected_id, None)
+                        self._tool_previews.pop(unexpected_id, None)
+                    unexpected_ids = ", ".join(sorted(unexpected_results.elements()))
+                    raise RuntimeError(
+                        f"Tool executor returned receipts outside the accepted block: "
+                        f"{unexpected_ids}"
+                    )
 
                 # Repeat-detection + tool-error nudge.  Mutates *results*
                 # in place to inject inline warning text on identical
@@ -9367,7 +12328,8 @@ class ChatSession:
                     fold_results: list[tuple[int, str, Any, Any]],
                     tc_names: dict[str, Any],
                     last_idx: int,
-                    feedback: str,
+                    queued_flush: _QueuedFlushPlan,
+                    accepted_call_id_counts: collections.Counter[str],
                     durable: list[Callable[[], None]],
                 ) -> None:
                     # Operator-context system turns are accumulated across the
@@ -9413,8 +12375,8 @@ class ChatSession:
                         # provider tool-call could still need cancellation
                         # repair; otherwise a reused call id in a later loop
                         # could inherit stale output.
-                        self._cancelled_tool_results.pop(tc_id, None)
-                        self.messages.append(turn_from_dict(tool_msg))
+                        staged_result = self._cancelled_tool_results.pop(tc_id, None)
+                        tool_turn = turn_from_dict(tool_msg)
 
                         # Token estimation — image content uses a fixed
                         # heuristic while text follows the calibrated ratio.
@@ -9427,7 +12389,11 @@ class ChatSession:
                                 1,
                                 int(text_chars / self._chars_per_token) + image_count * 1000,
                             )
-                            store_text = " ".join(
+                            # One scalar is shared by pending /history,
+                            # accepted SSE, and the durable TEXT column. The
+                            # history projector joins multipart text blocks
+                            # with newlines, so use the same delimiter here.
+                            store_text = "\n".join(
                                 p.get("text", "")
                                 for p in output
                                 if isinstance(p, dict) and p.get("type") == "text"
@@ -9435,50 +12401,75 @@ class ChatSession:
                         else:
                             tok_est = max(1, int(len(output) / self._chars_per_token))
                             store_text = output
-                        self._msg_tokens.append(tok_est)
-
                         tool_atts = list(tool_image_atts)
                         if tool_preview is not None:
                             tool_atts.append(tool_preview[1])
                         persist_ws_id = self._ws_id
-                        persist_event_id = self._ui_event_id()
+                        commit_key = uuid.uuid4().hex
+                        event_id_ref: list[int | None] = [None]
                         persist_meta = _tool_turn_meta(
                             tool_status,
                             tool_preview[0] if tool_preview else None,
+                            acting_principal=self._generation_principals.get(my_generation, ""),
                         )
-                        persist_atts = tuple(tool_atts)
+                        attachment_writes = _attachment_writes(tool_atts)
 
-                        def _persist_tool_result(
-                            *,
-                            ws_id: str = persist_ws_id,
-                            event_id: int | None = persist_event_id,
-                            text: str = store_text,
-                            tool_name: str = _tname,
-                            call_id: str = tc_id,
-                            is_error: bool = tool_is_error,
-                            meta_json: str | None = persist_meta,
-                            attachments: tuple[Attachment, ...] = persist_atts,
-                        ) -> None:
-                            tool_message_id = save_message(
-                                ws_id,
-                                "tool",
-                                text,
-                                tool_name,
-                                tool_call_id=call_id,
-                                event_id=event_id,
-                                is_error=is_error,
-                                meta=meta_json,
-                            )
-                            if attachments and tool_message_id:
-                                self._persist_attachment_refs(
-                                    tool_message_id,
-                                    attachments,
-                                    origin="tool",
-                                    ws_id=ws_id,
-                                )
+                        restore_tool_side_state = functools.partial(
+                            self._restore_tool_side_maps,
+                            call_id=tc_id,
+                            staged=staged_result,
+                            was_error=tool_is_error,
+                            status=tool_status,
+                            preview=tool_preview,
+                        )
 
-                        durable.append(_persist_tool_result)
+                        # The detailed live result was emitted before output
+                        # evaluation. Publish the final guarded scalar while
+                        # sharing the handoff lock with row admission so a
+                        # listener joining after the receipt still sees the
+                        # accepted row. Duplicate ids within this assistant
+                        # batch cannot key a browser upsert and retain strong
+                        # repair instead.
+                        pending = self._admit_and_publish_tool_row(
+                            turn=tool_turn,
+                            message=tool_msg,
+                            token_estimate=tok_est,
+                            commit_key=commit_key,
+                            persist=self._tool_row_persist_closure(
+                                ws_id=persist_ws_id,
+                                text=store_text,
+                                tool_name=_tname,
+                                call_id=tc_id,
+                                is_error=tool_is_error,
+                                meta_json=persist_meta,
+                                attachments=attachment_writes,
+                                commit_key=commit_key,
+                                event_id_ref=event_id_ref,
+                            ),
+                            restore_on_rollback=restore_tool_side_state,
+                            event_id_ref=event_id_ref,
+                            call_id=tc_id,
+                            name=_tname,
+                            output=store_text,
+                            is_error=tool_is_error,
+                            preview=tool_preview[0] if tool_preview else None,
+                            effect_status=(tool_status.value if tool_status is not None else None),
+                            projection_safe=(bool(tc_id) and accepted_call_id_counts[tc_id] == 1),
+                        )
+                        self._schedule_conversation_persistence(pending, durable)
                         pending_system_turns.extend(result_advisories)
+
+                    # Every ordinary result row above is now present in both
+                    # the live trajectory and handoff journal. A malformed
+                    # executor result set is completed conservatively here;
+                    # the shared synthesizer then retires the exact assistant
+                    # block before this callback returns and the durability
+                    # ticket is reserved. Storage may still fail, but the
+                    # accepted overlay cannot expose an unmatched prefix.
+                    self._synthesize_cancelled_results(
+                        "Tool execution returned no observable outcome.",
+                        deferred_persistence=durable,
+                    )
 
                     # Emit accumulated operator context only after the complete
                     # tool block, preserving the native-system placement rule.
@@ -9489,19 +12480,30 @@ class ChatSession:
                             deferred_persistence=durable,
                             **meta,
                         )
-                    # Seam 2: fold approval feedback and messages queued after
-                    # the final result advisory into one trailing user turn.
+                    # Seam 2: fold approval feedback into one trailing USER
+                    # turn. Queued interjections present at admission ride the
+                    # system advisory seam immediately above; later arrivals
+                    # remain queued for the next loop boundary.
                     self._flush_queued_messages(
-                        prefix=feedback,
                         deferred_persistence=durable,
+                        prepared=queued_flush,
                     )
 
+                # Existing queued interjections ride Seam 1 above. Approval
+                # feedback is a genuine USER turn, so rank it outside the
+                # generation publication and commit its pointer alongside it.
+                queued_flush = self._prepare_queued_flush(
+                    user_feedback or "",
+                    include_queue=False,
+                    origin_generation=my_generation,
+                )
                 fold_tool_batch = functools.partial(
                     _fold_tool_batch,
                     guarded_results,
                     _tc_names,
                     _last_idx,
-                    user_feedback or "",
+                    queued_flush,
+                    expected_result_counts,
                 )
 
                 if not self._commit_for_generation(
@@ -9525,7 +12527,51 @@ class ChatSession:
                 # re-checks.
                 if not pre_attempted_compact:
                     self._maybe_compact_midturn(my_generation)
+        except ConversationPersistenceError as exc:
+            # Do not run the generic failed-generation cleanup here: it drains
+            # queued user messages into a new conversation row, which would
+            # persist *after* the unresolved assistant boundary.  Keep queued
+            # input queued, prevent tool/provider continuation, and surface a
+            # bounded error/state update only. The pending full assistant row
+            # and any synthesized unstarted TOOL suffix remain visible through
+            # /history and reconcile in order before a later send can mutate
+            # history.
+            def _finalize_persistence_failure(
+                error: BaseException,
+                durable: list[Callable[[], None]],
+            ) -> None:
+                # The assistant turn is already accepted in memory before its
+                # durable closure runs. If it contains tool calls, the failed
+                # closure prevents control from ever reaching _execute_tools;
+                # complete that provider-visible block with definitive
+                # unstarted TOOL rows. Keep their scheduled wrappers in a
+                # scratch list: each journal entry retains its own persistence
+                # closure for the manager's later ordered reconciliation, while
+                # executing a wrapper here would bypass the retry due time and
+                # stop the fatal-state closure behind the existing poison.
+                deferred_tool_repairs: list[Callable[[], None]] = []
+                self._synthesize_cancelled_results(
+                    "Cancelled before tool execution because conversation persistence "
+                    "was interrupted; no side effects.",
+                    deferred_persistence=deferred_tool_repairs,
+                    definitely_unstarted=True,
+                )
+                self._drain_pending_advisories()
+                self._record_fatal_error(error, deferred_persistence=durable)
+
+            self._commit_for_generation(
+                my_generation,
+                functools.partial(_finalize_persistence_failure, exc),
+                allow_cancelled=True,
+                allow_persistence_poison=True,
+                allow_workstream_gone=True,
+            )
+            raise
         except GenerationCancelled:
+            queued_flush = self._prepare_queued_flush(
+                origin_generation=my_generation,
+                allow_rerank=False,
+            )
 
             def _finalize_cancelled_generation(
                 durable: list[Callable[[], None]],
@@ -9562,24 +12608,42 @@ class ChatSession:
                     else:
                         msg["content"] = "[generation cancelled before completion]"
                     persist_ws_id = self._ws_id
-                    persist_event_id = self._ui_event_id()
+                    commit_key = uuid.uuid4().hex
+                    persist_event_id: int | None = None
                     persist_content = msg["content"]
+                    partial_provenance = TurnProvenance.from_meta(msg.get("_provenance"))
+                    persist_meta = (
+                        json.dumps({PROVENANCE_META_KEY: partial_provenance.to_meta()})
+                        if partial_provenance is not None
+                        else None
+                    )
 
-                    def _persist_cancelled_partial() -> None:
-                        save_message(
+                    def _persist_cancelled_partial() -> int:
+                        return save_message(
                             persist_ws_id,
                             "assistant",
                             persist_content,
                             event_id=persist_event_id,
+                            meta=persist_meta,
+                            commit_key=commit_key,
                         )
 
-                    durable.append(_persist_cancelled_partial)
-                    self.messages.append(turn_from_dict(msg))
                     tok_est = max(
                         1,
                         int(self._msg_char_count(msg) / self._chars_per_token),
                     )
-                    self._msg_tokens.append(tok_est)
+                    with self._history_handoff_lock:
+                        self.messages.append(turn_from_dict(msg))
+                        self._msg_tokens.append(tok_est)
+                        self._request_history_resync_locked("cancelled_assistant_turn_accepted")
+                        persist_event_id = self._ui_event_id()
+                        pending = self._journal_conversation_row_locked(
+                            commit_key=commit_key,
+                            message=msg,
+                            persist=_persist_cancelled_partial,
+                            event_id=persist_event_id,
+                        )
+                    self._schedule_conversation_persistence(pending, durable)
                 else:
                     # Cancelled during tool execution — synthesize cancelled
                     # tool_result for any tool_calls that lack a matching result.
@@ -9591,7 +12655,10 @@ class ChatSession:
                     )
                 # Drain any queued user messages so they appear in the
                 # conversation and are visible on the next send().
-                self._flush_queued_messages(deferred_persistence=durable)
+                self._flush_queued_messages(
+                    deferred_persistence=durable,
+                    prepared=queued_flush,
+                )
                 self._drain_pending_advisories()
                 # No need to clear _cancel_event — it's replaced per-generation
                 # in send(), so this generation's event is simply discarded.
@@ -9605,11 +12672,16 @@ class ChatSession:
             if not self._commit_for_generation(
                 my_generation,
                 _finalize_cancelled_generation,
+                allow_workstream_gone=True,
             ):
                 return
             # Do NOT re-raise — return normally so server worker thread
             # completes cleanly.
         except KeyboardInterrupt as exc:
+            queued_flush = self._prepare_queued_flush(
+                origin_generation=my_generation,
+                allow_rerank=False,
+            )
 
             def _finalize_interrupted_generation(
                 error: BaseException,
@@ -9619,7 +12691,10 @@ class ChatSession:
                     "Interrupted by user.",
                     deferred_persistence=durable,
                 )
-                self._flush_queued_messages(deferred_persistence=durable)
+                self._flush_queued_messages(
+                    deferred_persistence=durable,
+                    prepared=queued_flush,
+                )
                 self._drain_pending_advisories()
                 self._record_fatal_error(error, deferred_persistence=durable)
 
@@ -9628,9 +12703,15 @@ class ChatSession:
             self._commit_for_generation(
                 my_generation,
                 functools.partial(_finalize_interrupted_generation, exc),
+                allow_workstream_gone=True,
             )
             raise
         except Exception as exc:
+            queued_flush = self._prepare_queued_flush(
+                origin_generation=my_generation,
+                allow_rerank=False,
+            )
+
             # Orphan gate: a superseded thread's stream death can escape
             # cancel conversion (the successor replaced the cancel event
             # before the blocked read died) and reach here — recording it
@@ -9642,13 +12723,32 @@ class ChatSession:
                 error: BaseException,
                 durable: list[Callable[[], None]],
             ) -> None:
-                self._flush_queued_messages(deferred_persistence=durable)
+                # Any exception after assistant acceptance still owes the
+                # provider one TOOL receipt per call. The central synthesizer
+                # is a no-op when this generation has no structural debt.
+                definitely_unstarted = isinstance(error, _MalformedToolBatchError)
+                repair_reason = (
+                    "Tool batch was rejected before execution because provider tool call "
+                    "ids were duplicated; no side effects."
+                    if definitely_unstarted
+                    else "Tool execution ended before the outcome could be observed."
+                )
+                self._synthesize_cancelled_results(
+                    repair_reason,
+                    deferred_persistence=durable,
+                    definitely_unstarted=definitely_unstarted,
+                )
+                self._flush_queued_messages(
+                    deferred_persistence=durable,
+                    prepared=queued_flush,
+                )
                 self._drain_pending_advisories()
                 self._record_fatal_error(error, deferred_persistence=durable)
 
             self._commit_for_generation(
                 my_generation,
                 functools.partial(_finalize_failed_generation, exc),
+                allow_workstream_gone=True,
             )
             raise
         finally:
@@ -9728,6 +12828,8 @@ class ChatSession:
         reason: str,
         *,
         deferred_persistence: list[Callable[[], None]] | None = None,
+        definitely_unstarted: bool = False,
+        structural_generation: int | None = None,
     ) -> None:
         """Synthesize tool_result messages for orphaned tool_calls after cancel.
 
@@ -9736,7 +12838,23 @@ class ChatSession:
         cancelled results for any that don't.  This keeps the conversation
         valid (both providers require matching tool_results) while preserving
         the full tool call structure so the model knows what was attempted.
+
+        ``definitely_unstarted`` is reserved for the assistant-persistence
+        failure seam, which runs before tool execution is reachable. It records
+        a definitive ``NONE`` disposition instead of the ordinary conservative
+        ``UNKNOWN`` cancellation outcome.
         """
+        if deferred_persistence is None:
+            self._direct_commit_reentry(
+                "Cannot append cancelled results to a closed session",
+                lambda durable: self._synthesize_cancelled_results(
+                    reason,
+                    deferred_persistence=durable,
+                    definitely_unstarted=definitely_unstarted,
+                    structural_generation=structural_generation,
+                ),
+            )
+            return
         # Find the last assistant message with tool_calls
         assistant_idx = None
         for i in range(len(self.messages) - 1, -1, -1):
@@ -9747,11 +12865,30 @@ class ChatSession:
         if assistant_idx is None:
             return
 
-        # Collect tool_call IDs that already have results
-        answered_ids: set[str] = set()
+        # Count matching results by occurrence, not just by ID. Provider IDs
+        # are normally unique, but compatibility servers may repeat a
+        # non-empty ID (``ensure_tool_call_ids`` repairs blanks only). In that
+        # case one observed TOOL row answers exactly one call; every remaining
+        # occurrence still needs its own structural receipt.
+        remaining_answered = collections.Counter[str]()
         for msg in self.messages[assistant_idx + 1 :]:
             if msg.role is Role.TOOL:
-                answered_ids.add(msg.tool_call_id or "")
+                remaining_answered[msg.tool_call_id or ""] += 1
+        assistant_call_id_counts = collections.Counter(
+            tc.id for tc in self.messages[assistant_idx].tool_calls if tc.id
+        )
+        # The generation these receipts belong to: the exact one force-abandon's
+        # structural finalizer names, otherwise the bounded live commit staging
+        # on this thread.  One derivation feeds both the acting principal
+        # stamped on every synthesized row and the structural debt completed
+        # below, so a synthesized receipt and the ordinary fold that shares its
+        # batch can never disagree about whose turn executed it.
+        origin_generation = (
+            structural_generation
+            if structural_generation is not None
+            else _active_commit_origin_generation.get()
+        )
+        acting_principal = self._generation_principals.get(origin_generation, "")
 
         # An orphaned tool_call usually has no observable result when cancel
         # lands, so the generic disposition is UNKNOWN rather than a bare
@@ -9763,12 +12900,17 @@ class ChatSession:
         for tc in self.messages[assistant_idx].tool_calls:
             tc_id = tc.id
             func_name = tc.name
-            if tc_id and tc_id not in answered_ids:
+            if tc_id and remaining_answered[tc_id]:
+                remaining_answered[tc_id] -= 1
+                continue
+            if tc_id:
                 staged_cancel = self._cancelled_tool_results.pop(tc_id, None)
                 effect_status: EffectStatus | None
                 if staged_cancel is None:
-                    detail = generic_detail
-                    effect_status = EffectStatus.UNKNOWN
+                    detail = reason if definitely_unstarted else generic_detail
+                    effect_status = (
+                        EffectStatus.NONE if definitely_unstarted else EffectStatus.UNKNOWN
+                    )
                     result_is_error = True
                     live_preview = None
                     live_result_already_emitted = False
@@ -9782,8 +12924,8 @@ class ChatSession:
                 # tool may have self-reported an error/status immediately
                 # before Stop; leaving either keyed by a reusable provider id
                 # would stamp it onto a later generation's unrelated result.
-                self._tool_error_flags.pop(tc_id, None)
-                self._tool_status.pop(tc_id, None)
+                prior_error_flag = self._tool_error_flags.pop(tc_id, False)
+                prior_tool_status = self._tool_status.pop(tc_id, None)
                 # A staged preview means _exec_open_preview COMPLETED and its
                 # descriptor already reached the frontend (live SSE at exec
                 # time) — the pane is open on it.  Discarding the blob here
@@ -9801,63 +12943,50 @@ class ChatSession:
                 )
                 if preview_entry is not None:
                     cancelled_turn.meta.extra["preview"] = preview_entry[0]
-                self.messages.append(cancelled_turn)
-                self._msg_tokens.append(1)
                 persist_ws_id = self._ws_id
-                persist_event_id = self._ui_event_id()
+                commit_key = uuid.uuid4().hex
+                event_id_ref: list[int | None] = [None]
                 persist_meta = _tool_turn_meta(
                     effect_status,
                     preview_entry[0] if preview_entry else None,
+                    acting_principal=acting_principal,
                 )
-                persist_preview = preview_entry[1] if preview_entry is not None else None
+                attachment_writes = _attachment_writes(
+                    () if preview_entry is None else (preview_entry[1],)
+                )
 
-                def _persist_cancelled_result(
+                restore_cancelled_side_state = functools.partial(
+                    self._restore_tool_side_maps,
+                    call_id=tc_id,
+                    staged=staged_cancel,
+                    was_error=prior_error_flag,
+                    status=prior_tool_status,
+                    preview=preview_entry,
+                )
+
+                # Complete the in-DOM tool batch when Stop won before the
+                # ordinary result publication. The accepted projection
+                # follows even when an executor receipt was already sent:
+                # a listener may have registered after that receipt, and a
+                # committed preview must remain reopenable on an error row.
+                def _emit_live_result_once(
                     *,
-                    ws_id: str = persist_ws_id,
-                    event_id: int | None = persist_event_id,
-                    result_detail: str = detail,
-                    tool_name: str = func_name,
-                    call_id: str = tc_id,
-                    is_error: bool = result_is_error,
-                    meta_json: str | None = persist_meta,
-                    preview_attachment: Attachment | None = persist_preview,
+                    _already_emitted: bool = live_result_already_emitted,
+                    _call_id: str = tc_id,
+                    _name: str = func_name,
+                    _detail: str = detail,
+                    _was_error: bool = result_is_error,
+                    _preview: Any = live_preview,
                 ) -> None:
-                    cancelled_row_id = save_message(
-                        ws_id,
-                        "tool",
-                        result_detail,
-                        tool_name,
-                        tool_call_id=call_id,
-                        event_id=event_id,
-                        is_error=is_error,
-                        meta=meta_json,
-                    )
-                    if preview_attachment is not None and cancelled_row_id:
-                        self._persist_attachment_refs(
-                            cancelled_row_id,
-                            [preview_attachment],
-                            origin="tool",
-                            ws_id=ws_id,
-                        )
-
-                if deferred_persistence is None:
-                    _persist_cancelled_result()
-                else:
-                    deferred_persistence.append(_persist_cancelled_result)
-                # Emit synthetic tool_result so live SSE listeners can
-                # complete the in-DOM tool batch — without this the
-                # coord ``--running`` indicator (added by SSE
-                # tool_info) would spin forever on cancelled batches.
-                # Defensive: we're already on a cancel/error path, so
-                # a UI hook failure must not compound the problem.
-                if not live_result_already_emitted:
+                    if _already_emitted:
+                        return
                     try:
                         self.ui.on_tool_result(
-                            tc_id,
-                            func_name,
-                            detail,
-                            is_error=result_is_error,
-                            preview=live_preview,
+                            _call_id,
+                            _name,
+                            _detail,
+                            is_error=_was_error,
+                            preview=_preview,
                         )
                     except Exception:
                         log.debug(
@@ -9865,6 +12994,192 @@ class ChatSession:
                             self._ws_id[:8],
                             exc_info=True,
                         )
+
+                pending_message = turn_to_dict(cancelled_turn)
+                pending = self._admit_and_publish_tool_row(
+                    turn=cancelled_turn,
+                    message=pending_message,
+                    token_estimate=1,
+                    commit_key=commit_key,
+                    persist=self._tool_row_persist_closure(
+                        ws_id=persist_ws_id,
+                        text=detail,
+                        tool_name=func_name,
+                        call_id=tc_id,
+                        is_error=result_is_error,
+                        meta_json=persist_meta,
+                        attachments=attachment_writes,
+                        commit_key=commit_key,
+                        event_id_ref=event_id_ref,
+                    ),
+                    restore_on_rollback=restore_cancelled_side_state,
+                    event_id_ref=event_id_ref,
+                    call_id=tc_id,
+                    name=func_name,
+                    output=detail,
+                    is_error=result_is_error,
+                    preview=preview_entry[0] if preview_entry else None,
+                    effect_status=(effect_status.value if effect_status is not None else None),
+                    projection_safe=(assistant_call_id_counts[tc_id] == 1),
+                    pre_publish=_emit_live_result_once,
+                )
+                self._schedule_conversation_persistence(
+                    pending,
+                    deferred_persistence,
+                )
+
+        if origin_generation:
+            completed_ids = [
+                msg.tool_call_id or ""
+                for msg in self.messages[assistant_idx + 1 :]
+                if msg.role is Role.TOOL
+            ]
+            self._complete_tool_structural_debt_locked(
+                origin_generation,
+                completed_ids,
+            )
+
+    def _restore_tool_side_maps(
+        self,
+        *,
+        call_id: str,
+        staged: _CancelledToolResult | None,
+        was_error: bool,
+        status: EffectStatus | None,
+        preview: tuple[dict[str, Any], Attachment] | None,
+    ) -> None:
+        """Re-stage one call's popped side channels after a rolled-back row.
+
+        Both accepted-TOOL-row paths pop the same four per-call maps while
+        building their row, so a failed journal admission has to put back
+        exactly what the fold consumed.  Shared so the two rollbacks cannot
+        drift.
+        """
+        if staged is not None:
+            self._cancelled_tool_results[call_id] = staged
+        if was_error:
+            self._tool_error_flags[call_id] = True
+        if status is not None:
+            self._tool_status[call_id] = status
+        if preview is not None:
+            self._tool_previews[call_id] = preview
+
+    def _tool_row_persist_closure(
+        self,
+        *,
+        ws_id: str,
+        text: str,
+        tool_name: str,
+        call_id: str,
+        is_error: bool,
+        meta_json: str | None,
+        attachments: tuple[AttachmentWrite, ...],
+        commit_key: str,
+        event_id_ref: list[int | None],
+    ) -> Callable[[], int]:
+        """Build the keyed durable write for one accepted TOOL row.
+
+        Shared by the ordinary result path and cancelled-result synthesis so
+        the two accepted-row shapes cannot drift.
+        """
+
+        def _persist() -> int:
+            if attachments:
+                return save_tool_message_with_attachments(
+                    ws_id,
+                    text,
+                    tool_name,
+                    call_id,
+                    attachments,
+                    event_id=event_id_ref[0],
+                    is_error=is_error,
+                    meta=meta_json,
+                    commit_key=commit_key,
+                )
+            return save_message(
+                ws_id,
+                "tool",
+                text,
+                tool_name,
+                tool_call_id=call_id,
+                event_id=event_id_ref[0],
+                is_error=is_error,
+                meta=meta_json,
+                commit_key=commit_key,
+            )
+
+        return _persist
+
+    def _admit_and_publish_tool_row(
+        self,
+        *,
+        turn: Turn,
+        message: dict[str, Any],
+        token_estimate: int,
+        commit_key: str,
+        persist: Callable[[], int],
+        restore_on_rollback: Callable[[], None],
+        event_id_ref: list[int | None],
+        call_id: str,
+        name: str,
+        output: str,
+        is_error: bool,
+        preview: dict[str, Any] | None,
+        effect_status: str | None,
+        projection_safe: bool,
+        pre_publish: Callable[[], None] | None = None,
+    ) -> _PendingConversationCommit:
+        """Append, journal, and publish one accepted TOOL row atomically.
+
+        The handoff lock spans live append, journal admission, and event
+        publication so a listener joining mid-batch still sees the accepted
+        row.  A failed journal admission rolls the live list and revision
+        back, restores the caller's per-call side maps, and re-raises,
+        leaving no half-admitted receipt behind.  Shared by the ordinary
+        result path and cancelled-result synthesis so the admission and
+        rollback choreography cannot drift.
+        """
+        with self._history_handoff_lock:
+            history_revision_before = self._history_handoff_revision
+            self.messages.append(turn)
+            self._msg_tokens.append(token_estimate)
+            try:
+                # pre_publish sits inside the rollback envelope: its supplier
+                # catches Exception only, so a BaseException (a second Ctrl-C
+                # landing in ui.on_tool_result during cancelled-result
+                # synthesis on the CLI main thread) must roll the live append
+                # back rather than leave a turn no journal entry or durable
+                # row will ever represent (round-4 review).
+                if pre_publish is not None:
+                    pre_publish()
+                pending = self._journal_conversation_row_locked(
+                    commit_key=commit_key,
+                    message=message,
+                    persist=persist,
+                    event_id=None,
+                )
+            except BaseException:
+                self._rollback_live_journal_admission_locked(
+                    turn=turn,
+                    commit_key=commit_key,
+                    history_revision_before=history_revision_before,
+                    reason="tool_turn_admission_rolled_back",
+                )
+                restore_on_rollback()
+                raise
+            event_id_ref[0] = self._publish_tool_turn_locked(
+                call_id=call_id,
+                name=name,
+                output=output,
+                is_error=is_error,
+                preview=preview,
+                effect_status=effect_status,
+                projection_safe=projection_safe,
+            )
+            message["_event_id"] = event_id_ref[0]
+            turn.meta.event_id = event_id_ref[0]
+            pending.message["_event_id"] = event_id_ref[0]
+        return pending
 
     # -- Rewind / retry -------------------------------------------------------
 
@@ -9887,65 +13202,182 @@ class ChatSession:
             if m.role is Role.USER and m.source != COMPACTION_SOURCE
         ]
 
-    def _persist_truncation(self, removed_count: int) -> None:
-        """Mirror a rewind/retry tail-trim into storage, compaction-safe.
+    def _persist_truncation(self, removed_count: int) -> int:
+        """Atomically remove a compaction-floored durable tail.
 
-        rewind/retry remove turns from the in-memory TAIL, which map 1:1 to the
-        most recent storage rows.  Deleting by *removed-row count* from the
-        storage end — rather than keeping the first ``len(self.messages)`` rows —
-        stays correct after a compaction, where ``self.messages`` holds synthetic
-        summary turns with no 1:1 storage rows while storage still holds the full
-        pre-compaction transcript plus the checkpoint marker.  The keep-count is
-        floored at the compaction boundary (:func:`get_compaction_floor`) so the
-        summary's backing rows and the marker are never deleted.  Identical to the
-        old ``keep = len(self.messages)`` when the ws never compacted (floor 0,
-        total == in-memory length).
-
-        Residual: an over-deep rewind that would cross the summary boundary clamps
-        at the floor in storage, so the in-memory trim can drop more than storage
-        does; a later resume rehydrates ``[summary] + [surviving tail]`` and the
-        two reconcile.
+        The backend owns parent locking, row-count/floor calculation, exact
+        deletion, and attachment reference release in one transaction.  It
+        raises on a missing parent or storage failure; callers must not publish
+        the corresponding live cut until this returns successfully.
         """
         if removed_count <= 0:
-            return
-        # The caller already truncated self.messages (rewind/retry both trim
-        # before calling this), so any sender that only appeared in the
-        # dropped tail is no longer derivable from live history — unlike
-        # compaction narrowing (which keeps the full transcript in storage,
-        # exactly why _recompute_shared_state unions in a persisted-sender
-        # read), a rewind/retry deletes those very rows below. Force a full,
-        # fresh re-derivation on the next compose rather than let the
-        # monotonic union/latch keep a departed sender "known" and the
-        # workstream stuck "shared" forever after the only evidence of a
-        # second participant is gone.
-        self._reset_shared_state()
-        total = count_messages(self._ws_id)
-        if total <= 0:
-            # Count unavailable (storage error) — skip the delete rather than risk
-            # a wrong truncation; the in-memory trim holds and resume reconciles.
-            return
-        floor = get_compaction_floor(self._ws_id)
-        if floor < 0:
-            # Floor unavailable (storage error). A 0 here is indistinguishable from
-            # "never compacted", so an over-deep trim could delete the marker and
-            # summarized prefix — skip rather than risk it; resume reconciles.
-            return
-        delete_messages_after(self._ws_id, max(floor, total - removed_count))
-        # History generation (#894/#884 seam): every truncation bumps the
-        # counter the /history single-flight folds into its flight key, so
-        # a request dispatched AFTER a rewind/retry can never join a flight
-        # whose load_messages ran BEFORE it (a joined pre-rewind payload
-        # rendered as fresh truth on the coordinator and reopened the
-        # over-rewind window the #894 client latch closes).  Bumped AFTER
-        # the storage delete: flights rebuild from storage, so a flight
-        # keyed with the OLD generation that reads post-delete rows is the
-        # harmless spuriously-fresh direction, while a NEW-generation
-        # flight reading pre-delete rows would be the wrongly-joined one —
-        # and the early-return error paths above (count/floor unavailable,
-        # delete skipped) correctly leave the generation unbumped.
-        self._history_generation += 1
+            return 0
+        return get_storage().truncate_messages_tail(self._ws_id, removed_count)
 
-    def rewind(self, n: int) -> int:
+    def _commit_history_truncation(
+        self,
+        admit: Callable[[list[Callable[[], None]]], None],
+    ) -> None:
+        """Admit a destructive cut only when no older durability ticket runs.
+
+        The truncation latch intentionally stays clear while an older ticket is
+        draining.  A deferred UI/storage callback in that ticket may itself
+        need a bounded generation commit; closing admission first would make
+        the callback wait for truncation while truncation waits for its ticket.
+        The generation lock makes the final idle-check, latch, callback, and
+        new ticket reservation indivisible from every ordinary commit.
+        """
+
+        def _durability_reached(high_water: int) -> bool:
+            return self._durability_serving_ticket >= high_water
+
+        while True:
+            wait_high_water: int | None = None
+
+            def _admit_if_idle(durable: list[Callable[[], None]]) -> None:
+                nonlocal wait_high_water
+                with self._durability_cond:
+                    if self._durability_serving_ticket != self._durability_next_ticket:
+                        wait_high_water = self._durability_next_ticket
+                        return
+                admit(durable)
+
+            if not self._commit_for_generation(
+                0,
+                _admit_if_idle,
+                allow_persistence_poison=True,
+            ):
+                raise GenerationCancelled()
+            if wait_high_water is None:
+                return
+            high_water = wait_high_water
+            with self._durability_cond:
+                self._durability_cond.wait_for(functools.partial(_durability_reached, high_water))
+
+    def _stage_history_truncation(
+        self,
+        durable: list[Callable[[], None]],
+        cut_index: int,
+        publish_reset: Callable[[], None] | None = None,
+    ) -> int:
+        """Reserve and stage one failure-atomic live/durable tail cut.
+
+        Called only from a ``_commit_for_generation`` callback while the
+        generation lock and truncation condition are held.  The active latch
+        prevents every later generation/direct commit from changing the live
+        list before the durability ticket commits and applies this exact slice.
+        """
+        removed_turns = tuple(self.messages[cut_index:])
+        removed_count = len(removed_turns)
+        original_length = len(self.messages)
+        if removed_count <= 0:
+            return 0
+        if self._history_truncation_active:
+            raise RuntimeError("history truncation admitted while another cut is active")
+        self._history_truncation_active = True
+        # Live turns and durable rows are not one-to-one: a structurally empty
+        # assistant result lives only in ``self.messages`` (stamped
+        # ``no_durable_row`` at admission). The durable cut must count only
+        # turns that own a storage row, else each live-only turn in the span
+        # deletes one older committed row in its place.
+        durable_removed = sum(
+            1 for turn in removed_turns if not turn.meta.extra.get("no_durable_row")
+        )
+
+        def _persist_and_publish_truncation() -> None:
+            try:
+                # This ticket was admitted before any terminal latch. Repair an
+                # older ambiguous row in FIFO order even if close/delete began
+                # while the ticket was waiting; terminal deletion waits for us.
+                # Deliberately NOT ``_force_retry``: a destructive mutation
+                # inside the transient backoff fails fast on the stored poison
+                # instead of hammering storage (soft close differs — it forces
+                # one last probe because refusing it keeps the session loaded).
+                # Pinned by ``test_unresolved_prefix_repair_failure_refuses_
+                # truncation_without_cut_publication``.
+                self._reconcile_pending_conversation_commits(_terminal_admitted_repair=True)
+                with self._history_visibility_lock:
+                    # No later commit can mutate the list while the active latch
+                    # is set. Validate nevertheless so a future unguarded history
+                    # replacement fails before touching durable state.
+                    with self._generation_lock:
+                        current = self.messages[cut_index : cut_index + removed_count]
+                        if len(current) != removed_count or any(
+                            actual is not expected
+                            for actual, expected in zip(
+                                current,
+                                removed_turns,
+                                strict=True,
+                            )
+                        ):
+                            raise RuntimeError("conversation changed outside truncation admission")
+
+                    self._persist_truncation(durable_removed)
+
+                    # Storage has committed.  From this point onward only
+                    # infallible list/field updates and best-effort UI repair
+                    # remain: raising on a second validation could leave the DB
+                    # cut committed while the old live tail stayed visible.
+                    # Publish the matching live cut, token revision, and repair
+                    # event as one bounded transition. History readers remain
+                    # behind visibility until both representations agree.
+                    with self._generation_lock, self._history_handoff_lock:
+                        del self.messages[cut_index:original_length]
+                        del self._msg_tokens[cut_index:original_length]
+                        self._last_usage = None
+                        self._invalidate_token_calibration_anchors()
+                        # A sender appearing only in the dropped tail is no
+                        # longer evidence that this workstream is shared.
+                        self._reset_shared_state()
+                        self._history_generation += 1
+                        self._history_handoff_revision += 1
+                        self._publish_history_truncation_reset_locked(publish_reset)
+
+                # Fence any generation that prepared provider/tool work against
+                # the removed trajectory.  Do not advance the Stop epoch: the
+                # retry command's already-captured worker claim must remain
+                # valid for its replacement send unless a real Stop occurred.
+                with self._generation_transition_lock, self._generation_lock:
+                    self._cancel_event.set()
+                    self._generation += 1
+            finally:
+                with self._history_truncation_condition:
+                    self._history_truncation_active = False
+                    self._history_truncation_condition.notify_all()
+
+        durable.append(_persist_and_publish_truncation)
+        return removed_count
+
+    def _publish_history_truncation_reset_locked(
+        self,
+        publish_reset: Callable[[], None] | None,
+    ) -> None:
+        """Publish exactly one structural-reset signal for a history cut.
+
+        HTTP callers supply their established ``clear_ui`` publisher: that
+        event owns the live-stream quiesce and edit-and-resend continuation in
+        both web clients.  Direct callers have no route-level follow-up, so the
+        stronger handoff repair remains their default.  A broken callback must
+        not turn an already-committed storage cut into a raised half-success;
+        fall back to the generic repair event instead.
+
+        Called with the history handoff lock held so the reset is ordered in
+        the same accepted revision as the live/durable cut.
+        """
+        if publish_reset is not None:
+            try:
+                publish_reset()
+                return
+            except Exception:
+                log.debug("history truncation reset publisher raised", exc_info=True)
+        self._request_history_resync_locked("history_truncated")
+
+    def rewind(
+        self,
+        n: int,
+        *,
+        publish_reset: Callable[[], None] | None = None,
+    ) -> int:
         """Drop the last *n* complete turns from the conversation.
 
         A turn = user message + all assistant/tool messages until the next
@@ -9954,39 +13386,61 @@ class ChatSession:
         """
         if n < 1:
             return 0
-        boundaries = self._find_turn_boundaries()
-        if not boundaries:
-            return 0
-        n = min(n, len(boundaries))
-        cut_index = boundaries[-n]
-        removed_count = len(self.messages) - cut_index
-        del self.messages[cut_index:]
-        del self._msg_tokens[cut_index:]
-        self._persist_truncation(removed_count)
+        removed_count = 0
+
+        def _admit_rewind(durable: list[Callable[[], None]]) -> None:
+            nonlocal removed_count
+            boundaries = self._find_turn_boundaries()
+            if not boundaries:
+                # Web rewind historically emits clear_ui even when there is
+                # nothing to remove (including an already-empty transcript).
+                # Direct callers pass no publisher and retain their no-event
+                # no-op behavior.
+                if publish_reset is not None:
+                    self._publish_history_truncation_reset_locked(publish_reset)
+                return
+            turn_count = min(n, len(boundaries))
+            removed_count = self._stage_history_truncation(
+                durable,
+                boundaries[-turn_count],
+                publish_reset,
+            )
+
+        self._commit_history_truncation(_admit_rewind)
         return removed_count
 
-    def retry(self) -> str | None:
+    def retry(
+        self,
+        *,
+        publish_reset: Callable[[], None] | None = None,
+    ) -> str | None:
         """Drop the last assistant response and return the user message to re-send.
 
         The caller is responsible for calling ``send()`` with the returned
         message.  Returns ``None`` if there is nothing to retry.
         """
-        boundaries = self._find_turn_boundaries()
-        if not boundaries:
-            return None
-        last_user_idx = boundaries[-1]
-        content = turn_to_dict(self.messages[last_user_idx]).get("content")
-        # Multipart messages (vision/images) have list-type content;
-        # retry only supports plain text.
-        if not isinstance(content, str) or not content:
-            return None
-        # Drop everything from (and including) the user message onward;
-        # send() will re-append the user message.
-        removed_count = len(self.messages) - last_user_idx
-        del self.messages[last_user_idx:]
-        del self._msg_tokens[last_user_idx:]
-        self._persist_truncation(removed_count)
-        return content
+        retry_content: str | None = None
+
+        def _admit_retry(durable: list[Callable[[], None]]) -> None:
+            nonlocal retry_content
+            boundaries = self._find_turn_boundaries()
+            if not boundaries:
+                if publish_reset is not None:
+                    self._publish_history_truncation_reset_locked(publish_reset)
+                return
+            last_user_idx = boundaries[-1]
+            content = turn_to_dict(self.messages[last_user_idx]).get("content")
+            # Multipart messages (vision/images) have list-type content;
+            # retry only supports plain text.
+            if not isinstance(content, str) or not content:
+                if publish_reset is not None:
+                    self._publish_history_truncation_reset_locked(publish_reset)
+                return
+            self._stage_history_truncation(durable, last_user_idx, publish_reset)
+            retry_content = content
+
+        self._commit_history_truncation(_admit_retry)
+        return retry_content
 
     def _ui_stream_discarded(self) -> None:
         """Best-effort dead-segment discard across UI generations.
@@ -10031,6 +13485,13 @@ class ChatSession:
         ``_api_call`` documents the equivalent 2-way stack); every layer
         stops immediately on a non-retryable class.
         """
+        # Reject an orphan before any provider-bound work. Prefix refresh and
+        # first-index capture run at the request-admission boundary below, after
+        # credential resolution but before wire preparation. This avoids a
+        # provisional first-turn composition whose project could disagree with
+        # the immutable snapshot.
+        self._check_generation_admission(my_generation)
+        principal_id = self._generation_principals.get(my_generation)
         attempt = 0
         # The latest non-empty dead attempt's flushed text.  Wrapper-LOCAL
         # (read off the frame's consumer, never a session slot), so an
@@ -10040,9 +13501,11 @@ class ChatSession:
         # phase fails with an unarmed error, the original death is the one
         # the operator needs to see, not the re-create's.
         last_stream_death: Exception | None = None
+        # Provenance of the attempt whose text ``dead_partial`` carries.  A
+        # zero-token re-death must not relabel preserved text from the prior
+        # attempt's lane.
+        dead_provenance: TurnProvenance | None = None
         consumer = _StreamTurnConsumer(self, my_generation)
-        principal_id = self._generation_principals.get(my_generation)
-
         debug_printed = False
 
         def _prepare(lowered: list[dict[str, Any]], lane: ModelLane) -> list[dict[str, Any]]:
@@ -10092,10 +13555,13 @@ class ChatSession:
                     return
                 cur = self._cancelled_partial_msg
                 if cur is None or (not cur.get("content") and dead_partial):
-                    self._cancelled_partial_msg = {
+                    promoted: dict[str, Any] = {
                         "role": "assistant",
                         "content": dead_partial,
                     }
+                    if dead_provenance is not None:
+                        promoted["_provenance"] = dead_provenance.to_meta()
+                    self._cancelled_partial_msg = promoted
 
             self._publish_for_generation(
                 my_generation,
@@ -10103,118 +13569,190 @@ class ChatSession:
                 allow_cancelled=True,
             )
 
-        while True:
-            try:
-                result = self._model_turn_with_fallback(
-                    consumer,
-                    _prepare,
-                    my_generation,
-                    principal_id=principal_id,
-                )
-                # A Stop that raced the trailing-metadata window: cancel()
-                # closed the stream and the drain's post-finish tolerance
-                # ended it CLEANLY, so without this re-check the turn
-                # commits as complete and its tool calls execute.
-                self._check_cancelled(my_generation)
-                consumer.finish_stream()
-                # Finalization emits terminal warnings/stream_end and may
-                # legalize a truncated result.  Keep that complete policy step
-                # on the same owner rail as the carry flush above so a force
-                # successor or close cannot receive the predecessor's terminal
-                # UI event in the gap between them.  A same-generation Stop
-                # after a completed stream preserves the historical completed-
-                # result boundary.
-                with self._generation_lock:
-                    if self._publication_shutdown or _generation_superseded(self, my_generation):
-                        raise GenerationCancelled()
-                    return self._finalize_stream_result(result)
-            except GenerationCancelled:
-                # A Stop during an attempt (incl. the re-create/TTFT window
-                # after a death) — finalize the streamed display if the
-                # attempt got a stream, then preserve the window's best
-                # partial.
-                if consumer.attempt_armed:
-                    consumer.record_cancelled_partial()
-                _promote_dead_partial()
-                raise
-            except KeyboardInterrupt:
-                # BaseException — the Exception arm below never sees it,
-                # but send() treats Ctrl-C as a survivable, recorded path,
-                # so the dead attempt still needs its client-side finalize
-                # (the CLI's markdown fence resets only in on_stream_end).
-                self._publish_for_generation(
-                    my_generation,
-                    self.ui.on_stream_end,
-                    allow_cancelled=True,
-                )
-                raise
-            except Exception as e:
-                armed = consumer.attempt_armed
-                new_dead = consumer.partial_content() if armed else ""
-                dead_partial = new_dead or dead_partial
-                if armed:
-                    # The partial is captured, so there is no live attempt
-                    # until the next ``begin_attempt``: without this, a
-                    # Stop or a walk-preamble failure landing in the
-                    # re-create window reads the DEAD attempt's armed
-                    # state (see ``end_attempt``).
-                    consumer.end_attempt()
-                if self._cancel_event.is_set():
-                    _promote_dead_partial()
-                    raise GenerationCancelled() from None
-                if _generation_superseded(self, my_generation) or self._publication_shutdown:
-                    # Superseded (force-cancel started a newer generation):
-                    # an orphaned thread must not touch the UI — a finalize
-                    # emitted here would clobber the NEW generation's
-                    # in-flight stream state.
-                    raise
-                if not armed:
-                    # Creation-phase failure: the walk already ran its full
-                    # ladder + fallbacks.  Mid re-issue it must not MASK
-                    # the original stream death (a closed-client re-create
-                    # surfaces as a retryable APIConnectionError and would
-                    # replace the operator-actionable wording) — EXCEPT
-                    # the classes carrying their own remediation: an
-                    # overflow surfaces as ITSELF so send()'s
-                    # compact-and-retry arm can recover the turn, and an
-                    # auth refusal or wire-preparation fault surfaces as
-                    # ITSELF so the fatal formatter's dedicated branch
-                    # renders.  Class name only in the log — a
-                    # ConnectError's text can carry a credential-bearing
-                    # base_url verbatim.
-                    if (
-                        last_stream_death is None
-                        or isinstance(e, _SELF_SURFACING_ERRORS)
-                        or _is_ctx_overflow(e)
-                    ):
-                        raise
-                    log.warning(
-                        "stream.retry.recreate_failed",
-                        error_type=type(e).__name__,
+        with self._recovered_serving_failures() as recovered_failures:
+            while True:
+                try:
+                    result = self._model_turn_with_fallback(
+                        consumer,
+                        _prepare,
+                        my_generation,
+                        principal_id=principal_id,
                     )
-                    raise last_stream_death from None
-                # The terminal predicate is the SHARED _stop_retrying,
-                # capped at _MID_STREAM_RETRIES, judged by the lane that
-                # ACTUALLY armed this stream (a fallback's retryable set
-                # can differ, e.g. ResponsesStreamFailedError).  The
-                # overflow arm applies here too — an overflow can surface
-                # mid-consumption (error-frame lanes), and it must fall
-                # through to send()'s compact-and-retry arm rather than
-                # burn re-issues on a deterministic failure.
-                serving_lane = consumer.lane
-                if serving_lane is None:
-                    raise RuntimeError("armed stream has no serving model lane") from e
-                if self._stop_retrying(
-                    e, attempt, serving_lane, max_retries=self._MID_STREAM_RETRIES
-                ):
-                    # Terminal: finalize AND discard, exactly like the
-                    # retry arm.  Keeping the buffers bought nothing — the
-                    # fatal path's _emit_state("error") drains and wipes
-                    # them anyway on every SessionUIBase lane — and an
-                    # overflow that send()'s compact-and-retry RECOVERS
-                    # re-streams into buffers that would otherwise still
-                    # hold the dead attempt's text, concatenating the two
-                    # in the idle payload.
+                    # A Stop that raced the trailing-metadata window: cancel()
+                    # closed the stream and the drain's post-finish tolerance
+                    # ended it CLEANLY, so without this re-check the turn
+                    # commits as complete and its tool calls execute.
+                    self._check_cancelled(my_generation)
+                    consumer.finish_stream()
+                    # Finalization emits terminal warnings/stream_end and may
+                    # legalize a truncated result.  Keep that complete policy step
+                    # on the same owner rail as the carry flush above so a force
+                    # successor or close cannot receive the predecessor's terminal
+                    # UI event in the gap between them.  A same-generation Stop
+                    # after a completed stream preserves the historical completed-
+                    # result boundary.
+                    with self._generation_lock:
+                        if self._publication_shutdown or _generation_superseded(
+                            self, my_generation
+                        ):
+                            raise GenerationCancelled()
+                        return self._finalize_stream_result(result)
+                except GenerationCancelled:
+                    # A Stop during an attempt (incl. the re-create/TTFT window
+                    # after a death) — finalize the streamed display if the
+                    # attempt got a stream, then preserve the window's best
+                    # partial.
+                    if consumer.attempt_armed:
+                        consumer.record_cancelled_partial()
+                    _promote_dead_partial()
+                    raise
+                except KeyboardInterrupt:
+                    # BaseException — the Exception arm below never sees it,
+                    # but send() treats Ctrl-C as a survivable, recorded path,
+                    # so the dead attempt still needs its client-side finalize
+                    # (the CLI's markdown fence resets only in on_stream_end).
+                    self._publish_for_generation(
+                        my_generation,
+                        self.ui.on_stream_end,
+                        allow_cancelled=True,
+                    )
+                    raise
+                except Exception as e:
+                    attempt_provenance = None
+                    armed = consumer.attempt_armed
+                    failed_lane = consumer.lane if armed else None
+                    if failed_lane is not None:
+                        self._remember_serving_failure_context(e, failed_lane)
+                        recovered_failures.append(e)
+                    new_dead = consumer.partial_content() if armed else ""
+                    if failed_lane is not None:
+                        attempt_provenance = TurnProvenance(
+                            model_alias=failed_lane.alias,
+                            backend_model_id=failed_lane.model,
+                            registry_generation=failed_lane.registry_generation,
+                            acting_principal_id=principal_id or "",
+                        )
+                    dead_partial = new_dead or dead_partial
+                    if attempt_provenance is not None and (new_dead or dead_provenance is None):
+                        dead_provenance = attempt_provenance
+                    if armed:
+                        # The partial is captured, so there is no live attempt
+                        # until the next ``begin_attempt``: without this, a
+                        # Stop or a walk-preamble failure landing in the
+                        # re-create window reads the DEAD attempt's armed
+                        # state (see ``end_attempt``).
+                        consumer.end_attempt()
+                    if self._cancel_event.is_set():
+                        _promote_dead_partial()
+                        raise GenerationCancelled() from None
+                    if _generation_superseded(self, my_generation) or self._publication_shutdown:
+                        # Superseded (force-cancel started a newer generation):
+                        # an orphaned thread must not touch the UI — a finalize
+                        # emitted here would clobber the NEW generation's
+                        # in-flight stream state.  send()'s orphan gate absorbs
+                        # the re-raise without recording it, so this snapshot
+                        # has no reader even though its exception escapes.
+                        self._forget_serving_failure_context(e)
+                        raise
+                    if not armed:
+                        # Creation-phase failure: the walk already ran its full
+                        # ladder + fallbacks.  Mid re-issue it must not MASK
+                        # the original stream death (a closed-client re-create
+                        # surfaces as a retryable APIConnectionError and would
+                        # replace the operator-actionable wording) — EXCEPT
+                        # the classes carrying their own remediation: an
+                        # overflow surfaces as ITSELF so send()'s
+                        # compact-and-retry arm can recover the turn, and an
+                        # auth refusal or wire-preparation fault surfaces as
+                        # ITSELF so the fatal formatter's dedicated branch
+                        # renders.  Class name only in the log — a
+                        # ConnectError's text can carry a credential-bearing
+                        # base_url verbatim.
+                        if (
+                            last_stream_death is None
+                            or isinstance(e, _SELF_SURFACING_ERRORS)
+                            or _is_ctx_overflow(e)
+                        ):
+                            raise
+                        log.warning(
+                            "stream.retry.recreate_failed",
+                            error_type=type(e).__name__,
+                        )
+                        raise last_stream_death from None
+                    # The terminal predicate is the SHARED _stop_retrying,
+                    # capped at _MID_STREAM_RETRIES, judged by the lane that
+                    # ACTUALLY armed this stream (a fallback's retryable set
+                    # can differ, e.g. ResponsesStreamFailedError).  The
+                    # overflow arm applies here too — an overflow can surface
+                    # mid-consumption (error-frame lanes), and it must fall
+                    # through to send()'s compact-and-retry arm rather than
+                    # burn re-issues on a deterministic failure.
+                    serving_lane = consumer.lane
+                    if serving_lane is None:
+                        raise RuntimeError("armed stream has no serving model lane") from e
+                    if self._stop_retrying(
+                        e, attempt, serving_lane, max_retries=self._MID_STREAM_RETRIES
+                    ):
+                        # Terminal: finalize AND discard, exactly like the
+                        # retry arm.  Keeping the buffers bought nothing — the
+                        # fatal path's _emit_state("error") drains and wipes
+                        # them anyway on every SessionUIBase lane — and an
+                        # overflow that send()'s compact-and-retry RECOVERS
+                        # re-streams into buffers that would otherwise still
+                        # hold the dead attempt's text, concatenating the two
+                        # in the idle payload.
+                        with self._generation_lock:
+                            if (
+                                self._publication_shutdown
+                                or _generation_superseded(self, my_generation)
+                                or self._cancel_event.is_set()
+                            ):
+                                _promote_dead_partial()
+                                raise GenerationCancelled() from None
+                            self.ui.on_stream_end()
+                            self._ui_stream_discarded()
+                        raise  # fatal path otherwise unchanged
+                    # This death supersedes the previous one: drop the older
+                    # snapshot here rather than at the ladder's exit, so a long
+                    # re-issue run holds one entry in the bounded map, not one
+                    # per attempt.
+                    self._forget_serving_failure_context(last_stream_death)
+                    last_stream_death = e
+                    # Delay from the PRE-increment attempt index — the same
+                    # convention as the sibling ladders' range loops.
+                    delay = self._RETRY_BASE_DELAY * (2**attempt)
+                    attempt += 1
+                    cause = type(e.__cause__).__name__ if e.__cause__ else type(e).__name__
+                    log.warning(
+                        "stream.retry",
+                        error_type=cause,
+                        attempt=attempt,
+                        model=serving_lane.model,
+                        alias=serving_lane.alias,
+                        registry_generation=serving_lane.registry_generation,
+                        retry_in=delay,
+                        # Spend trace for the abandoned generation: the wire
+                        # reports usage only at stream end, so a dead attempt's
+                        # billed tokens are otherwise invisible — dead_usage
+                        # carries what the wire DID deliver (Anthropic's early
+                        # prompt tokens; None on the OpenAI chat lane, whose
+                        # usage chunk trails the finish), and the char count
+                        # lets an operator estimate the discarded completion.
+                        # THIS death's flushed text only — a pre-token re-death
+                        # logs 0, never the Stop-preservation carry from a
+                        # prior attempt (that would double-count spend).
+                        dead_usage=self._last_usage,
+                        dead_content_chars=len(new_dead),
+                    )
+                    # Finalize the dead attempt client-side, then WAIT before
+                    # discarding: stream_end (browser bubble, CLI markdown
+                    # flush/fence reset) -> notice -> backoff.  The
+                    # server-buffer discard runs only AFTER the backoff
+                    # survives the Stop window — a Stop during backoff persists
+                    # the promoted partial to history, and the idle payload
+                    # (drained from the turn buffer) must carry the same text,
+                    # or the dashboard renders the cancelled turn empty while
+                    # the transcript has it.
                     with self._generation_lock:
                         if (
                             self._publication_shutdown
@@ -10224,98 +13762,53 @@ class ChatSession:
                             _promote_dead_partial()
                             raise GenerationCancelled() from None
                         self.ui.on_stream_end()
-                        self._ui_stream_discarded()
-                    raise  # fatal path otherwise unchanged
-                last_stream_death = e
-                # Delay from the PRE-increment attempt index — the same
-                # convention as the sibling ladders' range loops.
-                delay = self._RETRY_BASE_DELAY * (2**attempt)
-                attempt += 1
-                cause = type(e.__cause__).__name__ if e.__cause__ else type(e).__name__
-                log.warning(
-                    "stream.retry",
-                    error_type=cause,
-                    attempt=attempt,
-                    model=serving_lane.model,
-                    retry_in=delay,
-                    # Spend trace for the abandoned generation: the wire
-                    # reports usage only at stream end, so a dead attempt's
-                    # billed tokens are otherwise invisible — dead_usage
-                    # carries what the wire DID deliver (Anthropic's early
-                    # prompt tokens; None on the OpenAI chat lane, whose
-                    # usage chunk trails the finish), and the char count
-                    # lets an operator estimate the discarded completion.
-                    # THIS death's flushed text only — a pre-token re-death
-                    # logs 0, never the Stop-preservation carry from a
-                    # prior attempt (that would double-count spend).
-                    dead_usage=self._last_usage,
-                    dead_content_chars=len(new_dead),
-                )
-                # Finalize the dead attempt client-side, then WAIT before
-                # discarding: stream_end (browser bubble, CLI markdown
-                # flush/fence reset) -> notice -> backoff.  The
-                # server-buffer discard runs only AFTER the backoff
-                # survives the Stop window — a Stop during backoff persists
-                # the promoted partial to history, and the idle payload
-                # (drained from the turn buffer) must carry the same text,
-                # or the dashboard renders the cancelled turn empty while
-                # the transcript has it.
-                with self._generation_lock:
-                    if (
-                        self._publication_shutdown
-                        or _generation_superseded(self, my_generation)
-                        or self._cancel_event.is_set()
-                    ):
+                        self.ui.on_info(
+                            f"[stream died mid-response ({cause}) — retrying in "
+                            f"{delay:.0f}s ({attempt}/{self._MID_STREAM_RETRIES})]"
+                        )
+                    try:
+                        self._backoff_or_cancelled(delay, my_generation)
+                        # Retry preparation is one generation publication.  A
+                        # successor can claim immediately after the backoff check;
+                        # without this lock the abandoned worker could discard the
+                        # successor's buffer, restart its spinner, and clear its
+                        # newly registered provider handle before noticing it was
+                        # stale on the next loop iteration.
+                        with self._generation_lock:
+                            if (
+                                self._publication_shutdown
+                                or _generation_superseded(self, my_generation)
+                                or self._cancel_event.is_set()
+                            ):
+                                raise GenerationCancelled()
+                            # Retry is proceeding: truncate the dead segment from
+                            # the multi-segment turn buffer (the IDLE payload's
+                            # source) and reset the inflight snapshot BEFORE any
+                            # retried token lands, or every consumer appends the
+                            # retried text onto the dead attempt's.
+                            self._ui_stream_discarded()
+                            # Spinner for the recreate+TTFT window, and the fresh
+                            # segment watermark — AFTER the truncate, so a later
+                            # discard cannot resurrect this dead segment.  A
+                            # pre-first-token death leaves the spinner RUNNING
+                            # (_stop_spinner_once never fired) — on_thinking_start
+                            # is idempotent at the callee.
+                            self.ui.on_thinking_start()
+                            self._cancel_stream = None  # drop the dead SDK handle
+                        # A concurrent ModelRegistry.reload() closes cached
+                        # clients whose connection config changed — the
+                        # in-flight read then dies with a ReadError and
+                        # the old lane's client is CLOSED. Generation-gated (two compares
+                        # when nothing changed); the next attempt's
+                        # ``prepare_wire`` closure re-prepares against whatever
+                        # binding the walk resolves.
+                        self._refresh_model_from_registry()
+                    except GenerationCancelled:
+                        # A Stop landing in the backoff window aborts the turn
+                        # with the dead attempt's partial preserved — the same
+                        # disposition a cancel DURING the attempt gets.
                         _promote_dead_partial()
-                        raise GenerationCancelled() from None
-                    self.ui.on_stream_end()
-                    self.ui.on_info(
-                        f"[stream died mid-response ({cause}) — retrying in "
-                        f"{delay:.0f}s ({attempt}/{self._MID_STREAM_RETRIES})]"
-                    )
-                try:
-                    self._backoff_or_cancelled(delay, my_generation)
-                    # Retry preparation is one generation publication.  A
-                    # successor can claim immediately after the backoff check;
-                    # without this lock the abandoned worker could discard the
-                    # successor's buffer, restart its spinner, and clear its
-                    # newly registered provider handle before noticing it was
-                    # stale on the next loop iteration.
-                    with self._generation_lock:
-                        if (
-                            self._publication_shutdown
-                            or _generation_superseded(self, my_generation)
-                            or self._cancel_event.is_set()
-                        ):
-                            raise GenerationCancelled()
-                        # Retry is proceeding: truncate the dead segment from
-                        # the multi-segment turn buffer (the IDLE payload's
-                        # source) and reset the inflight snapshot BEFORE any
-                        # retried token lands, or every consumer appends the
-                        # retried text onto the dead attempt's.
-                        self._ui_stream_discarded()
-                        # Spinner for the recreate+TTFT window, and the fresh
-                        # segment watermark — AFTER the truncate, so a later
-                        # discard cannot resurrect this dead segment.  A
-                        # pre-first-token death leaves the spinner RUNNING
-                        # (_stop_spinner_once never fired) — on_thinking_start
-                        # is idempotent at the callee.
-                        self.ui.on_thinking_start()
-                        self._cancel_stream = None  # drop the dead SDK handle
-                    # A concurrent ModelRegistry.reload() closes cached
-                    # clients whose connection config changed — the
-                    # in-flight read then dies with a ReadError and
-                    # the old lane's client is CLOSED. Generation-gated (two compares
-                    # when nothing changed); the next attempt's
-                    # ``prepare_wire`` closure re-prepares against whatever
-                    # binding the walk resolves.
-                    self._refresh_model_from_registry()
-                except GenerationCancelled:
-                    # A Stop landing in the backoff window aborts the turn
-                    # with the dead attempt's partial preserved — the same
-                    # disposition a cancel DURING the attempt gets.
-                    _promote_dead_partial()
-                    raise
+                        raise
 
     def _finalize_stream_result(self, result: ModelTurnResult) -> ModelTurnResult:
         """Post-drain policies for a COMPLETED interactive turn.
@@ -10359,7 +13852,7 @@ class ChatSession:
                         native = ProviderNative(producer=old_native.producer, blocks=tuple(blocks))
                 result = dataclasses.replace(
                     result,
-                    turn=Turn.assistant(result.turn.text, native=native),
+                    turn=dataclasses.replace(result.turn, tool_calls=(), native=native),
                     tool_calls=[],
                 )
         elif finish_reason == "content_filter":
@@ -10387,12 +13880,16 @@ class ChatSession:
                 tools=[tc["function"]["name"] for tc in result.tool_calls],
             )
 
+        provenance = result.provenance
         log.debug(
             "stream.finished",
             finish_reason=finish_reason,
             has_content=bool(result.content),
             tool_call_count=len(result.tool_calls),
             content_length=len(result.content),
+            alias=provenance.model_alias,
+            model=provenance.backend_model_id,
+            registry_generation=provenance.registry_generation,
         )
         self.ui.on_stream_end()
         return result
@@ -10553,6 +14050,7 @@ class ChatSession:
         *,
         msgs: list[dict[str, Any]] | None = None,
         tool_def_chars: int | None = None,
+        provenance: TurnProvenance | None = None,
     ) -> None:
         """Update per-message token estimates using API usage data.
 
@@ -10599,6 +14097,19 @@ class ChatSession:
             )
         elif text_chars > 0:
             self._chars_per_token = text_chars / text_prompt_tok
+
+        calibration_key = (
+            self._provenance_calibration_key(provenance)
+            or self._active_token_calibration_key
+            or self._token_calibration_key(self._primary_lane())
+        )
+        self._active_token_calibration_key = calibration_key
+        self._last_usage_calibration_key = calibration_key
+        self._token_calibrations[calibration_key] = _TokenCalibration(
+            chars_per_token=self._chars_per_token,
+            prompt_tokens=prompt_tok,
+            message_prefix_ids=tuple(id(message) for message in self.messages),
+        )
 
         # Compute system_tokens (stable after first call)
         sys_chars = sum(self._msg_char_count(m) for m in self.system_messages)
@@ -11006,7 +14517,13 @@ class ChatSession:
             self._compaction_event(
                 my_generation, {"phase": "progress", "warning": "summary_truncated"}
             )
-        return _SummaryResult(text=summary, producer=result.producer)
+        return _SummaryResult(
+            text=summary,
+            producer=result.producer,
+            # Lightweight seam fakes predating provenance remain valid; every
+            # production ModelTurnResult carries the field.
+            provenance=getattr(result, "provenance", TurnProvenance()),
+        )
 
     def _summarize_blocks(
         self,
@@ -11294,6 +14811,9 @@ class ChatSession:
         """
         if not rows or budget <= 0:
             return ""
+        complete = heading + "".join(rows)
+        if len(complete) <= budget:
+            return complete
         kept: list[str] = []
         used = len(heading)
         for i, row in enumerate(rows):
@@ -11390,6 +14910,14 @@ class ChatSession:
             raise GenerationCancelled()
         try:
             return self._compact_messages_impl(auto, preserve_tail, my_generation, carry_spill)
+        except ConversationPersistenceError:
+            # The compaction state swap and successful END were already
+            # accepted atomically with a pending marker row. Durability poison
+            # must propagate to stop causal suffixes, but it is not a second
+            # compaction outcome: emitting a failed END here would violate the
+            # exactly-one terminal event contract and contradict the pending
+            # successful history card.
+            raise
         except BaseException as e:
             # GenerationCancelled is a BaseException — the except above the
             # message swap lets it propagate so history stays untouched; the
@@ -11842,6 +15370,7 @@ class ChatSession:
             "role": "assistant",
             "content": summary,
             "_source": COMPACTION_SOURCE,
+            "_provenance": summary_result.provenance.to_meta(),
         }
         su_tok = max(1, int(self._msg_char_count(summary_user) / self._chars_per_token))
         sa_tok = max(1, int(self._msg_char_count(summary_asst) / self._chars_per_token))
@@ -11870,60 +15399,135 @@ class ChatSession:
                     "prompt_tokens": after_tokens,
                     "total_tokens": after_tokens,
                 }
+            active_key = self._active_token_calibration_key
+            if active_key is not None:
+                active = self._token_calibrations.get(active_key)
+                self._token_calibrations[active_key] = _TokenCalibration(
+                    chars_per_token=(
+                        active.chars_per_token if active is not None else self._chars_per_token
+                    ),
+                    prompt_tokens=after_tokens,
+                    message_prefix_ids=tuple(id(message) for message in compacted_messages),
+                )
+                if self._last_usage is not None:
+                    self._last_usage_calibration_key = active_key
 
-            # The successful end event carries everything a UI needs to paint
-            # the result card; its id stamps the marker row below so /history
-            # and the live stream stay aligned.
-            end_event_id = self._compaction_event(
-                my_generation,
-                {
-                    "phase": "end",
-                    "ok": True,
-                    "trigger": trigger,
-                    "before_tokens": before_tokens,
-                    "after_tokens": after_tokens,
-                    "summary": summary,
-                },
-            )
-            # Persist a checkpoint so reopen rehydrates [summary]+[tail] rather
-            # than the full transcript.  Storage retains the complete audit
-            # history; this marker governs only the resume slice.
+            # Persist a checkpoint so reopen rehydrates [summary]+[tail]
+            # rather than the full transcript. Storage retains the complete
+            # audit history; this marker governs only the resume slice. The
+            # live display projection is the same SYSTEM/source=compaction
+            # shape produced by ``include_compaction=True`` while storage
+            # retains the canonical ASSISTANT marker role.
             if self._ws_id:
                 persist_ws_id = self._ws_id
-                persist_event_id = end_event_id if end_event_id is not None else self._ui_event_id()
+                commit_key = uuid.uuid4().hex
+                event_id_ref: list[int | None] = [None]
+                marker_meta: dict[str, Any] = {
+                    "before_tokens": before_tokens,
+                    "after_tokens": after_tokens,
+                    "trigger": trigger,
+                }
+                if summary_result.producer:
+                    marker_meta["summary_producer"] = summary_result.producer
+                marker_meta[PROVENANCE_META_KEY] = summary_result.provenance.to_meta()
+                # The public card keeps checkpoint/display fields but never
+                # exposes the private provenance/principal envelope.
+                display_meta = {
+                    key: copy.deepcopy(value)
+                    for key, value in marker_meta.items()
+                    if key != PROVENANCE_META_KEY
+                }
+                pending_marker = {
+                    "role": "system",
+                    "content": summary,
+                    "_source": COMPACTION_SOURCE,
+                    "_source_meta": display_meta,
+                }
 
-                def _persist_compaction_marker() -> None:
-                    # This read is part of the same ordered durable batch as
-                    # the marker insert.  Every earlier generation batch has
-                    # completed and no later batch can overtake it, so the
-                    # watermark names exactly the prefix summarized above.
-                    watermark = get_compaction_watermark(persist_ws_id, preserve_tail)
-                    if watermark is None:
-                        return
-                    marker_meta: dict[str, Any] = {
-                        "watermark": watermark,
-                        "before_tokens": before_tokens,
-                        "after_tokens": after_tokens,
-                        "trigger": trigger,
-                    }
-                    # Compaction has no provider-native block lane, so the
-                    # generic ``producer=`` storage envelope cannot carry this
-                    # attribution.  Persist the final merge producer in the
-                    # checkpoint marker's metadata instead; #964 owns the
-                    # broader accepted-turn provenance tuple.
-                    if summary_result.producer:
-                        marker_meta["summary_producer"] = summary_result.producer
-                    save_message(
-                        persist_ws_id,
+                meta_json_cell: list[str | None] = [None]
+
+                def _persist_compaction_marker(
+                    *,
+                    ws_id: str = persist_ws_id,
+                    row_commit_key: str = commit_key,
+                    row_event_id: list[int | None] = event_id_ref,
+                ) -> int:
+                    # The watermark is read inside the ordered durable batch:
+                    # every earlier generation batch has completed and no
+                    # later batch can overtake it, so the boundary names
+                    # exactly the prefix summarized above — including rows
+                    # that were still pending in the journal when compaction
+                    # was admitted. Memoized because the marker is a KEYED
+                    # save: a lost-ACK retry must present byte-identical meta
+                    # to the conflict validator, and a re-read after the first
+                    # attempt could observe this marker's own row. The read
+                    # deliberately bypasses the memory wrapper's error-to-None
+                    # coercion: a failed read must abort THIS attempt (no
+                    # bytes fixed, no save tried — the journal classifies it
+                    # retrying and the retry re-reads) rather than memoize
+                    # "absent" and durably commit a checkpoint-less marker on
+                    # the first healthy retry. ``None`` from a healthy read is
+                    # the legitimate no-rows case and persists a display-only
+                    # marker; reopen then resumes from full history.
+                    storage = get_storage()
+                    if meta_json_cell[0] is None:
+                        watermark = storage.get_compaction_watermark(ws_id, preserve_tail)
+                        persisted_meta = dict(marker_meta)
+                        if watermark is not None:
+                            persisted_meta["watermark"] = watermark
+                        meta_json_cell[0] = json.dumps(persisted_meta)
+                    return save_message(
+                        ws_id,
                         "assistant",
                         summary,
                         source=COMPACTION_SOURCE,
-                        meta=json.dumps(marker_meta),
-                        event_id=persist_event_id,
+                        meta=meta_json_cell[0],
+                        event_id=row_event_id[0],
                         producer=summary_result.producer,
+                        commit_key=row_commit_key,
                     )
 
-                durable.append(_persist_compaction_marker)
+                # END publication, fallback repair, marker admission, and
+                # revision advance are one REST/SSE handoff transition. Stamp
+                # after every emitted event so the row cursor covers it.
+                with self._history_handoff_lock:
+                    end_event_id = self._compaction_event(
+                        my_generation,
+                        {
+                            "phase": "end",
+                            "ok": True,
+                            "trigger": trigger,
+                            "before_tokens": before_tokens,
+                            "after_tokens": after_tokens,
+                            "summary": summary,
+                        },
+                    )
+                    if end_event_id is None and _active_task_agent_cancel_scope.get() is None:
+                        self._request_history_resync_locked("compaction_checkpoint_accepted")
+                    event_id_ref[0] = (
+                        end_event_id if end_event_id is not None else self._ui_event_id()
+                    )
+                    pending = self._journal_conversation_row_locked(
+                        commit_key=commit_key,
+                        message=pending_marker,
+                        persist=_persist_compaction_marker,
+                        event_id=event_id_ref[0],
+                    )
+                self._schedule_conversation_persistence(pending, durable)
+            else:
+                # Unscoped CLI/eval sessions have no history row, but retain
+                # the successful lifecycle event.
+                self._compaction_event(
+                    my_generation,
+                    {
+                        "phase": "end",
+                        "ok": True,
+                        "trigger": trigger,
+                        "before_tokens": before_tokens,
+                        "after_tokens": after_tokens,
+                        "summary": summary,
+                    },
+                )
 
         if not self._commit_for_generation(
             my_generation,
@@ -12519,7 +16123,7 @@ class ChatSession:
                 # Gated MCP resource read.  The URI is the risk surface
                 # (file:///etc/shadow, an SSRF-shaped http URI) and is what
                 # both tiers must see — without this branch the item carries
-                # only ``resource_uri``/``mcp_user_id`` (no ``mcp_args``), so it
+                # only ``resource_uri`` (no ``mcp_args``), so it
                 # fell past the fallback below and reached the judge as ``{}``.
                 it["func_args"] = {"uri": it.get("resource_uri", "")}
             elif name == "use_prompt":
@@ -12610,11 +16214,15 @@ class ChatSession:
             never answered.
             """
 
+            verdict_row = verdict.to_dict()  # type: ignore[attr-defined]
+            if judge_principal:
+                verdict_row["execution_principal_id"] = judge_principal
+
             def _persist_only() -> None:
                 persist_only = getattr(self.ui, "on_superseded_intent_verdict", None)
                 if persist_only is not None:
                     try:
-                        persist_only(verdict.to_dict())  # type: ignore[attr-defined]
+                        persist_only(dict(verdict_row))
                     except Exception:
                         log.debug("judge.superseded_verdict_persist_failed", exc_info=True)
 
@@ -12640,7 +16248,7 @@ class ChatSession:
                     try:
                         if ui_can_defer_persistence and base_ui is not None:
                             deferred_persistence = base_ui._publish_intent_verdict_live(
-                                verdict.to_dict(),  # type: ignore[attr-defined]
+                                dict(verdict_row),
                                 judge_event=cancel_event,
                             )
                         elif ui_takes_event:
@@ -12650,13 +16258,11 @@ class ChatSession:
                             # only the inherited production implementations can
                             # safely split their known storage tail.
                             self.ui.on_intent_verdict(
-                                verdict.to_dict(),  # type: ignore[attr-defined]
+                                dict(verdict_row),
                                 judge_event=cancel_event,
                             )
                         else:
-                            self.ui.on_intent_verdict(
-                                verdict.to_dict()  # type: ignore[attr-defined]
-                            )
+                            self.ui.on_intent_verdict(dict(verdict_row))
                     except Exception:
                         log.debug("judge.verdict_delivery_failed", exc_info=True)
                 else:
@@ -13215,6 +16821,8 @@ class ChatSession:
         attachment_ids: list[str] | tuple[str, ...] | None = None,
         queue_msg_id: str | None = None,
         interjector_user_id: str = "",
+        turn_principal_id: str | None = None,
+        client_send_id: str = "",
     ) -> tuple[str, str, str]:
         """Queue a user message for injection at the next tool-result seam.
 
@@ -13238,9 +16846,19 @@ class ChatSession:
         credentials and be misattributed to them.  The interjector must
         wait and send a fresh turn under their own identity.
 
+        ``turn_principal_id`` is the immutable owner captured with the active
+        worker-slot claim.  HTTP/coordinator queue paths pass it during the
+        short window before ``bind_acting_user`` updates the mutable session
+        actor.  Omitting it preserves the direct/CLI behavior and compares
+        against the current effective actor.
+
         ``queue_msg_id`` lets the caller supply the id (so it matches the
         ``send_id`` tracking token threaded through the send) — when
         omitted, an id is generated.
+
+        ``client_send_id`` is retained independently as one-shot browser
+        correlation.  It follows the text through a combined queue flush but
+        never affects queue/storage identity or delivery semantics.
         """
         from turnstone.core.tool_advisory import parse_priority
 
@@ -13251,10 +16869,21 @@ class ChatSession:
             )
 
         interjector = (interjector_user_id or "").strip()
-        if interjector and interjector != self._mcp_effective_user_id:
+        active_principal = (
+            (self._mcp_effective_user_id or "").strip()
+            if turn_principal_id is None
+            else (turn_principal_id or "").strip()
+        )
+        if interjector and interjector != active_principal:
             # Only an authenticated non-acting participant is blocked: the
             # acting user interjecting their own in-flight turn is fine, and
-            # unauthenticated lanes (empty id) keep the pre-existing behaviour.
+            # an unauthenticated interjector (empty id) keeps the pre-existing
+            # internal-lane behaviour. An EMPTY turn principal fails closed:
+            # folding an authenticated send into an unowned in-flight turn
+            # (init worker, internal wake on an ownerless session) would run
+            # the words under the ambient credential context and misattribute
+            # them to that turn's initiator — exactly what this guard exists
+            # to prevent.
             raise CrossUserInterjectionError(
                 "Another participant's turn is in flight — wait for it to "
                 "finish, then send your message so it runs under your own "
@@ -13274,23 +16903,97 @@ class ChatSession:
         with self._queued_lock:
             if len(self._queued_messages) >= self._QUEUE_MAX:
                 raise queue.Full()
-            self._queued_messages[msg_id] = (cleaned, priority)
+            owner = interjector or (active_principal if turn_principal_id is not None else "")
+            self._queued_messages[msg_id] = (
+                (cleaned, priority, owner, client_send_id)
+                if client_send_id
+                else (cleaned, priority, owner)
+            )
         return cleaned, priority, msg_id
+
+    def has_foreign_queued_messages(self, principal_id: str) -> bool:
+        """Whether retained queued text belongs to another participant.
+
+        Called under the workstream worker-slot lock before a fresh worker is
+        claimed.  Empty owners are legacy/internal entries and remain
+        compatible with every principal; authenticated entries are exact.
+        """
+        principal = (principal_id or "").strip()
+        if not principal:
+            return False
+        with self._queued_lock:
+            return self._has_foreign_queued_messages_locked(principal)
+
+    def claim_pending_interjection_wake(
+        self,
+        *,
+        exclude_signature: object | None = None,
+    ) -> tuple[tuple[str, tuple[str, ...]], ...] | None:
+        """Return one compatible queue snapshot token for an automatic wake.
+
+        Called only from a worker's ownership-clear backstop.  Budget refusal,
+        an abandoned generation, and unresolved durable/structural state all
+        require a later explicit user seam rather than an unattended retry.
+        ``exclude_signature`` belongs to the exact wake worker now exiting: if
+        its failed preamble restored the same popped rows, that attempt is not
+        immediately repeated.  The token is otherwise stateless until a wake
+        runner successfully spawns, so a deferred/refused dispatch cannot
+        suppress the competing real worker's own exit handoff.
+
+        The workstream-gone latch is its own blocker arm: the gone
+        discovery CLEARS the pending-commit journal, so the unresolved-
+        persistence check reads False exactly when the workstream can no
+        longer accept any turn — without this arm the claim admits a wake
+        that is structurally guaranteed to fail, burning wake nudges (and,
+        via send()'s internally-converged cancel, destroying the popped
+        rows) at every subsequent worker exit.  Refusal keeps the rows
+        retained; their disposition on a deleted workstream is #1001's.
+        Checked before ``_queued_lock`` like the persistence probe — both
+        take other locks and must not nest inside the queue lock.
+        """
+        if (
+            self._budget_exhausted
+            or self._generation_abandoned
+            or self.is_workstream_gone()
+            or self.has_unresolved_conversation_persistence()
+        ):
+            return None
+        principal = (self._mcp_effective_user_id or "").strip()
+        with self._queued_lock:
+            if not self._queued_messages:
+                return None
+            if principal and self._has_foreign_queued_messages_locked(principal):
+                return None
+            signature = tuple(
+                (message_id, tuple(row)) for message_id, row in self._queued_messages.items()
+            )
+            return None if signature == exclude_signature else signature
+
+    def _has_foreign_queued_messages_locked(self, principal_id: str) -> bool:
+        """Locked half of :meth:`has_foreign_queued_messages`."""
+        return any(
+            (owner := _queued_row_owner(row)) and owner != principal_id
+            for row in self._queued_messages.values()
+        )
 
     def dequeue_message(self, msg_id: str) -> bool:
         """Remove a queued message by ID.  Returns True if removed.
 
-        A miss is RECORDED, not just reported: during the wake handoff's
-        in-flight send the items live in the dispatcher's hands, so the
-        user's retraction cannot reach the queue — the ledger lets a
-        failure-path restore honour it instead of resurrecting a message
-        the user cancelled.  (A miss for an id that was simply already
-        delivered records harmlessly: the ledger is cleared at each pop
-        and consulted only by the restore.)
+        A miss for an id an OPEN pop window holds in flight is RECORDED,
+        not just reported: during the wake handoff's in-flight send the
+        items live in the dispatcher's hands, so the user's retraction
+        cannot reach the queue — the ledger lets a failure-path restore
+        honour it instead of resurrecting a message the user cancelled.
+        A miss for any other id (already delivered, never queued at all)
+        records NOTHING: under per-id ledger discipline no pop, restore,
+        or sweep would ever prune such an entry, so unconditional
+        recording grew the set for the session's whole lifetime — one
+        permanent entry per retract-after-delivery, unbounded for any
+        authenticated writer looping DELETEs with invented ids.
         """
         with self._queued_lock:
             popped = self._queued_messages.pop(msg_id, None)
-            if popped is None:
+            if popped is None and msg_id in self._popped_in_flight:
                 self._retracted_while_popped.add(msg_id)
         return popped is not None
 
@@ -13307,6 +17010,80 @@ class ChatSession:
         worker slot — it mutates ``self.messages``.
         """
         return self._flush_queued_messages()
+
+    def _drain_queue_for_identity_swap(self) -> None:
+        """Settle the queue before /new or /resume swaps this session's ws_id.
+
+        TOTAL: it must be impossible for the escape commands to raise out of
+        here — the CLI dispatches them uncaught, and an unhealthy journal
+        must never block leaving a workstream (round-5 review). Stranded OWN
+        text persists into the CURRENT workstream when the journal can accept
+        it; everything that cannot land is discarded WITH an accurate notice,
+        never carried across the swap. The except arm is deliberately
+        ``(GenerationCancelled, Exception)`` rather than a curated tuple —
+        the direct-flush raise surface (reconcile poison gate, commit
+        refusal, journal admission internals, storage drivers) is open-ended,
+        and a curated tuple is exactly how the last "never raises" version
+        ended up raising.
+        """
+        with self._queued_lock:
+            if not self._queued_messages:
+                # Skip even the flush's direct-mode preamble: the reconcile
+                # poison gate can raise with nothing queued at all.
+                self._retracted_while_popped.clear()
+                self._popped_in_flight.clear()
+                return
+        if self.is_workstream_gone():
+            with self._queued_lock:
+                dropped = len(self._queued_messages)
+                self._queued_messages.clear()
+                self._retracted_while_popped.clear()
+                self._popped_in_flight.clear()
+            if dropped:
+                self.ui.on_info(
+                    f"Discarded {dropped} queued message(s) — the workstream was "
+                    "deleted and can no longer save them."
+                )
+            return
+        flushed_ok = True
+        try:
+            self._flush_queued_messages()
+        except (GenerationCancelled, Exception):
+            flushed_ok = False
+            log.warning("session.identity_swap_flush_failed ws=%s", self._ws_id[:8], exc_info=True)
+        principal = (self._mcp_effective_user_id or "").strip()
+        with self._queued_lock:
+            own = 0
+            foreign = 0
+            for row in self._queued_messages.values():
+                owner = _queued_row_owner(row)
+                if principal and owner and owner != principal:
+                    foreign += 1
+                else:
+                    own += 1
+            self._queued_messages.clear()
+            self._retracted_while_popped.clear()
+            # No pop window can be open here (CLI-only path, single REPL
+            # thread, no CLI wake lane), so this is a belt-and-braces
+            # invariant, not a live close: a stale in-flight id must not
+            # outlive the identity swap and suppress a legitimate later
+            # message on the NEW workstream.
+            self._popped_in_flight.clear()
+        # Per-partition notices: after a SUCCESSFUL flush the leftovers are
+        # provably another participant's; after a failed flush the actor's
+        # own unsaved rows must never be counted as someone else's.
+        if own:
+            self.ui.on_info(
+                f"Discarded {own} of your queued message(s) — they could not be "
+                "saved before leaving this workstream."
+            )
+        if foreign:
+            self.ui.on_info(
+                f"Discarded {foreign} queued message(s) from another participant — "
+                "they cannot follow into a different workstream."
+            )
+        if not flushed_ok and not own and not foreign:
+            self.ui.on_info("Queued messages could not be saved and were discarded.")
 
     def compact_now(self, *, principal_id: str | None = None) -> bool:
         """Manual compaction with send()'s full generation discipline.
@@ -13341,10 +17118,20 @@ class ChatSession:
         pass it explicitly; local/direct callers capture the session's current
         effective user once before claiming the compaction generation.
         """
+        worker_claim = current_worker_claim(self)
         compact_principal = (
-            (self._mcp_effective_user_id or "") if principal_id is None else principal_id
+            (
+                worker_claim.principal_id
+                if worker_claim is not None
+                else (self._mcp_effective_user_id or "")
+            )
+            if principal_id is None
+            else principal_id
         ).strip()
-        my_generation = self._claim_generation(principal_id=compact_principal)
+        my_generation = self._claim_generation(
+            principal_id=compact_principal,
+            expected_cancel_epoch=(worker_claim.cancel_epoch if worker_claim is not None else None),
+        )
         cancel_landed = False
         try:
             compacted = self._compact_messages(my_generation=my_generation)
@@ -13381,6 +17168,7 @@ class ChatSession:
         prefix: str = "",
         *,
         deferred_persistence: list[Callable[[], None]] | None = None,
+        prepared: _QueuedFlushPlan | None = None,
     ) -> bool:
         """Drain queued messages into a single combined user turn.
 
@@ -13400,48 +17188,188 @@ class ChatSession:
         Returns ``True`` when any user row was appended (prefix or
         items), ``False`` when both were empty.
         """
-        queued_text = self._pop_queued_messages_text()
-        if not queued_text and not prefix:
+        if deferred_persistence is None:
+            plan = self._prepare_queued_flush(prefix)
+            return bool(
+                self._direct_commit_reentry(
+                    "Cannot flush queued messages on a closed session",
+                    lambda durable: self._flush_queued_messages(
+                        deferred_persistence=durable,
+                        prepared=plan,
+                    ),
+                )
+            )
+        if prepared is None:
+            raise RuntimeError("queued flush must be prepared outside publication")
+        return self._apply_queued_flush(prepared, deferred_persistence)
+
+    def _prepare_queued_flush(
+        self,
+        prefix: str = "",
+        *,
+        include_queue: bool = True,
+        origin_generation: int = 0,
+        allow_rerank: bool = True,
+    ) -> _QueuedFlushPlan:
+        """Snapshot and rank one prospective queued USER turn outside locks."""
+        worker_claim = current_worker_claim(self)
+        principal = (
+            worker_claim.principal_id
+            if worker_claim is not None and worker_claim.principal_id
+            else (self._mcp_effective_user_id or "")
+        ).strip()
+        items: tuple[tuple[str, _QueuedRow], ...] = ()
+        if include_queue:
+            with self._queued_lock:
+                items = tuple(
+                    (message_id, row)
+                    for message_id, row in self._queued_messages.items()
+                    if not principal or not (owner := _queued_row_owner(row)) or owner == principal
+                )
+        owners = {_queued_row_owner(row) for _message_id, row in items}
+        owners.discard("")
+        if len(owners) > 1:
+            # The snapshot predicate above makes this unreachable for a bound
+            # actor. Keep the invariant explicit for ownerless legacy lanes.
+            raise RuntimeError("queued flush contains multiple principals")
+        if owners:
+            item_principal = next(iter(owners))
+            if principal and item_principal != principal:
+                raise RuntimeError("queued flush principal changed during planning")
+            principal = item_principal
+
+        queued = collections.OrderedDict(items)
+        queued_text = self._render_queued_messages(queued)
+        content = prefix + "\n\n" + queued_text if prefix and queued_text else prefix or queued_text
+        return _QueuedFlushPlan(
+            prefix=prefix,
+            items=items,
+            turn=self._plan_genuine_user_turn(
+                content,
+                principal,
+                origin_generation=origin_generation,
+                allow_rerank=allow_rerank,
+            ),
+        )
+
+    def _apply_queued_flush(
+        self,
+        plan: _QueuedFlushPlan,
+        deferred_persistence: list[Callable[[], None]],
+    ) -> bool:
+        """Admit one prepared queue snapshot and its pointer atomically."""
+        matched: collections.OrderedDict[str, _QueuedRow] = collections.OrderedDict()
+        exact = True
+        with self._queued_lock:
+            for message_id, planned_row in plan.items:
+                current = self._queued_messages.get(message_id)
+                if current is None or tuple(current) != planned_row:
+                    exact = False
+                    continue
+                matched[message_id] = current
+            for message_id in matched:
+                del self._queued_messages[message_id]
+
+        queued_text = self._render_queued_messages(matched)
+        content = (
+            plan.prefix + "\n\n" + queued_text
+            if plan.prefix and queued_text
+            else plan.prefix or queued_text
+        )
+        if not content:
             return False
 
-        if prefix and queued_text:
-            content = prefix + "\n\n" + queued_text
-        elif prefix:
-            content = prefix
-        else:
-            content = queued_text
-        self._append_user_turn(
-            content,
+        pointer = plan.turn.memory_pointer if exact and content == plan.turn.content else ""
+        self._append_genuine_user_turn(
+            dataclasses.replace(
+                plan.turn,
+                content=content,
+                memory_pointer=pointer,
+            ),
             (),
             deferred_persistence=deferred_persistence,
+            client_send_ids=self._client_send_ids_from_queued(matched),
         )
         return True
 
-    def _pop_queued_messages(self) -> dict[str, tuple[str, str]]:
-        """Atomically drain ``_queued_messages``, returning the raw items.
+    def _pop_queued_messages(
+        self,
+    ) -> dict[str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]]:
+        """Partition-pop ``_queued_messages`` by owner, returning the raw items.
 
-        The pop happens under ``_queued_lock`` and is destructive: the
-        caller owns delivery of whatever comes back, and a caller whose
-        delivery can fail restores the SAME mapping via
-        :meth:`_restore_queued_messages` — ids and priorities intact, so
-        the queued-id / send-id correspondence the delete route and the
-        pending rows rely on survives a failed dispatch.
+        Pops entries owned by the CURRENT effective actor plus unowned/legacy
+        entries (``owner == ""`` or a pre-owner 2-tuple); another
+        participant's entries are STRUCTURALLY retained in place — they can
+        never leave the queue under a different actor's credentials, which is
+        the security property the deleted pop-side ownership assert enforced
+        by raising.  Every consumer therefore does the right thing on a
+        mixed-ownership queue with no per-site mode flag: own text flows,
+        foreign text waits for its owner's next turn.  With an EMPTY current
+        principal everything pops — an owned row cannot coexist with an empty
+        actor (admission fails closed on empty principals and the effective
+        id is sticky), so that arm only ever sees all-unowned queues.
+
+        The pop is destructive for the popped subset: the caller owns
+        delivery, and a caller whose delivery can fail restores the SAME
+        mapping via :meth:`_restore_queued_messages` — ids and priorities
+        intact, so the queued-id / send-id correspondence the delete route
+        and the pending rows rely on survives a failed dispatch.
+
+        Retraction-ledger discipline is PER-ID, never wholesale: this pop
+        discards suppression records only for the ids it pops (a fresh pop
+        of a re-queued id starts a clean window), leaving records that guard
+        an OUTER pop window intact — the wake handoff holds its popped items
+        across a full ``send()`` whose own flush seams pop again, and a
+        wholesale clear here would destroy the outer window's retraction and
+        resurrect a message the user cancelled.
         """
+        principal = (self._mcp_effective_user_id or "").strip()
         with self._queued_lock:
-            items = dict(self._queued_messages)
-            self._queued_messages.clear()
-            self._retracted_while_popped.clear()
-        return items
+            popped: dict[
+                str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]
+            ] = {}
+            for mid, row in self._queued_messages.items():
+                owner = _queued_row_owner(row)
+                if principal and owner and owner != principal:
+                    continue
+                popped[mid] = row
+            for mid in popped:
+                del self._queued_messages[mid]
+                self._retracted_while_popped.discard(mid)
+                # Window OPEN, atomic with the delete: a gap would let a
+                # DELETE race in, see the id in neither structure, record
+                # nothing — and the restore would resurrect the retracted
+                # message.  Exactly one close per window: the restore (for
+                # the ids it considered) or ``_close_pop_window`` on every
+                # success / deliberate-discard / exception exit.
+                self._popped_in_flight.add(mid)
+        return popped
 
-    def _restore_queued_messages(self, items: dict[str, tuple[str, str]]) -> None:
+    def _restore_queued_messages(
+        self,
+        items: dict[str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]],
+    ) -> None:
         """Put popped items back at the FRONT of ``_queued_messages``.
 
         The undo half of :meth:`_pop_queued_messages`, for a dispatcher
         whose delivery failed before any turn was appended.  Restores
         unconditionally — the items were already admitted, so
         ``_QUEUE_MAX`` (an admission gate, not a storage invariant) does
-        not re-apply — and ahead of anything queued meanwhile, keeping
-        arrival order.
+        not re-apply — and ahead of anything queued meanwhile.  With
+        partitioned pops "meanwhile" can include another participant's
+        RETAINED rows that arrived earlier; restored rows still merge to the
+        front (bounded: different owners never render in the same turn, so
+        cross-owner order is presentation-free).  Ledger discipline is
+        per-id: only the suppression records this restore consumed (the ids
+        it considered) are discarded, never records guarding another pop
+        window.  The restore IS this window's close: the in-flight
+        removal covers every id it CONSIDERED (including the retracted
+        subset it did not re-insert — a restored-subset-only removal
+        would leak one in-flight id per honoured retraction), atomically
+        with the ledger consume under one lock acquisition, so a re-pop
+        by a new window cannot be stripped by the old window's later
+        cleanup.  A caller whose restore ran must NOT also run
+        ``_close_pop_window`` for the same ids.
         """
         with self._queued_lock:
             merged = {
@@ -13450,10 +17378,33 @@ class ChatSession:
             merged.update(self._queued_messages)
             self._queued_messages.clear()
             self._queued_messages.update(merged)
-            self._retracted_while_popped.clear()
+            self._retracted_while_popped.difference_update(items.keys())
+            self._popped_in_flight.difference_update(items.keys())
+
+    def _close_pop_window(
+        self,
+        items: dict[str, tuple[str, str] | tuple[str, str, str] | tuple[str, str, str, str]],
+    ) -> None:
+        """Close a pop window that ends WITHOUT a restore.
+
+        Success-commit, deliberate-discard (gone latch, cancel
+        no-restore, content-free husks), and exception escapes all end
+        here — per-id, so a nested window's close never touches an outer
+        window's ids.  Callers whose failure arm restored must skip this
+        for the restored window: the restore already closed those ids,
+        and a later blanket discard could strip a marker a NEW window
+        now owns (re-enabling the resurrection bug the ledger exists to
+        prevent).
+        """
+        if not items:
+            return
+        with self._queued_lock:
+            self._popped_in_flight.difference_update(items.keys())
 
     @staticmethod
-    def _render_queued_messages(items: dict[str, tuple[str, str]]) -> str:
+    def _render_queued_messages(
+        items: Mapping[str, _QueuedRow],
+    ) -> str:
         """The one rendering of popped interjection items as USER-turn
         content — ``[IMPORTANT]``-prefixed per item priority, items
         joined by blank lines — shared by :meth:`_flush_queued_messages`
@@ -13470,16 +17421,17 @@ class ChatSession:
         from turnstone.core.tool_advisory import PRIORITY_IMPORTANT
 
         return "\n\n".join(
-            f"[IMPORTANT] {msg}" if pri == PRIORITY_IMPORTANT else msg
-            for msg, pri in items.values()
-            if msg.strip()
+            f"[IMPORTANT] {row[0]}" if row[1] == PRIORITY_IMPORTANT else row[0]
+            for row in items.values()
+            if row[0].strip()
         )
 
-    def _pop_queued_messages_text(self) -> str:
-        """Pop-and-render in one step, for the flush seams whose delivery
-        cannot fail between pop and append (:meth:`_flush_queued_messages`
-        appends the turn immediately)."""
-        return self._render_queued_messages(self._pop_queued_messages())
+    @staticmethod
+    def _client_send_ids_from_queued(
+        items: Mapping[str, _QueuedRow],
+    ) -> tuple[str, ...]:
+        """Return non-empty browser correlation ids in queue arrival order."""
+        return tuple(csid for row in items.values() if (csid := _queued_row_client_send_id(row)))
 
     def _collect_advisories(
         self,
@@ -13532,26 +17484,51 @@ class ChatSession:
         # and tool/any-channel metacog nudges.  Both fire once per batch so a
         # parallel fan-out doesn't paint the same advisory N times.
         if is_last_in_batch:
-            with self._queued_lock:
-                queued_items = list(self._queued_messages.values())
-                self._queued_messages.clear()
-            for text, priority in queued_items:
-                # Drop empty/whitespace interjections (e.g. a bare "!!!" whose
-                # priority prefix ``parse_priority`` strips to "") — an empty
-                # operator turn would fold to an empty fence / paint a blank
-                # bubble.  Frame the rest as the user's words so the turn keeps
-                # user (not operator) authority, including on the native path
-                # where it enters as a real role=system message.
-                if not text.strip():
-                    continue
-                # ``framed`` (preamble + "User message: …") is the model-facing
-                # content — it keeps the user's authority framing on the wire.
-                # The structured meta carries the user's RAW words + priority so
-                # the FE renders a clean "queued message" bubble (the operator
-                # reads the message, not the model-directed preamble) with
-                # priority emphasis.  Both derive from ``(text, priority)``.
-                framed = render_user_interjection(text, priority)
-                specs.append(("user_interjection", framed, {"priority": priority, "message": text}))
+            # THE partitioned pop — not an inline copy of it: only the acting
+            # principal's (and unowned) rows become advisory specs; another
+            # participant's retained rows stay queued and produce NO spec —
+            # an advisory is a model-facing turn, and announcing another
+            # participant's pending text would leak their activity into this
+            # actor's transcript with no sender-scoped rendering on the
+            # model side.  Silence + retention is the correct exit.  Sharing
+            # the method keeps the security-relevant partition predicate and
+            # the ledger/window bookkeeping single-sourced.
+            popped = self._pop_queued_messages()
+            try:
+                for row in popped.values():
+                    text, priority = row[:2]
+                    # Drop empty/whitespace interjections (e.g. a bare "!!!"
+                    # whose priority prefix ``parse_priority`` strips to "")
+                    # — an empty operator turn would fold to an empty fence /
+                    # paint a blank bubble.  Frame the rest as the user's
+                    # words so the turn keeps user (not operator) authority,
+                    # including on the native path where it enters as a real
+                    # role=system message.
+                    if not text.strip():
+                        continue
+                    # ``framed`` (preamble + "User message: …") is the
+                    # model-facing content — it keeps the user's authority
+                    # framing on the wire.  The structured meta carries the
+                    # user's RAW words + priority so the FE renders a clean
+                    # "queued message" bubble (the operator reads the
+                    # message, not the model-directed preamble) with priority
+                    # emphasis.  Both derive from ``(text, priority)``.
+                    framed = render_user_interjection(text, priority)
+                    interjection_meta = {"priority": priority, "message": text}
+                    sender = _queued_row_owner(row)
+                    if sender:
+                        interjection_meta["sender"] = sender
+                    client_send_id = _queued_row_client_send_id(row)
+                    if client_send_id:
+                        interjection_meta["client_send_id"] = client_send_id
+                    specs.append(("user_interjection", framed, interjection_meta))
+            finally:
+                # The advisory lane has NO restore path — a raise between
+                # here and the caller's ``_append_system_turn`` loses the
+                # specs with the closure — so the window closes at this
+                # seam's exit: a longer window buys nothing and only lets
+                # retractions accumulate against ids nothing will restore.
+                self._close_pop_window(popped)
 
             # Metacognitive tool-channel drain.  Queued by
             # ``_queue_tool_advisory`` from the tool_error / repeat
@@ -13567,17 +17544,28 @@ class ChatSession:
     # Phase 2 — approve: display all previews, single prompt (serial)
     # Phase 3 — execute: run approved tools (parallel if multiple)
 
+    def _approval_wait_seconds(self) -> float | None:
+        """Resolve the live human-approval deadline; zero means unbounded."""
+        timeout_seconds = DEFAULT_APPROVAL_TIMEOUT_SECONDS
+        if self._config_store is not None:
+            timeout_seconds = self._config_store.get(
+                "tools.approval_timeout_seconds",
+                DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+            )
+        return float(timeout_seconds) if timeout_seconds > 0 else None
+
     def _push_smart_approval_config(self, items: list[dict[str, Any]]) -> None:
         """Stamp one coherent live Smart Approvals config on a gate batch.
 
         Called just before EVERY ``approve_tools`` — the main loop's and
         each sub-agent gate's — so a hot-reloaded ``judge.*`` change
-        takes effect on the next batch whichever path gates it.  The snapshot
+        takes effect on the next batch whichever path gates it. The snapshot
         rides the private prepared-item channel so parallel task-agent gates
-        cannot combine fields from different hot-reload generations.  Only
+        cannot combine fields from different hot-reload generations. Only
         SessionUIBase carries this gate; CLI/eval UIs keep their own approval
-        behavior.  The feature stays inert unless both the judge and Smart
-        Approvals are enabled in this exact snapshot.
+        behavior. The feature stays inert unless both the judge and Smart
+        Approvals are enabled in this exact snapshot. The same private batch
+        channel carries the independently resolved human wait deadline.
         """
         from turnstone.core.session_ui_base import SessionUIBase, _SmartApprovalConfig
 
@@ -13588,8 +17576,10 @@ class ChatSession:
                 threshold=jc.confidence_threshold if jc is not None else 0.95,
                 wait_seconds=jc.timeout if jc is not None else 0.0,
             )
+            approval_wait_seconds = self._approval_wait_seconds()
             for item in items:
                 item["_smart_approval_config"] = snapshot
+                item["_approval_wait_seconds"] = approval_wait_seconds
 
     def _execute_tools(
         self,
@@ -13659,62 +17649,50 @@ class ChatSession:
                 allow_cancelled=True,
             )
 
+        execution_principal = (
+            (self._mcp_effective_user_id or "") if principal_id is None else principal_id
+        ).strip()
         try:
-            items = [self._safe_prepare_tool(tc) for tc in tool_calls]
+            items = [
+                self._prepare_tool_for_principal(tc, execution_principal, safe=True)
+                for tc in tool_calls
+            ]
             self._check_cancelled(my_generation)
         except GenerationCancelled:
             _stage_unstarted_tool_calls()
             raise
-        execution_principal = (
-            (self._mcp_effective_user_id or "") if principal_id is None else principal_id
-        ).strip()
         for item in items:
-            item["_principal_id"] = execution_principal
             item["_approval_cancel_witness"] = approval_cancel_witness
 
-        # Reject the read+write mix on ``tasks`` within a single
-        # parallel batch.  ``tasks`` mutates an ordered planning
-        # list and supports a ``list`` read; a batch like
-        # ``[tasks(add=...), tasks(list)]`` has unspecified
-        # ordering inside ``_execute_tools.run_one``'s
-        # ThreadPoolExecutor — the read can land before or after
-        # the write and produce inconsistent state to the model.
-        #
-        # All-write and all-read batches are SAFE:
-        #   - Writes serialise under the per-ws lock in
-        #     ``CoordinatorClient.tasks_*``, AND a batch containing
-        #     any ``tasks`` write runs serially in input order (see
-        #     the run-loop branch below) so the final task list
-        #     ordering matches what the model emitted, not the
-        #     scheduler's acquisition order.
-        #   - Reads can't race against anything.
-        #
-        # The rule below only fires on the MIX, so the natural
-        # batch shapes ("add four tasks at once", "list nodes +
-        # list skills + tasks(list) for a planning snapshot") are
-        # both permitted; only the genuinely-broken shape gets
-        # rejected.  Non-tasks siblings paralleled with tasks()
-        # are unaffected — they don't touch the tasks state.
+        # Apply action-dependent consistency rules declared by each preparer.
+        # The executor deliberately knows nothing about tool names: a future
+        # stateful tool opts into the same read/write and serialization policy
+        # by attaching ``_batch_policy`` to its prepared item.
         if len(items) > 1:
-            tasks_items = [
-                it
-                for it in items
-                if it.get("func_name") == "tasks" and not it.get("error") and not it.get("denied")
-            ]
-            if tasks_items:
-                has_read = any(it.get("action") in _TASKS_READ_ACTIONS for it in tasks_items)
-                has_write = any(it.get("action") in _TASKS_WRITE_ACTIONS for it in tasks_items)
-                if has_read and has_write:
-                    for it in tasks_items:
-                        it["error"] = (
-                            "Error: tasks(...) read (`list`) and write "
-                            "(`add` / `update` / `remove` / `reorder`) actions "
-                            "cannot run in the same parallel tool batch — the "
-                            "read-after-write ordering is not guaranteed. "
-                            "All-reads or all-writes are fine; mix only by "
-                            "splitting them across separate assistant turns."
-                        )
-                        it["needs_approval"] = False
+            policy_groups: dict[str, list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+            for item in items:
+                policy = item.get("_batch_policy")
+                if item.get("error") or item.get("denied") or not isinstance(policy, dict):
+                    continue
+                group = str(policy.get("group") or "")
+                access = str(policy.get("access") or "")
+                if group and access in {"read", "write"}:
+                    policy_groups.setdefault(group, []).append((item, policy))
+            for grouped_items in policy_groups.values():
+                accesses = {str(policy["access"]) for _item, policy in grouped_items}
+                if accesses != {"read", "write"}:
+                    continue
+                error = next(
+                    (
+                        str(policy.get("mixed_access_error") or "")
+                        for _item, policy in grouped_items
+                        if policy.get("mixed_access_error")
+                    ),
+                    "Error: read and write actions cannot run in the same tool batch.",
+                )
+                for item, _policy in grouped_items:
+                    item["error"] = error
+                    item["needs_approval"] = False
 
         # Intent validation (advisory, non-blocking).  Detach the prior main
         # generation under the same lifecycle lock used by callback delivery
@@ -13927,7 +17905,7 @@ class ChatSession:
                         raise GenerationCancelled()
                     started_call_ids.add(str(item.get("call_id") or ""))
                 execute_item = item
-                if item.get("func_name") in {"task_agent", "web_fetch"}:
+                if item.get("_needs_origin_context"):
                     # Synchronization objects are execution-only state.  Keep
                     # them out of the prepared item that crosses the intent
                     # judge, approval UI, and any serialization boundary.
@@ -13936,6 +17914,11 @@ class ChatSession:
                         "_origin_cancel_event": execution_cancel_event,
                         "_origin_generation": my_generation,
                     }
+                if item.get("_requires_fresh_system_prefix"):
+                    self._ensure_system_prefix_fresh(
+                        principal_id=str(item.get("_principal_id") or "").strip(),
+                        origin_generation=my_generation,
+                    )
                 result: tuple[str, str | list[dict[str, Any]]] = item["execute"](execute_item)
                 return result
             except (KeyboardInterrupt, GenerationCancelled):
@@ -13983,22 +17966,16 @@ class ChatSession:
             if len(items) == 1:
                 results = [run_one(items[0])]
             else:
-                # When the batch contains any ``tasks`` write, run every
-                # item serially in input order.  ``tasks_add`` appends
-                # under a per-ws lock; a parallel ThreadPoolExecutor's
-                # scheduler-dependent acquisition order would otherwise
-                # produce a final task list whose ordering varies
-                # run-to-run, even though the SET of tasks is consistent.
-                # The model emitted the writes in a particular order;
-                # respecting that is the deterministic shape both
-                # operators and the model expect.  Other batches stay
-                # parallel — the perf payoff is real and there's no
-                # ordering hazard against state outside ``tasks``.
-                has_tasks_write = any(
-                    it.get("func_name") == "tasks" and it.get("action") in _TASKS_WRITE_ACTIONS
-                    for it in items
+                # A preparer can require model-order execution for a write whose
+                # observable result depends on sibling ordering. Serialize the
+                # whole batch so unrelated siblings cannot interleave between
+                # those writes; ordinary batches retain parallel execution.
+                serialize_batch = any(
+                    isinstance(policy := item.get("_batch_policy"), dict)
+                    and bool(policy.get("serialize"))
+                    for item in items
                 )
-                if has_tasks_write:
+                if serialize_batch:
                     results = [run_one(it) for it in items]
                 else:
                     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -14074,6 +18051,12 @@ class ChatSession:
             }
 
     def _prepare_tool(self, tc: dict[str, Any]) -> dict[str, Any]:
+        """Prepare one tool call and stamp its immutable acting principal."""
+        item = self._prepare_tool_item(tc)
+        item["_principal_id"] = self._tool_prepare_principal_id()
+        return item
+
+    def _prepare_tool_item(self, tc: dict[str, Any]) -> dict[str, Any]:
         """Parse a tool call and prepare preview info for display."""
         call_id = tc["id"]
         func_name = tc["function"]["name"].strip()
@@ -14227,13 +18210,14 @@ class ChatSession:
         }
         preparer = preparers.get(func_name)
         if not preparer:
+            prepare_user_id = self._tool_prepare_principal_id() or None
             # Check if this is an MCP tool. Pass the effective ``user_id``
             # (acting user on shared workstreams) so per-user pool tools
             # become reachable here — without this kwarg the gate stays
             # static-only and pool dispatch is structurally unreachable
             # from ``ChatSession._prepare_tool`` (RFC §3, invariant 8).
             if self._mcp_client and self._mcp_client.is_mcp_tool(
-                func_name, user_id=self._mcp_effective_user_id
+                func_name, user_id=prepare_user_id
             ):
                 return self._prepare_mcp_tool(call_id, func_name, args)
             self.ui.on_error(f"Model called unknown tool: {func_name!r}")
@@ -14242,7 +18226,7 @@ class ChatSession:
                 available.extend(
                     sorted(
                         t["function"]["name"]
-                        for t in self._mcp_client.get_tools(user_id=self._mcp_effective_user_id)
+                        for t in self._mcp_client.get_tools(user_id=prepare_user_id)
                     )
                 )
             return {
@@ -14897,13 +18881,15 @@ class ChatSession:
         # SSRF screen \u2014 a NAMED private address is approvable under the
         # tools.allow_private_network opt-in (the header tags it so the
         # operator approves it as what it is).
-        screen_err, private_origin = _screen_tool_url(url, self._allow_private_network())
+        screen_err, private_origin, private_block = _screen_tool_url(
+            url, self._allow_private_network()
+        )
         if screen_err:
             return {
                 "call_id": call_id,
                 "func_name": "web_fetch",
                 "header": "\u2717 web_fetch: blocked (private network)"
-                if "private/internal" in screen_err
+                if private_block
                 else "\u2717 web_fetch: blocked",
                 "preview": f"    {url}",
                 "needs_approval": False,
@@ -14923,6 +18909,7 @@ class ChatSession:
             "url": url,
             "question": question,
             "allow_private_origin": private_origin,
+            "_needs_origin_context": True,
         }
 
     def _prepare_open_preview(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -14969,13 +18956,15 @@ class ChatSession:
             # Same opt-in lane as web_fetch: a named private address is
             # approvable under tools.allow_private_network, tagged so the
             # operator approves it as what it is.
-            screen_err, private_origin = _screen_tool_url(target, self._allow_private_network())
+            screen_err, private_origin, private_block = _screen_tool_url(
+                target, self._allow_private_network()
+            )
             if screen_err:
                 return {
                     "call_id": call_id,
                     "func_name": "open_preview",
                     "header": "✗ open_preview: blocked (private network)"
-                    if "private/internal" in screen_err
+                    if private_block
                     else "✗ open_preview: blocked",
                     "preview": f"    {target}",
                     "needs_approval": False,
@@ -15102,13 +19091,33 @@ class ChatSession:
 
     def _exec_tool_search(self, item: dict[str, Any]) -> tuple[str, str]:
         """Execute a client-side tool search and expand visible tools."""
-        assert self._tool_search is not None
         query = item["query"]
-        results = self._tool_search.search(query)
-        # Expand discovered tools into the visible set
-        names = [t.get("function", {}).get("name", "") for t in results]
-        newly_added = self._tool_search.expand_visible(names)
-        if newly_added and self._persona_tools is not None:
+        while True:
+            with self._acting_user_bind_lock:
+                tool_search = self._tool_search
+                if tool_search is None:
+                    raise RuntimeError("tool search is not active")
+                epoch = self._mcp_projection_epoch
+                change_seq = self._mcp_tools_change_seq
+
+            # Search may invoke BM25 reranking; never hold the actor/catalog lock
+            # across that work.  The identity/version check below retries if a
+            # refresh replaces the manager before expansion commits.
+            results = tool_search.search(query)
+            names = [t.get("function", {}).get("name", "") for t in results]
+            with self._acting_user_bind_lock:
+                if self._publication_shutdown:
+                    raise GenerationCancelled()
+                if (
+                    self._tool_search is not tool_search
+                    or self._mcp_projection_epoch != epoch
+                    or self._mcp_tools_change_seq != change_seq
+                ):
+                    continue
+                newly_added = tool_search.expand_visible(names)
+                recompose = bool(newly_added and self._persona_tools is not None)
+                break
+        if recompose:
             # Under a soft persona set the prompt was composed against the
             # pre-expansion visible names, so tool-gated policy segments
             # for the just-expanded tools were dropped — recompose so the
@@ -15116,7 +19125,7 @@ class ChatSession:
             # array changes on expansion anyway (client-side mode), so the
             # prefix-cache invalidation is already being paid.
             self._init_system_messages()
-        output = self._tool_search.format_search_results(results)
+        output = tool_search.format_search_results(results)
         return item["call_id"], output
 
     def _validate_agent_model_override(
@@ -15196,7 +19205,7 @@ class ChatSession:
         skill_arg = (args.get("skill") or "").strip()
         skill_data: dict[str, Any] | None = None
         if skill_arg:
-            skill_data = get_skill_by_name(skill_arg)
+            skill_data = self._get_skill_by_name(skill_arg)
             if skill_data is None:
                 return {
                     "call_id": call_id,
@@ -15268,7 +19277,11 @@ class ChatSession:
         persona_memory = True
         if persona_arg:
             try:
-                row, perr = resolve_persona_for_kind(get_storage(), persona_arg, "interactive")
+                row, perr = resolve_persona_for_kind(
+                    get_storage(),
+                    persona_arg,
+                    "interactive",
+                )
                 if perr or row is None:
                     detail = perr or f"unknown persona {persona_arg!r}"
                     return {
@@ -15332,192 +19345,184 @@ class ChatSession:
             "persona_tools": persona_tools,
             "persona_mcp": persona_mcp,
             "persona_memory": persona_memory,
+            "_needs_origin_context": True,
+            "_requires_fresh_system_prefix": True,
         }
 
-    def _resolve_scope_id(self, scope: str) -> str:
-        """Map a scope name to its scope_id.
+    def _memory_principal_id(self, principal_id: str | None = None) -> str:
+        """Resolve the actor for memory authorization."""
+        if principal_id is not None:
+            return principal_id.strip()
+        return (self._acting_user_id or self._user_id or "").strip()
 
-        ``coordinator`` is COORDINATOR-only \u2014 the coord can save and
-        read memories in its own private namespace, but its child
-        interactive workstreams cannot see or write the row.  This
-        closes the cross-session prompt-injection lane that an
-        adversarially-steered child would otherwise have through the
-        coord's system message: the coord's children consume external
-        content (MCP tool output, attachments) which can be steered to
-        plant instructions, and the new scope must not become a
-        delivery channel back into the parent's prompt.
+    def _memory_access(self, principal_id: str | None = None) -> _MemoryAccess:
+        """Resolve live project access for one immutable acting principal."""
+        actor = self._memory_principal_id(principal_id)
+        attached = self._memory_attached_project_id
+        project_id = ""
+        project_name = ""
+        project_writable = False
+        if actor and attached:
+            from turnstone.core.auth import resolve_project_access
 
-        The containment gate is the session KIND (children are always
-        INTERACTIVE \u2014 :meth:`_validate_scope` rejects them before this
-        resolver runs), not secrecy of the scope_id value.  That is
-        what lets the coord scope key on the durable ``user_id``
-        (shared with children, visible cluster-wide as display
-        metadata) without widening the write surface: no lane \u2014 memory
-        tool or REST (``_VALID_MEMORY_SCOPES`` in ``server.py`` omits
-        ``coordinator``) \u2014 accepts a caller-supplied coordinator
-        scope_id.
+            project_access = resolve_project_access(actor, attached, storage=get_storage())
+            if project_access.can_read and project_access.state == "active":
+                project_id = attached
+                project_name = project_access.name
+                project_writable = project_access.can_write
+        return _MemoryAccess(
+            principal_id=actor,
+            attached_project_id=attached,
+            project_id=project_id,
+            project_name=project_name,
+            project_writable=project_writable,
+        )
+
+    def project_name_for_principal(self, principal_id: str) -> str:
+        """Return the active attached-project name visible to ``principal_id``.
+
+        The principal is explicit so connection-level presentation never reads
+        the session's mutable acting-user binding. Project rename, archival,
+        and access revocation therefore take effect on the next lookup.
         """
+        return self._memory_access(principal_id).project_name
+
+    def _resolve_scope_id(self, scope: str, access: _MemoryAccess | None = None) -> str:
+        """Map a validated scope to the actor-specific storage key."""
+        resolved = access or self._memory_access()
         if scope == "workstream":
             return self._ws_id
         if scope == "user":
-            return self._user_id
+            return resolved.principal_id
         if scope == "coordinator":
-            return self._coordinator_scope_id()
+            return self._coordinator_scope_id(resolved)
         if scope == "project":
-            return self._project_id
+            return resolved.project_id
         return ""
 
-    def _coordinator_scope_id(self) -> str:
-        """Return the user_id anchoring the ``coordinator`` memory scope, or ``""``.
+    def _coordinator_scope_id(self, access: _MemoryAccess | None = None) -> str:
+        """Return this coordinator actor's private memory namespace."""
+        if self._kind != WorkstreamKind.COORDINATOR:
+            return ""
+        return (access or self._memory_access()).principal_id
 
-        Only a coordinator session has a coord scope \u2014 returns
-        ``self._user_id`` for ``kind == COORDINATOR``, ``""`` otherwise.
-        Keying on the user (not the ws_id) makes the namespace durable:
-        every coordinator session the same user runs shares one
-        orchestration memory, so notes survive close/reopen.  Children
-        of a coord get an empty scope_id, which :meth:`_validate_scope`
-        translates into an explicit reject \u2014 children must use
-        ``workstream`` or ``user`` scope for their own memories.
+    @staticmethod
+    def _memory_prepare_error(call_id: str, header: str, error: str) -> dict[str, Any]:
+        return {
+            "call_id": call_id,
+            "func_name": "memory",
+            "header": header,
+            "preview": "",
+            "needs_approval": False,
+            "error": error,
+        }
 
-        ``""`` for an unauthenticated coordinator is unreachable in
-        practice (``__init__`` refuses to construct one) but kept
-        fail-closed: an empty scope_id never resolves to a readable or
-        writable namespace.
-
-        See :meth:`_resolve_scope_id`'s docstring for the security
-        rationale (cross-session prompt-injection containment).
-        """
-        if self._kind == WorkstreamKind.COORDINATOR:
-            return self._user_id
-        return ""
-
-    def _validate_scope(self, scope: str, call_id: str) -> dict[str, Any] | None:
-        """Return an error dict if scope is invalid, None if OK.
-
-        Coord sessions are isolated to coord-scope: they reject every
-        other scope (``global`` / ``workstream`` / ``user``) so the
-        coord's memory namespace stays focused on orchestration and
-        doesn't accidentally mutate or read user-context rows.
-
-        Interactive sessions reject ``coordinator`` for the symmetric
-        reason \u2014 coord-scope rows belong to a per-user namespace read
-        only by that user's COORDINATOR sessions, and an IC writer
-        (children share the parent's user_id, so the kind check is the
-        gate) could otherwise be a cross-session prompt-injection lane
-        into the parent coord's system message.
-        """
-        if scope == "user" and not self._user_id:
-            return {
-                "call_id": call_id,
-                "func_name": "memory",
-                "header": "\u2717 memory: user scope requires authentication",
-                "preview": "",
-                "needs_approval": False,
-                "error": "Error: 'user' scope requires authenticated user identity",
-            }
-        if scope == "project" and not self._project_id:
-            return {
-                "call_id": call_id,
-                "func_name": "memory",
-                "header": "✗ memory: not attached to an accessible project",
-                "preview": "",
-                "needs_approval": False,
-                "error": (
-                    "Error: 'project' scope requires this workstream to be "
-                    "attached to a project you can access."
-                ),
-            }
-        if (
-            scope == "coordinator"
-            and self._kind == WorkstreamKind.COORDINATOR
-            and not self._user_id
-        ):
-            # Backstop for the save lane: search/list reject empty
-            # scope_ids in _exec_memory, but save would otherwise write
-            # a ("coordinator", "") row shared by every unauthenticated
-            # session. Unreachable through real hosts (__init__ refuses
-            # COORDINATOR without a user_id); guards test doubles and
-            # future hosts. Kind-scoped so non-coordinator callers keep
-            # the clearer kind-mismatch error below regardless of their
-            # auth state.
-            return {
-                "call_id": call_id,
-                "func_name": "memory",
-                "header": "\u2717 memory: coordinator scope requires authentication",
-                "preview": "",
-                "needs_approval": False,
-                "error": "Error: 'coordinator' scope requires authenticated user identity",
-            }
-        if self._kind == WorkstreamKind.COORDINATOR and scope not in (
-            "coordinator",
-            "project",
-        ):
-            return {
-                "call_id": call_id,
-                "func_name": "memory",
-                "header": f"\u2717 memory: scope '{scope}' unavailable to coordinator",
-                "preview": "",
-                "needs_approval": False,
-                "error": (
-                    f"Error: '{scope}' scope is not available to coordinator "
-                    "sessions. Coord sessions only see and write the "
-                    "'coordinator' scope \u2014 their orchestration namespace is "
-                    "isolated from the user's interactive memory. Use "
-                    "scope='coordinator' or omit scope (it defaults to "
-                    "'coordinator' for coord sessions)."
-                ),
-            }
-        if scope == "coordinator" and self._kind != WorkstreamKind.COORDINATOR:
-            return {
-                "call_id": call_id,
-                "func_name": "memory",
-                "header": "\u2717 memory: coordinator scope unavailable",
-                "preview": "",
-                "needs_approval": False,
-                "error": (
-                    "Error: 'coordinator' scope is only valid for coordinator "
-                    "sessions. This is an interactive workstream \u2014 use "
-                    "'workstream' or 'user' scope for context private to this "
-                    "session, or ask the parent coordinator to manage shared "
-                    "context on your behalf."
-                ),
-            }
+    def _validate_scope(
+        self,
+        scope: str,
+        call_id: str,
+        *,
+        access: _MemoryAccess | None = None,
+        write: bool = False,
+    ) -> dict[str, Any] | None:
+        """Validate one exact scope against kind, actor identity, and live ACL."""
+        resolved = access or self._memory_access()
+        allowed = (
+            {"coordinator", "project"}
+            if self._kind == WorkstreamKind.COORDINATOR
+            else {"global", "workstream", "user", "project"}
+        )
+        if scope not in allowed:
+            guidance = (
+                "Use coordinator, project, or omit scope to inherit the active target."
+                if self._kind == WorkstreamKind.COORDINATOR
+                else "Use global, workstream, user, or an accessible attached project."
+            )
+            return self._memory_prepare_error(
+                call_id,
+                f"✗ memory: scope '{scope}' unavailable",
+                f"Error: scope '{scope}' is unavailable to this workstream kind. {guidance}",
+            )
+        if scope in {"user", "coordinator"} and not resolved.principal_id:
+            return self._memory_prepare_error(
+                call_id,
+                f"✗ memory: {scope} scope requires authentication",
+                f"Error: '{scope}' scope requires an authenticated acting user",
+            )
+        if scope == "project":
+            if not resolved.attached_project_id:
+                reason = "this workstream is not attached to a project"
+            elif not resolved.project_id:
+                reason = "the acting user cannot access the active attached project"
+            elif write and not resolved.project_writable:
+                reason = "the acting user has read-only access to the attached project"
+            else:
+                reason = ""
+            if reason:
+                operation = "changed" if write else "read"
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory: project scope unavailable",
+                    f"Error: {reason}; project-scoped memory cannot be {operation}.",
+                )
         return None
 
-    def _default_memory_scope(self) -> str:
-        """Default ``scope`` for a memory(action='save') with no explicit scope.
-
-        An attached, WRITABLE project wins for both kinds: work done inside a
-        project lands in the project bucket by default instead of leaking into
-        the kind default (``global`` / ``coordinator``).  The model can still
-        target another scope explicitly (a genuine cross-project ``user`` fact,
-        say).  A read-only project session keeps the kind default — it can't
-        write the project anyway, so defaulting there would only hit the
-        write-gate.
-
-        Otherwise: coord sessions default to ``coordinator`` (the only scope
-        they can write); interactive sessions default to ``global``.
-        """
-        if self._project_id and self._project_writable:
+    def _inherited_memory_scope(self, access: _MemoryAccess | None = None) -> str:
+        """Return the single target inherited by unscoped save/get/delete."""
+        resolved = access or self._memory_access()
+        if resolved.attached_project_id:
             return "project"
         if self._kind == WorkstreamKind.COORDINATOR:
             return "coordinator"
         return "global"
 
-    def _implicit_scope_walk(self) -> tuple[str, ...]:
-        """Walk for memory(action='get'/'delete') with no explicit scope.
+    def _memory_scope_miss_hint(
+        self,
+        name: str,
+        scopes: list[tuple[str, str]],
+        *,
+        action: str,
+        access: _MemoryAccess | None = None,
+    ) -> str:
+        """Point a wrong-scope miss at visible same-name rows."""
+        resolved = access or self._memory_access()
+        attempted = set(scopes)
+        visible = self._visible_scopes(resolved)
+        matches = set(
+            find_structured_memory_scopes(
+                name,
+                visible,
+                acting_principal_id=resolved.principal_id,
+            )
+        )
+        matching_scopes = [
+            scope
+            for scope, scope_id in visible
+            if (scope, scope_id) not in attempted and (scope, scope_id) in matches
+        ]
+        if not matching_scopes:
+            return ""
+        if len(matching_scopes) == 1:
+            scope = matching_scopes[0]
+            if action == "delete" and scope == "project" and not resolved.project_writable:
+                return (
+                    "\nHint: a memory with this name exists in scope='project', "
+                    "but your project access is read-only."
+                )
+            return (
+                f"\nHint: a memory with this name exists in scope='{scope}'; "
+                f"retry with scope='{scope}'."
+            )
+        rendered_scopes = ", ".join(f"'{scope}'" for scope in matching_scopes)
+        hint = (
+            "\nHint: memories with this name exist in visible scopes: "
+            f"{rendered_scopes}; retry with the intended scope explicitly."
+        )
+        if action == "delete" and "project" in matching_scopes and not resolved.project_writable:
+            hint += " Project scope is read-only."
+        return hint
 
-        Coord sessions only walk ``coordinator`` \u2014 anything else would
-        search namespaces the coord can't write to.  Interactive sessions
-        keep the narrowest-first walk (workstream \u2192 user \u2192 global); a
-        ``coordinator`` step there would always resolve to empty
-        scope_id and be a wasted lookup.
-        """
-        if self._kind == WorkstreamKind.COORDINATOR:
-            return ("coordinator",)
-        return _IMPLICIT_SCOPE_WALK
-
-    def _visible_memory_count(self) -> int:
+    def _visible_memory_count(self, access: _MemoryAccess | None = None) -> int:
         """Count memories visible to this session.
 
         Coord sessions are isolated to their own coord-scope namespace —
@@ -15527,189 +19532,176 @@ class ChatSession:
         (same user, different workstream) into the coord's system
         message, which the coord shouldn't be reasoning over.
         """
-        if self._kind == WorkstreamKind.COORDINATOR:
-            scope_id = self._coordinator_scope_id()
-            n = 0
-            if scope_id:
-                n += count_structured_memories(scope="coordinator", scope_id=scope_id)
-            if self._project_id:
-                n += count_structured_memories(scope="project", scope_id=self._project_id)
-            return n
-        n = count_structured_memories(scope="global")
-        n += count_structured_memories(scope="workstream", scope_id=self._ws_id)
-        if self._user_id:
-            n += count_structured_memories(scope="user", scope_id=self._user_id)
-        if self._project_id:
-            n += count_structured_memories(scope="project", scope_id=self._project_id)
-        return n
+        resolved = access or self._memory_access()
+        total = 0
+        for scope, scope_id in self._visible_scopes(resolved):
+            try:
+                total += count_structured_memories(
+                    scope=scope,
+                    scope_id=scope_id,
+                    acting_principal_id=resolved.principal_id,
+                )
+            except Exception:
+                log.warning("Failed to count structured memories", exc_info=True)
+        return total
 
-    def _visible_scopes(self) -> list[tuple[str, str]]:
+    def _visible_scopes(self, access: _MemoryAccess | None = None) -> list[tuple[str, str]]:
         """Return the (scope, scope_id) pairs visible to this session.
 
         Coord sessions see their coord-scope; interactive sessions see global +
         their workstream + their user (when uid present).  Either kind also sees
-        its attached ``project`` scope when the session resolved read access to a
-        project at construction.  Drives the single-query visibility helpers.
+        its attached ``project`` scope when the acting principal currently has
+        read access. Drives the single-query visibility helpers.
         """
+        resolved = access or self._memory_access()
         if self._kind == WorkstreamKind.COORDINATOR:
-            scope_id = self._coordinator_scope_id()
-            # Fail-closed on an empty scope_id (unreachable through real hosts —
-            # __init__ refuses anonymous coordinators): the storage helpers treat
-            # a falsy scope_id as "no scope_id filter" (that's how ``global``
-            # works), so a ("coordinator", "") pair would read EVERY user's
-            # coordinator rows instead of none.
+            scope_id = self._coordinator_scope_id(resolved)
+            # Fail closed on an empty scope id (unreachable through real hosts,
+            # because __init__ refuses anonymous coordinators): no anonymous
+            # coordinator namespace exists.
             coord_scopes: list[tuple[str, str]] = []
             if scope_id:
                 coord_scopes.append(("coordinator", scope_id))
             # A coordinator attached to a project also recalls the shared project
             # bucket (read + write), alongside its isolated coordinator scope.
-            if self._project_id:
-                coord_scopes.append(("project", self._project_id))
+            if resolved.project_id:
+                coord_scopes.append(("project", resolved.project_id))
             return coord_scopes
         scopes: list[tuple[str, str]] = [("global", ""), ("workstream", self._ws_id)]
-        if self._user_id:
-            scopes.append(("user", self._user_id))
-        if self._project_id:
-            scopes.append(("project", self._project_id))
+        if resolved.principal_id:
+            scopes.append(("user", resolved.principal_id))
+        if resolved.project_id:
+            scopes.append(("project", resolved.project_id))
         return scopes
 
-    def _list_visible_memories(self, mem_type: str = "", limit: int = 50) -> list[dict[str, str]]:
-        """List memories visible to this session with optional type filter.
+    def _invalidate_system_prefix(self) -> None:
+        """Mark the actor/identity-dependent prompt prefix for recomposition."""
+        with self._system_prefix_lock:
+            self._system_prefix_epoch = getattr(self, "_system_prefix_epoch", 0) + 1
+            self._system_prefix_dirty = True
 
-        Single SQL round-trip — collapses the prior per-scope fan-out.
-        See :meth:`_visible_memory_count` for the coord-isolation rule.
-        """
-        return list_visible_structured_memories(
-            self._visible_scopes(), mem_type=mem_type, limit=limit
-        )
-
-    def _search_visible_memories(
+    def _plan_memory_pointer(
         self,
-        query: str,
-        mem_type: str = "",
-        limit: int = 20,
+        user_message: str,
         *,
-        cache_updates: dict[tuple[str, str, int], list[dict[str, str]]] | None = None,
-    ) -> list[dict[str, str]]:
-        """Search memories visible to this session (scope-filtered).
+        access: _MemoryAccess,
+        origin_generation: int = 0,
+        allow_rerank: bool = True,
+    ) -> str:
+        """Build a live metadata-only pointer for one genuine user turn."""
+        if not user_message.strip() or not self._nudges_enabled("memory_pointer"):
+            return ""
+        try:
+            rows = get_storage().list_visible_memory_index_entries(
+                self._visible_scopes(access),
+                acting_principal_id=access.principal_id,
+            )
+            threshold = self._bm25_rerank_threshold()
+            relevant = score_memories(
+                rows,
+                user_message,
+                k=self._mem_cfg.relevance_k,
+                reranker=(
+                    self._bm25_reranker(
+                        threshold,
+                        origin_generation=origin_generation,
+                    )
+                    if allow_rerank
+                    else None
+                ),
+                rerank_filters=threshold > 0,
+            )
+        except Exception:
+            log.warning("memory.pointer_planning_failed", exc_info=True)
+            return ""
+        return render_memory_pointer(relevant)
 
-        Single SQL round-trip with a per-turn cache: ``_init_system_messages``
-        is invoked many times within a turn (state transitions, MCP refresh,
-        tool results) and the recent-context query is identical across them.
-        Cache is cleared on each new user turn and after memory writes/deletes.
-        See :meth:`_visible_memory_count` for the coord-isolation rule.
-        """
-        cache_key = (query, mem_type, limit)
-        cached = self._mem_search_cache.get(cache_key)
-        if cached is not None:
-            return cached
-        if cache_updates is not None:
-            planned = cache_updates.get(cache_key)
-            if planned is not None:
-                return planned
-        rows = search_visible_structured_memories(
-            query, self._visible_scopes(), mem_type=mem_type, limit=limit
-        )
-        if cache_updates is None:
-            self._mem_search_cache[cache_key] = rows
-        else:
-            cache_updates[cache_key] = rows
-        return rows
-
-    def _invalidate_memory_cache(self) -> None:
-        """Drop the per-turn search cache; call on user-turn append + memory writes."""
-        self._mem_search_cache.clear()
-        self._touched_memory_keys.clear()
-
-    def _select_memory_candidates(
+    def _plan_genuine_user_turn(
         self,
-        context: str,
+        content: str,
+        principal_id: str,
         *,
-        cache_updates: dict[tuple[str, str, int], list[dict[str, str]]] | None = None,
-    ) -> tuple[list[dict[str, str]], str]:
-        """Pick the candidate set fed into BM25 ranking.
-
-        Returns ``(memories, source_label)`` where source is one of:
-        ``recency`` (no context, or search returned nothing),
-        ``search`` (search saturated the fetch_limit budget alone), or
-        ``union`` (search hits ∪ recency, deduped by memory_id).
-
-        Invariant: the candidate pool is always a SUPERSET of the
-        recency-only pool the original bug used — recency is fully
-        preserved (not truncated) whenever it gets unioned.  Worst
-        case the union is 2 × fetch_limit candidates (~100 with
-        defaults), which BM25 ranks in pure Python in well under a
-        millisecond.  BM25's score>0 cutoff in bm25.py drops anything
-        that doesn't match the query, so unranked recency tail items
-        cost nothing on irrelevant candidates while saving the
-        relevant ones.
-
-        Capping the union at fetch_limit (the prior behavior) would
-        evict the recency tail when search added distinct hits — and
-        the recency tail is exactly where ancient-but-recently-touched
-        memories live, which is the recall the PR sets out to improve.
-        """
-        fetch_limit = self._mem_cfg.fetch_limit
-        if not context:
-            return self._list_visible_memories(limit=fetch_limit), "recency"
-        search_hits = self._search_visible_memories(
-            context,
-            limit=fetch_limit,
-            cache_updates=cache_updates,
+        origin_generation: int = 0,
+        allow_rerank: bool = True,
+    ) -> _GenuineUserTurnPlan:
+        """Plan all metadata derived from an admitted human turn."""
+        principal = principal_id.strip()
+        return _GenuineUserTurnPlan(
+            content=content,
+            principal_id=principal,
+            memory_pointer=self._plan_memory_pointer(
+                content,
+                access=self._memory_access(principal),
+                origin_generation=origin_generation,
+                allow_rerank=allow_rerank,
+            ),
         )
-        if len(search_hits) >= fetch_limit:
-            return search_hits, "search"
-        recency = self._list_visible_memories(limit=fetch_limit)
-        seen = {m["memory_id"] for m in search_hits}
-        extra = [m for m in recency if m["memory_id"] not in seen]
-        if not search_hits:
-            return extra, "recency"
-        return search_hits + extra, ("union" if extra else "search")
 
-    @staticmethod
-    def _memory_keys(rows: list[dict[str, str]]) -> list[tuple[str, str, str]]:
-        """Build ``(name, scope, scope_id)`` touch keys from memory rows.
+    def _append_genuine_user_turn(
+        self,
+        plan: _GenuineUserTurnPlan,
+        attachments: list[Attachment] | tuple[Attachment, ...],
+        *,
+        send_id: str | None = None,
+        deferred_persistence: list[Callable[[], None]],
+        client_send_ids: tuple[str, ...] = (),
+        after_user: Callable[[], None] | None = None,
+    ) -> None:
+        """Publish a human USER row and its derived turns in ledger order."""
+        self._append_user_turn(
+            plan.content,
+            attachments,
+            send_id=send_id,
+            deferred_persistence=deferred_persistence,
+            sender_user_id=plan.principal_id,
+            client_send_ids=client_send_ids,
+        )
+        self._memory_index_admission_generation = self._generation
+        if after_user is not None:
+            after_user()
+        if plan.memory_pointer:
+            self._append_system_turn(
+                "memory_pointer",
+                plan.memory_pointer,
+                deferred_persistence=deferred_persistence,
+            )
 
-        The storage read helpers return ``SELECT *`` rows, so all three
-        columns are present.
-        """
-        return [(r.get("name", ""), r.get("scope", ""), r.get("scope_id", "")) for r in rows]
-
-    def _touch_injected_memories(self, rows: list[dict[str, str]]) -> None:
-        """Touch the memories injected into the system prefix this turn.
-
-        ``_init_system_messages`` recomposes many times per turn; gate on the
-        per-turn touched-key set so each surfaced memory is counted at most
-        once between user turns.  Best-effort: the facade swallows storage
-        errors, so a failed touch never breaks composition.
-        """
-        fresh = [k for k in self._memory_keys(rows) if k not in self._touched_memory_keys]
-        if not fresh:
-            return
-        self._touched_memory_keys.update(fresh)
-        touch_structured_memories(fresh)
-
-    def _touch_read_memories(self, rows: list[dict[str, str]]) -> None:
-        """Touch memories returned by an explicit memory-tool read.
-
-        A search/get is a distinct user-driven access each time it runs, so
-        these are counted unconditionally (not subject to the composition
-        per-turn dedup).  Best-effort via the facade.
-        """
-        touch_structured_memories(self._memory_keys(rows))
+    def _memory_index_backpressure(self, access: _MemoryAccess) -> str:
+        """Return a post-save soft-cap notice for the writer's live envelope."""
+        try:
+            report = prospective_memory_index(
+                self._visible_scopes(access),
+                acting_principal_id=access.principal_id,
+            )
+        except Exception:
+            log.warning("memory.index_backpressure_failed", exc_info=True)
+            return (
+                "\nNotice: complete live index health could not be calculated; "
+                "check admin memory index health before adding more entries."
+            )
+        memory_config = self._mem_cfg
+        budget = memory_config.index_budget_chars
+        char_count = report["char_count"]
+        notices: list[str] = []
+        if memory_config.model_index_over_budget_notice and char_count > budget:
+            notices.append(
+                f"complete live index is above its configured soft budget "
+                f"({char_count:,} / {budget:,} characters)"
+            )
+        invalid = report["invalid_description_count"]
+        if invalid:
+            notices.append(f"{invalid} legacy entries need authored descriptions")
+        return f"\nNotice: {'; '.join(notices)}." if notices else ""
 
     def _check_metacognitive_nudge(self, user_message: str) -> tuple[str, str] | None:
         """Check if a metacognitive nudge should fire for *user_message*.
 
-        Called *before* the user turn is appended to ``self.messages``,
-        so ``msg_count`` counts the about-to-be-appended message — this
-        keeps the ``should_nudge('start', ..., message_count=1)`` semantic
-        intact (one user message = first turn).
+        Called *before* the user turn is appended to ``self.messages``, so
+        ``msg_count`` includes the about-to-be-appended message.
 
         Returns ``(nudge_type, nudge_text)`` or ``None``.
         """
-        memory_count = self._visible_memory_count()
-        planned = self._plan_metacognitive_nudge(user_message, memory_count=memory_count)
+        planned = self._plan_metacognitive_nudge(user_message)
         if planned:
             record_nudge(planned[0], self._metacog_state)
         return planned
@@ -15717,8 +19709,6 @@ class ChatSession:
     def _plan_metacognitive_nudge(
         self,
         user_message: str,
-        *,
-        memory_count: int,
     ) -> tuple[str, str] | None:
         """Return an eligible user nudge without consuming its cooldown."""
         # Wake-channel guard: don't re-detect nudges on the synthetic
@@ -15728,37 +19718,30 @@ class ChatSession:
         # text changes shouldn't be load-bearing for correctness.
         if self._wake_source_tag:
             return None
-        # Every type this detector emits (start/correction/completion) is
-        # memory-directed, so the persona memory lever gates the whole pass.
-        if not self._nudges_enabled("start"):
-            return None
         msg_count = len(self.messages) + 1
         cd = self._mem_cfg.nudge_cooldown
 
-        if nudge_allowed(
-            "start",
-            self._metacog_state,
-            message_count=msg_count,
-            memory_count=memory_count,
-            cooldown_secs=cd,
-        ):
-            return ("start", format_nudge("start"))
-
-        if detect_correction(user_message) and nudge_allowed(
-            "correction",
-            self._metacog_state,
-            message_count=msg_count,
-            memory_count=memory_count,
-            cooldown_secs=cd,
+        if (
+            self._nudges_enabled("correction")
+            and detect_correction(user_message)
+            and nudge_allowed(
+                "correction",
+                self._metacog_state,
+                message_count=msg_count,
+                cooldown_secs=cd,
+            )
         ):
             return ("correction", format_nudge("correction"))
 
-        if detect_completion(user_message) and nudge_allowed(
-            "completion",
-            self._metacog_state,
-            message_count=msg_count,
-            memory_count=memory_count,
-            cooldown_secs=cd,
+        if (
+            self._nudges_enabled("completion")
+            and detect_completion(user_message)
+            and nudge_allowed(
+                "completion",
+                self._metacog_state,
+                message_count=msg_count,
+                cooldown_secs=cd,
+            )
         ):
             return ("completion", format_nudge("completion"))
 
@@ -15770,7 +19753,7 @@ class ChatSession:
         Drains in ``_emit_pending_user_nudges`` and is appended as a
         first-class ``{"role": "system"}`` turn AFTER the user turn.  Used
         for nudges that respond to the user's message: ``correction``,
-        ``resume``, ``start``, ``completion``.  (``denial`` is user
+        ``resume``, ``completion``. (``denial`` is user
         behaviour too, but it responds to a specific TOOL BATCH — it
         rides the tool channel so it lands with the denied results.)
 
@@ -15803,7 +19786,7 @@ class ChatSession:
         rule).  Each drained nudge becomes one ``{"role": "system",
         "_source": <nudge_type>, ...}`` turn via :meth:`_append_system_turn`
         — the source is the nudge type (``correction`` / ``resume`` /
-        ``start`` / ``completion`` / ``idle_children`` /
+        ``completion`` / ``idle_children`` /
         ``watch_triggered``) and any optional metadata (e.g.
         ``watch_triggered``'s ``watch_name``) rides as sibling keys.
         ``_append_system_turn`` persists each row and fires the live
@@ -15963,19 +19946,47 @@ class ChatSession:
         # queued for the user's next real send, where the approval
         # prompt has someone in front of it, and falls through to the
         # wake drain so this worker's exit keeps its convergence.
-        if not self._budget_exhausted:
+        # The gone latch takes the same rule for the same reason: the
+        # admission refusal surfaces as GenerationCancelled, which
+        # send()'s own cancel finalizer converges INTERNALLY (no
+        # re-raise), so neither except arm below would run and the
+        # popped rows would be destroyed with no restore, no log, no
+        # notice.  This delivery-site gate must be at least as strong as
+        # the claim gate that normally protects it — a nudge-driven wake
+        # reaches here without ever consulting the claim.
+        if not self._budget_exhausted and not self.is_workstream_gone():
+            # Partitioned pop: only the wake lane's effective principal's
+            # (and unowned) rows fold into the interjection send; another
+            # participant's retained rows stay queued for their owner and the
+            # wake falls through to the nudge drain below.
             popped = self._pop_queued_messages()
             interjection = self._render_queued_messages(popped)
+            client_send_ids = self._client_send_ids_from_queued(popped)
             if interjection:
-                dropped = self._nudge_queue.clear_channels({WAKE_CHANNEL})
-                log.info(
-                    "wake_nudge.interjection_owns_seam ws=%s dropped_wake_nudges=%d",
-                    self._ws_id[:8],
-                    dropped,
-                )
+                # ``appended_before`` first, then EVERYTHING that can raise
+                # inside the try: a raise out of ``clear_channels`` lands in
+                # the BaseException arm with nothing appended and restores —
+                # outside the try it would destroy the popped rows AND leak
+                # the open window.
                 appended_before = len(self.messages)
+                window_closed = False
                 try:
-                    self.send(interjection)
+                    dropped = self._nudge_queue.clear_channels({WAKE_CHANNEL})
+                    log.info(
+                        "wake_nudge.interjection_owns_seam ws=%s dropped_wake_nudges=%d",
+                        self._ws_id[:8],
+                        dropped,
+                    )
+                    # Queued items that predate browser correlation ids keep
+                    # the established plain ``send(text)`` handoff: some
+                    # embedded session adapters expose exactly that surface
+                    # and do not accept a redundant empty keyword.  Building
+                    # the keyword only when there is something to correlate
+                    # keeps that promise with one call shape.
+                    send_kwargs: dict[str, Any] = (
+                        {"client_send_ids": client_send_ids} if client_send_ids else {}
+                    )
+                    self.send(interjection, **send_kwargs)
                 except GenerationCancelled:
                     # Same containment as the wake send below: this
                     # method IS the wake worker's run() closure and
@@ -16011,18 +20022,33 @@ class ChatSession:
                     # items); a worker-exit re-check of the interjection
                     # queue would close that window structurally.
                     if len(self.messages) == appended_before:
+                        # The restore is this window's close — it removes
+                        # the in-flight markers for every id it considered,
+                        # atomically with its ledger consume.  The finally
+                        # below must then SKIP: a blanket close after the
+                        # restore could strip a marker a new window already
+                        # re-popped (the resurrection re-enabler).
                         self._restore_queued_messages(popped)
+                        window_closed = True
                     raise
+                finally:
+                    if not window_closed:
+                        # Success-commit, the deliberate no-restore cancel
+                        # arm, and appended-then-raised all end the window
+                        # without a restore.
+                        self._close_pop_window(popped)
                 return
             if popped:
                 # Everything queued was content-free (a bare priority
                 # marker) — nothing to dispatch, nothing worth a turn.
-                # Fall through to the normal wake drain below.
+                # Deliberate discard: close the window, then fall through
+                # to the normal wake drain below.
                 log.info(
                     "wake_nudge.interjection_empty ws=%s discarded=%d",
                     self._ws_id[:8],
                     len(popped),
                 )
+                self._close_pop_window(popped)
 
         # Two-pass drain: wake-eligible channels first.  ``"quiet"`` entries
         # (external events demoted by a user cancel) ride a wake earned by
@@ -16367,8 +20393,6 @@ class ChatSession:
         """
         try:
             storage = get_storage()
-            if storage is None:
-                return persona, ""
             row, err = resolve_persona_for_kind(storage, persona, "interactive")
         except Exception:
             log.debug("spawn.persona_precheck_failed", persona=persona, exc_info=True)
@@ -17215,23 +21239,25 @@ class ChatSession:
         early-return (callers detect ``deny is not None`` and short-circuit).
         """
         from turnstone.core.auth import user_has_permission
-        from turnstone.core.storage._registry import get_storage
 
-        if user_has_permission(self._user_id, "model.skills.write"):
+        storage = get_storage()
+        if user_has_permission(
+            self._user_id,
+            "model.skills.write",
+            storage=storage,
+        ):
             return None
         # Audit the deny so probing for the grant leaves a forensic
         # record.  ``skill.write_denied`` action distinguishes denied
         # attempts from approved-and-failed writes (which audit under
         # ``skill.create`` / ``skill.update`` etc.).
         name = args.get("name") if isinstance(args.get("name"), str) else ""
-        storage = get_storage()
-        if storage is not None:
-            self._audit_skill_action(
-                storage,
-                "skill.write_denied",
-                "",
-                {"action": action, "name": name or ""},
-            )
+        self._audit_skill_action(
+            storage,
+            "skill.write_denied",
+            "",
+            {"action": action, "name": name or ""},
+        )
         return self._coord_tool_error(
             call_id,
             "skills",
@@ -17369,14 +21395,8 @@ class ChatSession:
         }
 
     def _exec_skills_find(self, item: dict[str, Any]) -> tuple[str, str]:
-        from turnstone.core.storage._registry import get_storage
-
         call_id = item["call_id"]
         storage = get_storage()
-        if storage is None:
-            msg = "Error: storage unavailable"
-            self._report_tool_result(call_id, "skills", msg, is_error=True)
-            return call_id, msg
         # ``kind`` is opt-in only — the default catalog browse returns all
         # kinds and the model sorts/groups client-side on the ``kind`` field
         # in the projection.  Passing ``kind=interactive`` (etc.) widens the
@@ -17533,15 +21553,9 @@ class ChatSession:
         }
 
     def _exec_skills_get(self, item: dict[str, Any]) -> tuple[str, str]:
-        from turnstone.core.storage._registry import get_storage
-
         call_id = item["call_id"]
         name = item["name"]
         storage = get_storage()
-        if storage is None:
-            msg = "Error: storage unavailable"
-            self._report_tool_result(call_id, "skills", msg, is_error=True)
-            return call_id, msg
         row = storage.get_prompt_template_by_name(name)
         if row is None:
             msg = self._skill_hint(
@@ -17599,14 +21613,11 @@ class ChatSession:
         storage = get_storage()
         row = None
         lookup_failed = False
-        if storage is None:
+        try:
+            row = storage.get_prompt_template_by_name(name)
+        except Exception:
+            log.warning("skill.risk_gate_lookup_failed", skill=name, exc_info=True)
             lookup_failed = True
-        else:
-            try:
-                row = storage.get_prompt_template_by_name(name)
-            except Exception:
-                log.warning("skill.risk_gate_lookup_failed", skill=name, exc_info=True)
-                lookup_failed = True
         if lookup_failed:
             # Fail CLOSED: a risk gate that can't read the row must DENY, never
             # wave the skill through — for storage-unavailable (None) AND a
@@ -17673,16 +21684,10 @@ class ChatSession:
         }
 
     def _exec_skills_load(self, item: dict[str, Any]) -> tuple[str, str]:
-        from turnstone.core.storage._registry import get_storage
-
         call_id = item["call_id"]
         name = item["name"]
         arguments = item.get("arguments", "")
         storage = get_storage()
-        if storage is None:
-            msg = "Error: storage unavailable"
-            self._report_tool_result(call_id, "skills", msg, is_error=True)
-            return call_id, msg
         # ``enabled=False`` is the admin's quarantine flag — collapse the
         # missing-row and disabled cases into a single recovery hint so
         # the model has one consistent next step.  The ``kind`` column is
@@ -17797,8 +21802,6 @@ class ChatSession:
         }
 
     def _exec_skills_create(self, item: dict[str, Any]) -> tuple[str, str]:
-        from turnstone.core.storage._registry import get_storage
-
         call_id = item["call_id"]
         name = item["name"]
         # Re-check the permission at exec time — operator may have
@@ -17810,10 +21813,6 @@ class ChatSession:
             self._report_tool_result(call_id, "skills", err, is_error=True)
             return call_id, err
         storage = get_storage()
-        if storage is None:
-            msg = "Error: storage unavailable"
-            self._report_tool_result(call_id, "skills", msg, is_error=True)
-            return call_id, msg
         if storage.get_prompt_template_by_name(name) is not None:
             msg = self._skill_hint(
                 f"skill name '{name}' already exists",
@@ -17881,14 +21880,11 @@ class ChatSession:
     def _prepare_skills_update(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         from turnstone.core.skill_field_validation import parse_skill_session_config
         from turnstone.core.skill_kind import SkillKind
-        from turnstone.core.storage._registry import get_storage
 
         name = self._coord_str_arg(args, "name").strip()
         if not name:
             return self._coord_tool_error(call_id, "skills", "update: 'name' is required")
         storage = get_storage()
-        if storage is None:
-            return self._coord_tool_error(call_id, "skills", "storage unavailable")
         existing = storage.get_prompt_template_by_name(name)
         if existing is None:
             return self._coord_tool_error(
@@ -18059,8 +22055,6 @@ class ChatSession:
         }
 
     def _exec_skills_update(self, item: dict[str, Any]) -> tuple[str, str]:
-        from turnstone.core.storage._registry import get_storage
-
         call_id = item["call_id"]
         name = item["name"]
         template_id = item["template_id"]
@@ -18071,10 +22065,6 @@ class ChatSession:
             self._report_tool_result(call_id, "skills", err, is_error=True)
             return call_id, err
         storage = get_storage()
-        if storage is None:
-            msg = "Error: storage unavailable"
-            self._report_tool_result(call_id, "skills", msg, is_error=True)
-            return call_id, msg
         # Re-fetch the row to catch a readonly flip between prepare and
         # exec.  If the row went readonly since prepare, drop any updates
         # that the prepare-time filter would no longer accept.  If it
@@ -18157,15 +22147,11 @@ class ChatSession:
     def _prepare_skills_toggle(
         self, call_id: str, args: dict[str, Any], *, enable: bool
     ) -> dict[str, Any]:
-        from turnstone.core.storage._registry import get_storage
-
         verb = "enable" if enable else "disable"
         name = self._coord_str_arg(args, "name").strip()
         if not name:
             return self._coord_tool_error(call_id, "skills", f"{verb}: 'name' is required")
         storage = get_storage()
-        if storage is None:
-            return self._coord_tool_error(call_id, "skills", "storage unavailable")
         existing = storage.get_prompt_template_by_name(name)
         if existing is None:
             return self._coord_tool_error(
@@ -18232,8 +22218,6 @@ class ChatSession:
         }
 
     def _exec_skills_toggle(self, item: dict[str, Any], *, enable: bool) -> tuple[str, str]:
-        from turnstone.core.storage._registry import get_storage
-
         call_id = item["call_id"]
         name = item["name"]
         template_id = item["template_id"]
@@ -18245,10 +22229,6 @@ class ChatSession:
             self._report_tool_result(call_id, "skills", err, is_error=True)
             return call_id, err
         storage = get_storage()
-        if storage is None:
-            msg = "Error: storage unavailable"
-            self._report_tool_result(call_id, "skills", msg, is_error=True)
-            return call_id, msg
         try:
             storage.update_prompt_template(template_id, enabled=enable)
         except Exception as e:
@@ -18366,13 +22346,13 @@ class ChatSession:
         if self._coord_client is None:
             return self._coord_tool_error(call_id, "tasks", "coordinator client unavailable")
         action = self._coord_str_arg(args, "action").strip().lower()
-        if action not in {"add", "update", "remove", "reorder", "list"}:
+        if action not in _TASKS_READ_ACTIONS | _TASKS_WRITE_ACTIONS:
             return self._coord_tool_error(
                 call_id,
                 "tasks",
                 "action must be one of: add, update, remove, reorder, list",
             )
-        if action == "list":
+        if action in _TASKS_READ_ACTIONS:
             return {
                 "call_id": call_id,
                 "func_name": "tasks",
@@ -18381,6 +22361,11 @@ class ChatSession:
                 "needs_approval": False,
                 "execute": self._exec_tasks,
                 "action": "list",
+                "_batch_policy": _batch_policy(
+                    "tasks",
+                    "read",
+                    _TASKS_MIXED_BATCH_ERROR,
+                ),
             }
         # --- mutating actions -------------------------------------------------
         item: dict[str, Any] = {
@@ -18389,6 +22374,12 @@ class ChatSession:
             "needs_approval": True,
             "execute": self._exec_tasks,
             "action": action,
+            "_batch_policy": _batch_policy(
+                "tasks",
+                "write",
+                _TASKS_MIXED_BATCH_ERROR,
+                serialize=True,
+            ),
         }
 
         # Deferred import shared by every mutating branch below — ONE site,
@@ -18934,20 +22925,19 @@ class ChatSession:
     def _prepare_memory(self, call_id: str, args: dict[str, Any]) -> dict[str, Any]:
         """Prepare a memory tool action (save/get/search/delete/list)."""
         action = (args.get("action") or "").strip().lower()
+        access = self._memory_access(self._tool_prepare_principal_id() or None)
 
         if action == "save":
-            name = (args.get("name") or args.get("key") or "").strip()
-            content = (args.get("content") or args.get("value") or "").strip()
-            name = normalize_key(name)
-            if not name:
-                return {
-                    "call_id": call_id,
-                    "func_name": "memory",
-                    "header": "\u2717 memory save: missing name",
-                    "preview": "",
-                    "needs_approval": False,
-                    "error": "Error: 'name' is required for save",
-                }
+            raw_name = args.get("name")
+            content = (args.get("content") or "").strip()
+            try:
+                name = normalize_memory_name(raw_name)
+            except ValueError as exc:
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory save: invalid name",
+                    f"Error: {exc}",
+                )
             if not content:
                 return {
                     "call_id": call_id,
@@ -18966,43 +22956,35 @@ class ChatSession:
                     "needs_approval": False,
                     "error": f"Error: content exceeds {self._mem_cfg.max_content} character limit",
                 }
-            # None (field omitted) means "leave unset": the upsert keeps the
-            # stored value on update and defaults on insert; an explicit value
-            # (including "" / "general") overwrites.
-            description = args.get("description")
-            if description is not None:
-                description = str(description).strip()
+            try:
+                description = normalize_memory_description(args.get("description"))
+            except ValueError as exc:
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory save: invalid description",
+                    f"Error: {exc}",
+                )
             mem_type = args.get("type")
             if mem_type is not None:
                 mem_type = str(mem_type).strip().lower()
                 if mem_type not in ("user", "general", "feedback", "reference"):
-                    # An unrecognized type (e.g. a typo) is treated as unset
-                    # (preserve the stored type on update / default on insert)
-                    # rather than silently overwriting it with "general".
-                    mem_type = None
-            # Default scope is kind-aware: coord sessions default to
-            # ``coordinator`` (their only writable scope); IC sessions
-            # default to ``global`` (matches pre-fix behaviour).
-            default_scope = self._default_memory_scope()
-            scope = (args.get("scope") or default_scope).strip().lower()
+                    return self._memory_prepare_error(
+                        call_id,
+                        "✗ memory save: invalid type",
+                        f"Error: invalid memory type '{mem_type}'",
+                    )
+            default_scope = self._inherited_memory_scope(access)
+            scope = str(args.get("scope") or default_scope).strip().lower()
             if scope not in _VALID_MEMORY_SCOPES:
-                scope = default_scope
-            scope_err = self._validate_scope(scope, call_id)
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory save: invalid scope",
+                    f"Error: invalid scope '{scope}'. Valid: {', '.join(_VALID_MEMORY_SCOPES)}",
+                )
+            scope_err = self._validate_scope(scope, call_id, access=access, write=True)
             if scope_err:
                 return scope_err
-            if scope == "project" and not self._project_writable:
-                return {
-                    "call_id": call_id,
-                    "func_name": "memory",
-                    "header": "\u2717 memory save: project is read-only for you",
-                    "preview": "",
-                    "needs_approval": False,
-                    "error": (
-                        "Error: you have read-only access to this project; you "
-                        "cannot save project-scoped memory."
-                    ),
-                }
-            scope_id = self._resolve_scope_id(scope)
+            scope_id = self._resolve_scope_id(scope, access)
             return {
                 "call_id": call_id,
                 "func_name": "memory",
@@ -19017,19 +22999,23 @@ class ChatSession:
                 "mem_type": mem_type,
                 "scope": scope,
                 "scope_id": scope_id,
+                "_batch_policy": _batch_policy(
+                    "memory",
+                    "write",
+                    _MEMORY_MIXED_BATCH_ERROR,
+                    serialize=True,
+                ),
             }
 
         if action == "get":
-            name = normalize_key((args.get("name") or args.get("key") or "").strip())
-            if not name:
-                return {
-                    "call_id": call_id,
-                    "func_name": "memory",
-                    "header": "\u2717 memory get: missing name",
-                    "preview": "",
-                    "needs_approval": False,
-                    "error": "Error: 'name' is required for get",
-                }
+            try:
+                name = normalize_memory_name(args.get("name"))
+            except ValueError as exc:
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory get: invalid name",
+                    f"Error: {exc}",
+                )
             explicit_scope = (args.get("scope") or "").strip().lower()
             valid_scopes = _VALID_MEMORY_SCOPES
             if explicit_scope and explicit_scope not in valid_scopes:
@@ -19041,21 +23027,11 @@ class ChatSession:
                     "needs_approval": False,
                     "error": f"Error: invalid scope '{explicit_scope}'. Valid: {', '.join(valid_scopes)}",
                 }
-            if explicit_scope:
-                scope_err = self._validate_scope(explicit_scope, call_id)
-                if scope_err:
-                    return scope_err
-                scopes_to_try = [(explicit_scope, self._resolve_scope_id(explicit_scope))]
-            else:
-                # Implicit fallback walk \u2014 kind-aware narrowest-to-widest.
-                # Coord sessions only walk ``coordinator``; IC sessions
-                # walk workstream \u2192 user \u2192 global.  See
-                # :meth:`_implicit_scope_walk`.
-                scopes_to_try = []
-                for s in self._implicit_scope_walk():
-                    sid = self._resolve_scope_id(s)
-                    if sid or s == "global":
-                        scopes_to_try.append((s, sid))
+            scope = explicit_scope or self._inherited_memory_scope(access)
+            scope_err = self._validate_scope(scope, call_id, access=access)
+            if scope_err:
+                return scope_err
+            scopes_to_try = [(scope, self._resolve_scope_id(scope, access))]
             return {
                 "call_id": call_id,
                 "func_name": "memory",
@@ -19066,19 +23042,22 @@ class ChatSession:
                 "action": "get",
                 "name": name,
                 "scopes_to_try": scopes_to_try,
+                "_batch_policy": _batch_policy(
+                    "memory",
+                    "read",
+                    _MEMORY_MIXED_BATCH_ERROR,
+                ),
             }
 
         if action == "delete":
-            name = normalize_key((args.get("name") or args.get("key") or "").strip())
-            if not name:
-                return {
-                    "call_id": call_id,
-                    "func_name": "memory",
-                    "header": "\u2717 memory delete: empty name",
-                    "preview": "",
-                    "needs_approval": False,
-                    "error": "Error: name is required for delete",
-                }
+            try:
+                name = normalize_memory_name(args.get("name"))
+            except ValueError as exc:
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory delete: invalid name",
+                    f"Error: {exc}",
+                )
             explicit_scope = (args.get("scope") or "").strip().lower()
             valid_scopes = _VALID_MEMORY_SCOPES
             if explicit_scope and explicit_scope not in valid_scopes:
@@ -19093,38 +23072,11 @@ class ChatSession:
                         f"Valid scopes: {', '.join(valid_scopes)}"
                     ),
                 }
-            if explicit_scope:
-                scope_err = self._validate_scope(explicit_scope, call_id)
-                if scope_err:
-                    return scope_err
-                # _validate_scope gates on READ access (_project_id); deleting a
-                # shared project row is a WRITE, so gate it on _project_writable
-                # too — mirrors the save path so a read-only member of a public
-                # project can't destroy project-scoped memory.  (The implicit
-                # walk below never includes project scope, so it needs no gate.)
-                if explicit_scope == "project" and not self._project_writable:
-                    return {
-                        "call_id": call_id,
-                        "func_name": "memory",
-                        "header": "✗ memory delete: project is read-only for you",
-                        "preview": "",
-                        "needs_approval": False,
-                        "error": (
-                            "Error: you have read-only access to this project; you "
-                            "cannot delete project-scoped memory."
-                        ),
-                    }
-                scope_id = self._resolve_scope_id(explicit_scope)
-                scopes_to_try = [(explicit_scope, scope_id)]
-            else:
-                # Kind-aware implicit walk — coord sessions stay in coord-scope;
-                # IC sessions walk narrowest-to-widest (workstream → user → global).
-                # See :meth:`_implicit_scope_walk`.
-                scopes_to_try = []
-                for s in self._implicit_scope_walk():
-                    sid = self._resolve_scope_id(s)
-                    if sid or s == "global":
-                        scopes_to_try.append((s, sid))
+            scope = explicit_scope or self._inherited_memory_scope(access)
+            scope_err = self._validate_scope(scope, call_id, access=access, write=True)
+            if scope_err:
+                return scope_err
+            scopes_to_try = [(scope, self._resolve_scope_id(scope, access))]
             return {
                 "call_id": call_id,
                 "func_name": "memory",
@@ -19135,27 +23087,43 @@ class ChatSession:
                 "action": "delete",
                 "name": name,
                 "scopes_to_try": scopes_to_try,
+                "_batch_policy": _batch_policy(
+                    "memory",
+                    "write",
+                    _MEMORY_MIXED_BATCH_ERROR,
+                    serialize=True,
+                ),
             }
 
         if action == "search":
             query = (args.get("query") or "").strip()
             mem_type = (args.get("type") or "").strip().lower()
             if mem_type and mem_type not in ("user", "general", "feedback", "reference"):
-                mem_type = ""
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory search: invalid type",
+                    f"Error: invalid memory type '{mem_type}'",
+                )
             scope = (args.get("scope") or "").strip().lower()
             if scope and scope not in _VALID_MEMORY_SCOPES:
-                scope = ""
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory search: invalid scope",
+                    f"Error: invalid scope '{scope}'. Valid: {', '.join(_VALID_MEMORY_SCOPES)}",
+                )
             if scope:
-                scope_err = self._validate_scope(scope, call_id)
+                scope_err = self._validate_scope(scope, call_id, access=access)
                 if scope_err:
                     return scope_err
-            scope_id = self._resolve_scope_id(scope) if scope else ""
-            limit = args.get("limit", 20)
-            if isinstance(limit, str):
-                try:
-                    limit = int(limit)
-                except ValueError:
-                    limit = 20
+            scope_id = self._resolve_scope_id(scope, access) if scope else ""
+            try:
+                limit = int(args.get("limit", 20))
+            except (TypeError, ValueError):
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory search: invalid limit",
+                    "Error: limit must be an integer",
+                )
             return {
                 "call_id": call_id,
                 "func_name": "memory",
@@ -19169,26 +23137,41 @@ class ChatSession:
                 "scope": scope,
                 "scope_id": scope_id,
                 "limit": max(1, min(limit, 50)),
+                "_batch_policy": _batch_policy(
+                    "memory",
+                    "read",
+                    _MEMORY_MIXED_BATCH_ERROR,
+                ),
             }
 
         if action == "list":
             mem_type = (args.get("type") or "").strip().lower()
             if mem_type and mem_type not in ("user", "general", "feedback", "reference"):
-                mem_type = ""
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory list: invalid type",
+                    f"Error: invalid memory type '{mem_type}'",
+                )
             scope = (args.get("scope") or "").strip().lower()
             if scope and scope not in _VALID_MEMORY_SCOPES:
-                scope = ""
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory list: invalid scope",
+                    f"Error: invalid scope '{scope}'. Valid: {', '.join(_VALID_MEMORY_SCOPES)}",
+                )
             if scope:
-                scope_err = self._validate_scope(scope, call_id)
+                scope_err = self._validate_scope(scope, call_id, access=access)
                 if scope_err:
                     return scope_err
-            scope_id = self._resolve_scope_id(scope) if scope else ""
-            limit = args.get("limit", 20)
-            if isinstance(limit, str):
-                try:
-                    limit = int(limit)
-                except ValueError:
-                    limit = 20
+            scope_id = self._resolve_scope_id(scope, access) if scope else ""
+            try:
+                limit = int(args.get("limit", 20))
+            except (TypeError, ValueError):
+                return self._memory_prepare_error(
+                    call_id,
+                    "✗ memory list: invalid limit",
+                    "Error: limit must be an integer",
+                )
             return {
                 "call_id": call_id,
                 "func_name": "memory",
@@ -19201,6 +23184,11 @@ class ChatSession:
                 "scope": scope,
                 "scope_id": scope_id,
                 "limit": max(1, min(limit, 50)),
+                "_batch_policy": _batch_policy(
+                    "memory",
+                    "read",
+                    _MEMORY_MIXED_BATCH_ERROR,
+                ),
             }
 
         return {
@@ -19242,11 +23230,6 @@ class ChatSession:
             "query": query,
             "limit": max(1, min(limit, 50)),
             "offset": max(0, offset),
-            # Pin the tenancy scope at prepare time: an item that sits in
-            # the queue must search as the user whose turn requested it,
-            # not whoever binds the session later (same discipline as
-            # ``mcp_user_id`` in ``_prepare_mcp_tool``).
-            "scope_user_id": self._history_scope_user_id(),
         }
 
     # -- skill prepare/execute -------------------------------------------------
@@ -19277,10 +23260,6 @@ class ChatSession:
             "execute": self._exec_mcp_tool,
             "mcp_func_name": func_name,
             "mcp_args": args,
-            # Pin the credential identity at prepare time: an item that
-            # sits pending approval must execute under the user whose
-            # turn requested it, not whoever binds the session later.
-            "mcp_user_id": self._mcp_effective_user_id,
         }
 
     def _exec_mcp_tool(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -19297,7 +23276,7 @@ class ChatSession:
             output = self._mcp_client.call_tool_sync(
                 func_name,
                 args,
-                user_id=item.get("mcp_user_id", self._mcp_effective_user_id),
+                user_id=str(item["_principal_id"] or "").strip() or None,
                 timeout=self.tool_timeout,
                 is_interactive_for_consent=self._is_interactive_for_consent,
             )
@@ -19371,8 +23350,6 @@ class ChatSession:
             "approval_label": f"mcp_resource__{self._normalize_resource_uri(uri)}",
             "execute": self._exec_read_resource,
             "resource_uri": uri,
-            # Pinned at prepare time — see _prepare_mcp_tool.
-            "mcp_user_id": self._mcp_effective_user_id,
         }
 
     def _exec_read_resource(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -19391,7 +23368,7 @@ class ChatSession:
             # static path runs byte-identical (invariant 1).
             output = self._mcp_client.read_resource_sync(
                 uri,
-                user_id=item.get("mcp_user_id", self._mcp_effective_user_id),
+                user_id=str(item["_principal_id"] or "").strip() or None,
                 timeout=self.tool_timeout,
                 is_interactive_for_consent=self._is_interactive_for_consent,
             )
@@ -19434,7 +23411,8 @@ class ChatSession:
                 "needs_approval": False,
                 "error": "No MCP servers configured",
             }
-        if not self._mcp_client.is_mcp_prompt(name, user_id=self._mcp_effective_user_id):
+        principal_id = self._tool_prepare_principal_id() or None
+        if not self._mcp_client.is_mcp_prompt(name, user_id=principal_id):
             return {
                 "call_id": call_id,
                 "func_name": "use_prompt",
@@ -19468,8 +23446,6 @@ class ChatSession:
             "execute": self._exec_use_prompt,
             "prompt_name": name,
             "prompt_arguments": arguments,
-            # Pinned at prepare time — see _prepare_mcp_tool.
-            "mcp_user_id": self._mcp_effective_user_id,
         }
 
     def _exec_use_prompt(self, item: dict[str, Any]) -> tuple[str, str]:
@@ -19490,7 +23466,7 @@ class ChatSession:
             messages = self._mcp_client.get_prompt_sync(
                 name,
                 arguments or None,
-                user_id=item.get("mcp_user_id", self._mcp_effective_user_id),
+                user_id=str(item["_principal_id"] or "").strip() or None,
                 timeout=self.tool_timeout,
                 is_interactive_for_consent=self._is_interactive_for_consent,
             )
@@ -20289,6 +24265,64 @@ class ChatSession:
         if fn is not None:
             fn(parent_call_id, item)
 
+    def _paint_agent_context(
+        self,
+        parent_call_id: str | None,
+        prompt_tokens: int,
+        context_window: int,
+        *,
+        generation: int,
+    ) -> None:
+        """Publish one normalized task-agent context reading when supported."""
+        if not parent_call_id:
+            return
+        fn = getattr(self.ui, "on_agent_context", None)
+        if fn is not None:
+            fn(
+                parent_call_id,
+                prompt_tokens,
+                context_window,
+                generation=generation,
+            )
+
+    def _clear_agent_context(self, parent_call_id: str | None, *, generation: int) -> None:
+        """Best-effort clear of generation-scoped task-agent reconnect state."""
+        if not parent_call_id:
+            return
+        fn = getattr(self.ui, "clear_agent_context", None)
+        if fn is not None:
+            try:
+                fn(parent_call_id, generation=generation)
+            except Exception:
+                # A custom UI hook must not suppress the task's authoritative
+                # terminal result. SessionUIBase's implementation is
+                # in-memory/infallible; this guard preserves the compatibility
+                # posture of every other optional task-agent UI hook.
+                log.debug(
+                    "session.agent_context.cleanup_failed ws=%s call_id=%s generation=%d",
+                    self._ws_id[:8],
+                    parent_call_id,
+                    generation,
+                    exc_info=True,
+                )
+
+    def _clear_agent_contexts_before_generation(self, generation: int) -> None:
+        """Best-effort purge of reconnect state owned by retired workers."""
+        fn = getattr(self.ui, "clear_agent_contexts_before_generation", None)
+        if fn is None:
+            return
+        try:
+            fn(generation)
+        except Exception:
+            # Force-abandon is the escape hatch for a wedged worker. Auxiliary
+            # UI cleanup must not defeat its structural repair + slot release.
+            log.debug(
+                "session.agent_context.force_cleanup_failed ws=%s generation=%d",
+                self._ws_id[:8],
+                generation,
+                exc_info=True,
+            )
+
     def _begin_agent_scope(self) -> None:
         """Mark a task agent as in flight so the web pane drops its ``on_info``
         progress chatter (it can't nest under the card — no call_id).  Bracketed
@@ -20609,6 +24643,7 @@ class ChatSession:
         # without consulting a later shared-workstream actor.
         cancel_scope.check()
         lane = self._lane_for_backend_auth_principal(lane, agent_principal)
+        agent_context_window = self._context_window_for_lane(lane) if parent_call_id else 0
 
         def _api_call(
             turns: list[Turn],
@@ -20645,6 +24680,7 @@ class ChatSession:
                         mint=mint,
                         wire_id_map=wire_id_map,
                         cancel_ref=cancel_scope.cancel_ref,
+                        acting_principal_id=agent_principal,
                         prepare_wire=lambda wire, serving_lane: self._prepare_lowered_wire_messages(
                             wire,
                             caps=require_lane_capabilities(serving_lane),
@@ -20660,6 +24696,21 @@ class ChatSession:
                     # window: never append or accept a stale child response
                     # after its originating run was cancelled.
                     cancel_scope.check()
+                    agent_usage = agent_result.usage
+                    if agent_usage is not None and parent_call_id:
+                        published = self._publish_for_generation(
+                            origin_generation,
+                            functools.partial(
+                                self._paint_agent_context,
+                                parent_call_id,
+                                agent_usage.prompt_tokens,
+                                agent_context_window,
+                                generation=origin_generation,
+                            ),
+                            allow_cancelled=False,
+                        )
+                        if not published:
+                            raise GenerationCancelled()
                     return agent_result
                 except Exception as e:
                     # Closing a provider stream commonly surfaces as an
@@ -20855,8 +24906,10 @@ class ChatSession:
                     is_tool_error = True
                     child_effect_status = EffectStatus.NONE
                 else:
-                    prepared = self._prepare_tool(tc_dict)
-                    prepared["_principal_id"] = agent_principal
+                    prepared = self._prepare_tool_for_principal(
+                        tc_dict,
+                        agent_principal,
+                    )
                     prepared["_approval_cancel_witness"] = _ApprovalCancelWitness(
                         self,
                         cancel_scope.cancel_ref,
@@ -21084,7 +25137,29 @@ class ChatSession:
         # its identity in a single system message. No conversation history —
         # it's an autonomous sub-agent. Merged to avoid multi-system-message
         # errors on models like Qwen.
-        base = self._agent_system_messages[0]["content"] if self._agent_system_messages else ""
+        # Finalize the child tool envelope before rendering any capability-
+        # gated prompt component. The exact wire tools are the sole source of
+        # prompt capabilities: an allowlist can remove a capability but can
+        # never add a tool absent from the production task-agent lane.
+        task_tools = self._apply_persona_visibility(self._task_tools)
+        persona_tools = item.get("persona_tools")
+        if persona_tools is not None:
+            task_tools = [
+                t for t in task_tools if t.get("function", {}).get("name") in persona_tools
+            ]
+        if not item.get("persona_mcp", True):
+            # Child persona mcp-off: shed MCP server tools + MCP-access tools,
+            # mirroring how an mcp-off main session sheds them (nulled client).
+            task_tools = [
+                t
+                for t in task_tools
+                if not _is_mcp_surface_tool(t.get("function", {}).get("name", ""))
+            ]
+        task_capabilities = frozenset(
+            name for tool in task_tools if (name := tool.get("function", {}).get("name", ""))
+        )
+        prompt_messages = self._agent_system_messages_for_capabilities(task_capabilities)
+        base = prompt_messages[0]["content"] if prompt_messages else ""
         agent_turns: list[Turn] = [Turn.system(base + "\n\n" + identity)]
         if skill_data:
             # Structured forensic record naming the skill the LLM ran under.
@@ -21117,36 +25192,6 @@ class ChatSession:
                 skill_body = skill_body[:_MAX_SKILL_CONTENT]
             agent_turns.append(Turn.user(self._TASK_SKILL_CAPABILITY_PREAMBLE + skill_body))
         agent_turns.append(Turn.user(prompt))
-        # Attenuate the sub-agent's tools (Principle 7): authority narrows down
-        # a delegation edge, never widens.  TWO envelopes apply, both narrowing
-        # (filtering the available set is sufficient — a tool absent from the
-        # list can't be called, so it can't be auto-approved whatever
-        # ``auto_tools`` says):
-        #   1. the PARENT session's own persona grant — a restricted principal
-        #      must not escalate by spawning.  ``_apply_persona_visibility`` is a
-        #      no-op when the parent has no restrictive persona, and already
-        #      honours the parent's tools + memory levers (parent mcp-off is
-        #      reflected in ``_task_tools`` at construction).
-        #   2. the CHILD persona (``task_agent persona=…``) — its tools, mcp,
-        #      and memory levers confine the sub-agent exactly as they would a
-        #      main session that adopted the persona.
-        task_tools = self._apply_persona_visibility(self._task_tools)
-        persona_tools = item.get("persona_tools")
-        if persona_tools is not None:
-            task_tools = [
-                t for t in task_tools if t.get("function", {}).get("name") in persona_tools
-            ]
-        if not item.get("persona_mcp", True):
-            # Child persona mcp-off: shed MCP server tools + MCP-access tools,
-            # mirroring how an mcp-off main session sheds them (nulled client).
-            task_tools = [
-                t
-                for t in task_tools
-                if not _is_mcp_surface_tool(t.get("function", {}).get("name", ""))
-            ]
-        if not item.get("persona_memory", True):
-            # Child persona memory-off: drop the memory tool from its hands.
-            task_tools = [t for t in task_tools if t.get("function", {}).get("name") != "memory"]
         self._begin_agent_scope()
         # Per-sub-agent file-read tracking.  COPY the parent's current set in (so
         # the agent can edit a file the parent already read for it — no spurious
@@ -21171,15 +25216,24 @@ class ChatSession:
                 origin_cancel_event=item.get("_origin_cancel_event"),
                 origin_generation=origin_generation,
             )
+
             # Self-report the task_agent's OWN result.  The parent run-loop only
             # reports error/denied/exception results centrally; success results
             # rely on each tool self-reporting (bash, search, … all do), and the
             # task_agent never did — so without this the live card has no
             # completion signal (it stays "running" and the synthesis never
             # renders live, only on reload).
+            def _publish_success() -> None:
+                # Clear-before-terminal closes the fresh-subscriber race: a
+                # listener must observe either the active snapshot followed by
+                # this result, or no snapshot plus this result — never a
+                # synthetic active reading after the terminal replay.
+                self._clear_agent_context(call_id, generation=origin_generation)
+                self._report_tool_result(call_id, "task_agent", result)
+
             if not self._publish_for_generation(
                 origin_generation,
-                lambda: self._report_tool_result(call_id, "task_agent", result),
+                _publish_success,
                 allow_cancelled=False,
             ):
                 raise GenerationCancelled()
@@ -21200,6 +25254,7 @@ class ChatSession:
             disposition = self._cancelled_agent_disposition(agent_turns, "task")
 
             def _publish_cancelled() -> None:
+                self._clear_agent_context(call_id, generation=origin_generation)
                 status = self._cancelled_agent_status(agent_turns)
                 receipt = _CancelledToolResult(
                     detail=disposition,
@@ -21251,9 +25306,14 @@ class ChatSession:
             # "failed" and the message renders (replaces the old on_info, which
             # was suppressed during the agent scope anyway).
             msg = f"Task error: {e}"
+
+            def _publish_error() -> None:
+                self._clear_agent_context(call_id, generation=origin_generation)
+                self._report_tool_result(call_id, "task_agent", msg, is_error=True)
+
             self._publish_for_generation(
                 origin_generation,
-                lambda: self._report_tool_result(call_id, "task_agent", msg, is_error=True),
+                _publish_error,
             )
             return call_id, msg
         finally:
@@ -21273,6 +25333,11 @@ class ChatSession:
             self._end_agent_scope()
             child_ids = {tc.id for tc, _result in self._iter_agent_tool_results(agent_turns)}
             self._clear_agent_children(call_id, child_ids=child_ids)
+            # This is pure exact-owner cleanup, not publication. A retiring
+            # predecessor must still drop its own reading after a force claim;
+            # the generation stored beside the entry protects a successor that
+            # reused the same public call id.
+            self._clear_agent_context(call_id, generation=origin_generation)
 
             def _stash() -> None:
                 try:
@@ -21442,6 +25507,7 @@ class ChatSession:
         scope: str,
         scope_id: str,
         mem_type: str,
+        principal_id: str,
     ) -> None:
         """Emit an audit row for a mutating memory tool action.
 
@@ -21462,6 +25528,7 @@ class ChatSession:
         intentionally not audited — they'd multiply audit volume
         without forensic value.
         """
+        storage = get_storage()
         try:
             from turnstone.core.audit import record_audit
 
@@ -21473,8 +25540,8 @@ class ChatSession:
                 "ws_id": self._ws_id,
             }
             record_audit(
-                get_storage(),
-                self._user_id,
+                storage,
+                principal_id,
                 action,
                 "memory",
                 memory_id,
@@ -21487,124 +25554,157 @@ class ChatSession:
         """Execute a memory tool action."""
         call_id = item["call_id"]
         action = item["action"]
+        # Real dispatch stamps every prepared tool item generically. Never
+        # substitute the mutable session actor here: an unstamped item must not
+        # acquire whichever principal happens to be bound at execution time.
+        principal_id = str(item.get("_principal_id") or "").strip()
 
         try:
+            storage = get_storage()
             if action == "save":
-                row, was_update = save_structured_memory(
-                    item["name"],
-                    item["content"],
-                    description=item["description"],
-                    mem_type=item["mem_type"],
-                    scope=item["scope"],
-                    scope_id=item["scope_id"],
-                )
-                if not row:
-                    msg = f"Error: failed to save memory '{item['name']}'"
-                    self._report_tool_result(call_id, "memory", msg, is_error=True)
-                    return call_id, msg
-                # Invalidate the per-turn search cache so an in-turn
-                # memory(search)/(list) reflects this write.  Deliberately do NOT
-                # recompose the system prefix here: injected memories ride in the
-                # cached system block, so re-initing on every save/update busts
-                # the prompt cache (a full system + history re-write) — for a
-                # memory the model already holds via this tool result.  The write
-                # folds into the prefix at the next natural recompose
-                # (skill/model/MCP/resume/compaction) or the next session.
-                self._invalidate_memory_cache()
-                self._audit_memory_event(
-                    "memory.update" if was_update else "memory.save",
-                    row["memory_id"],
-                    name=row["name"],
-                    scope=row["scope"],
-                    scope_id=row["scope_id"],
-                    mem_type=row["type"],
-                )
+                with self._system_prefix_lock:
+                    access = self._memory_access(principal_id)
+                    scope = str(item["scope"])
+                    scope_err = self._validate_scope(
+                        scope,
+                        call_id,
+                        access=access,
+                        write=True,
+                    )
+                    if scope_err:
+                        msg = str(scope_err["error"])
+                        self._report_tool_result(call_id, "memory", msg, is_error=True)
+                        return call_id, msg
+                    scope_id = self._resolve_scope_id(scope, access)
+                    row, was_update = storage.upsert_structured_memory(
+                        str(uuid.uuid4()),
+                        normalize_memory_name(item["name"]),
+                        normalize_memory_description(item["description"]),
+                        item["mem_type"],
+                        scope,
+                        scope_id,
+                        item["content"],
+                        require_active_project=scope == "project",
+                        acting_principal_id=principal_id,
+                    )
+                    if not row:
+                        raise RuntimeError("structured memory upsert returned no row")
+                    self._audit_memory_event(
+                        "memory.update" if was_update else "memory.save",
+                        row["memory_id"],
+                        name=row["name"],
+                        scope=row["scope"],
+                        scope_id=row["scope_id"],
+                        mem_type=row["type"],
+                        principal_id=principal_id,
+                    )
                 verb = "Updated" if was_update else "Saved"
                 msg = f"{verb} memory '{row['name']}' (type={row['type']}, scope={row['scope']})"
+                msg += self._memory_index_backpressure(access)
                 self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
 
             if action == "get":
-                scopes = item["scopes_to_try"]
-                mem = None
-                found_scope = ""
-                for scope, scope_id in scopes:
-                    mem = get_structured_memory_by_name(item["name"], scope, scope_id)
-                    if mem:
-                        found_scope = scope
-                        break
+                access = self._memory_access(principal_id)
+                scope = str(item["scopes_to_try"][0][0])
+                scope_err = self._validate_scope(scope, call_id, access=access)
+                if scope_err:
+                    msg = str(scope_err["error"])
+                    self._report_tool_result(call_id, "memory", msg, is_error=True)
+                    return call_id, msg
+                scope_id = self._resolve_scope_id(scope, access)
+                scopes = [(scope, scope_id)]
+                mem = storage.get_and_touch_structured_memory_by_name(
+                    normalize_memory_name(item["name"]),
+                    scope,
+                    scope_id,
+                    acting_principal_id=principal_id,
+                )
                 if mem:
-                    self._touch_read_memories([mem])
                     content = mem.get("content", "")
                     desc = mem.get("description", "")
                     mem_type = mem.get("type", "")
-                    header = f"[{mem_type}:{found_scope}] {item['name']}"
+                    header = f"[{mem_type}:{scope}] {item['name']}"
                     if desc:
                         header += f" — {desc}"
                     msg = f"{header}\n\n{content}"
                 else:
-                    tried = ", ".join(s for s, _ in scopes)
-                    msg = f"Error: memory '{item['name']}' not found (searched scopes: {tried})"
+                    msg = f"Error: memory '{item['name']}' not found (scope={scope})"
+                    msg += self._memory_scope_miss_hint(
+                        item["name"], scopes, action="get", access=access
+                    )
                 self._report_tool_result(call_id, "memory", msg, is_error=mem is None)
                 return call_id, msg
 
             if action == "delete":
-                scopes = item["scopes_to_try"]
-                deleted: dict[str, str] | None = None
-                deleted_scope = ""
-                deleted_scope_id = ""
-                # Look up first so the audit row can record the deleted
-                # memory_id + type (delete-by-name returns only a bool).
-                # Falling back through the scope walk keeps the current
-                # narrowest-first IC semantics; coord sessions only see
-                # ``coordinator`` here.
-                for scope, scope_id in scopes:
-                    existing = get_structured_memory_by_name(item["name"], scope, scope_id)
-                    if existing and delete_structured_memory_by_id(existing["memory_id"]):
-                        deleted = existing
-                        deleted_scope = scope
-                        deleted_scope_id = scope_id
-                        break
-                if deleted is None:
-                    tried = ", ".join(s for s, _ in scopes)
-                    msg = f"Error: memory '{item['name']}' not found (searched scopes: {tried})"
-                    self._report_tool_result(call_id, "memory", msg, is_error=True)
-                else:
-                    self._invalidate_memory_cache()
-                    self._init_system_messages()
+                with self._system_prefix_lock:
+                    access = self._memory_access(principal_id)
+                    scope = str(item["scopes_to_try"][0][0])
+                    scope_err = self._validate_scope(
+                        scope,
+                        call_id,
+                        access=access,
+                        write=True,
+                    )
+                    scope_id = self._resolve_scope_id(scope, access)
+                    scopes = [(scope, scope_id)]
+                    if scope_err:
+                        msg = str(scope_err["error"])
+                        msg += self._memory_scope_miss_hint(
+                            item["name"], scopes, action="delete", access=access
+                        )
+                        self._report_tool_result(call_id, "memory", msg, is_error=True)
+                        return call_id, msg
+                    deleted = storage.delete_structured_memory_returning(
+                        normalize_memory_name(item["name"]),
+                        scope,
+                        scope_id,
+                        acting_principal_id=principal_id,
+                    )
+                    if deleted is None:
+                        msg = f"Error: memory '{item['name']}' not found (scope={scope})"
+                        msg += self._memory_scope_miss_hint(
+                            item["name"], scopes, action="delete", access=access
+                        )
+                        self._report_tool_result(call_id, "memory", msg, is_error=True)
+                        return call_id, msg
                     self._audit_memory_event(
                         "memory.delete",
                         deleted["memory_id"],
                         name=item["name"],
-                        scope=deleted_scope,
-                        scope_id=deleted_scope_id,
+                        scope=scope,
+                        scope_id=scope_id,
                         mem_type=deleted.get("type", ""),
+                        principal_id=principal_id,
                     )
-                    msg = f"Deleted memory '{item['name']}' (scope={deleted_scope})"
-                    self._report_tool_result(call_id, "memory", msg)
+                    msg = f"Deleted memory '{item['name']}' (scope={scope})"
+                self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
 
             if action == "search":
+                access = self._memory_access(principal_id)
                 scope = item.get("scope", "")
-                scope_id = item.get("scope_id", "")
-                # Defense-in-depth: reject scoped queries with empty scope_id
-                if scope in ("user", "workstream", "coordinator") and not scope_id:
-                    msg = f"Error: '{scope}' scope requires a valid identity"
-                    self._report_tool_result(call_id, "memory", msg, is_error=True)
-                    return call_id, msg
                 if scope:
-                    rows = search_structured_memories(
+                    scope_err = self._validate_scope(scope, call_id, access=access)
+                    if scope_err:
+                        msg = str(scope_err["error"])
+                        self._report_tool_result(call_id, "memory", msg, is_error=True)
+                        return call_id, msg
+                    scope_id = self._resolve_scope_id(scope, access)
+                    rows = storage.search_visible_structured_memories(
                         item["query"],
+                        [(scope, scope_id)],
                         mem_type=item.get("mem_type", ""),
-                        scope=scope,
-                        scope_id=scope_id,
                         limit=item["limit"],
+                        acting_principal_id=principal_id,
                     )
                 else:
-                    rows = self._search_visible_memories(
+                    rows = storage.search_visible_structured_memories(
                         item["query"],
+                        self._visible_scopes(access),
                         mem_type=item.get("mem_type", ""),
                         limit=item["limit"],
+                        acting_principal_id=principal_id,
                     )
                 log.info(
                     "memory.search",
@@ -21612,19 +25712,16 @@ class ChatSession:
                     result_count=len(rows),
                     query=item["query"][:120],
                 )
-                self._touch_read_memories(rows)
                 if rows:
                     lines = []
                     for m in rows:
                         desc = f" — {m['description']}" if m.get("description") else ""
-                        preview = m["content"][:200]
-                        if len(m["content"]) > 200:
-                            preview += "..."
-                        lines.append(
-                            f"  [{m['type']}:{m['scope']}] {m['name']}{desc}\n    {preview}"
-                        )
+                        lines.append(f"  [{m['type']}:{m['scope']}] {m['name']}{desc}")
                     msg = f"Memories ({len(rows)} results):\n" + "\n".join(lines)
-                    msg += "\n\nUse memory(action='get', name='...') for full content."
+                    msg += (
+                        "\n\nFor full content, call memory(action='get') with the "
+                        "displayed name and scope."
+                    )
                 else:
                     msg = (
                         f"No memories found for '{item['query']}'."
@@ -21635,43 +25732,55 @@ class ChatSession:
                 return call_id, msg
 
             if action == "list":
+                access = self._memory_access(principal_id)
                 scope = item.get("scope", "")
-                scope_id = item.get("scope_id", "")
-                if scope in ("user", "workstream", "coordinator") and not scope_id:
-                    msg = f"Error: '{scope}' scope requires a valid identity"
-                    self._report_tool_result(call_id, "memory", msg, is_error=True)
-                    return call_id, msg
                 if scope:
-                    rows = list_structured_memories(
+                    scope_err = self._validate_scope(scope, call_id, access=access)
+                    if scope_err:
+                        msg = str(scope_err["error"])
+                        self._report_tool_result(call_id, "memory", msg, is_error=True)
+                        return call_id, msg
+                    scope_id = self._resolve_scope_id(scope, access)
+                    rows = storage.list_visible_structured_memories(
+                        [(scope, scope_id)],
                         mem_type=item.get("mem_type", ""),
-                        scope=scope,
-                        scope_id=scope_id,
                         limit=item["limit"],
+                        acting_principal_id=principal_id,
                     )
                 else:
-                    rows = self._list_visible_memories(
+                    rows = storage.list_visible_structured_memories(
+                        self._visible_scopes(access),
                         mem_type=item.get("mem_type", ""),
                         limit=item["limit"],
+                        acting_principal_id=principal_id,
                     )
                 if rows:
                     lines = []
                     for m in rows:
                         desc = f" — {m['description']}" if m.get("description") else ""
-                        preview = m["content"][:200]
-                        if len(m["content"]) > 200:
-                            preview += "..."
-                        lines.append(
-                            f"  [{m['type']}:{m['scope']}] {m['name']}{desc}\n    {preview}"
-                        )
+                        lines.append(f"  [{m['type']}:{m['scope']}] {m['name']}{desc}")
                     msg = f"Memories ({len(rows)}):\n" + "\n".join(lines)
-                    msg += "\n\nUse memory(action='get', name='...') for full content."
+                    msg += (
+                        "\n\nFor full content, call memory(action='get') with the "
+                        "displayed name and scope."
+                    )
                 else:
                     msg = "No memories stored."
                 self._report_tool_result(call_id, "memory", msg)
                 return call_id, msg
 
-        except Exception as e:
-            msg = f"Error: {e}"
+        except ProjectMemoryAuthorizationError:
+            msg = "Error: the acting user no longer has access to project-scoped memory."
+            self._report_tool_result(call_id, "memory", msg, is_error=True)
+            return call_id, msg
+        except Exception:
+            log.warning(
+                "memory.tool_storage_failed",
+                action=action,
+                principal_id=principal_id,
+                exc_info=True,
+            )
+            msg = "Error: memory storage operation failed; retry after storage recovers."
             self._report_tool_result(call_id, "memory", msg, is_error=True)
             return call_id, msg
 
@@ -21698,16 +25807,17 @@ class ChatSession:
         """
         call_id = item["call_id"]
         query, limit, offset = item["query"], item["limit"], item.get("offset", 0)
+        storage = get_storage()
 
         # KeyError on a missing pin is deliberate — an unpinned item must
         # fail loudly, not fall back to an unscoped (tenant-wide) search.
-        conv_rows = search_history(
+        conv_rows = storage.search_history(
             query,
             limit,
             offset,
-            user_id=item["scope_user_id"],
+            user_id=str(item["_principal_id"] or "").strip() or None,
             exclude_ws_id=self._ws_id or None,
-            exclude_after=(get_compaction_checkpoint(self._ws_id) if self._ws_id else None),
+            exclude_after=(storage.get_compaction_checkpoint(self._ws_id) if self._ws_id else None),
         )
         if conv_rows:
             lines = []
@@ -21848,8 +25958,8 @@ class ChatSession:
 
         # Retry loop: attempt delivery, re-query services on each retry
         # in case a gateway comes back online between attempts.
+        storage = get_storage()
         for attempt in range(1 + self._NOTIFY_MAX_RETRIES):
-            storage = get_storage()
             services = storage.list_services("channel", max_age_seconds=120)
             if not services:
                 if attempt < self._NOTIFY_MAX_RETRIES:
@@ -22049,22 +26159,21 @@ class ChatSession:
         # Check max watches limit and duplicate names
         storage = get_storage()
         existing: list[dict[str, Any]] = []
-        if storage:
-            existing = storage.list_watches_for_ws(self._ws_id)
-            if len(existing) >= MAX_WATCHES_PER_WS:
-                return {
-                    "call_id": call_id,
-                    "func_name": "watch",
-                    "header": f"\u2717 watch: limit reached ({MAX_WATCHES_PER_WS})",
-                    "preview": "",
-                    "needs_approval": False,
-                    "error": f"Error: maximum {MAX_WATCHES_PER_WS} active watches per workstream",
-                }
+        existing = storage.list_watches_for_ws(self._ws_id)
+        if len(existing) >= MAX_WATCHES_PER_WS:
+            return {
+                "call_id": call_id,
+                "func_name": "watch",
+                "header": f"\u2717 watch: limit reached ({MAX_WATCHES_PER_WS})",
+                "preview": "",
+                "needs_approval": False,
+                "error": f"Error: maximum {MAX_WATCHES_PER_WS} active watches per workstream",
+            }
 
         name = args.get("name", "")
         if not name:
             name = f"watch-{uuid.uuid4().hex[:4]}"
-        elif storage and any(w["name"] == name for w in existing):
+        elif any(w["name"] == name for w in existing):
             return {
                 "call_id": call_id,
                 "func_name": "watch",
@@ -22652,8 +26761,23 @@ class ChatSession:
         self._report_tool_result(call_id, "web_search", output)
         return call_id, output
 
-    def handle_command(self, cmd_line: str) -> bool:
-        """Handle slash commands. Returns True if should exit."""
+    def handle_command(
+        self,
+        cmd_line: str,
+        *,
+        principal_id: str | None = None,
+    ) -> bool:
+        """Handle slash commands under one immutable initiating principal."""
+        worker_claim = current_worker_claim(self)
+        command_principal = (
+            (
+                worker_claim.principal_id
+                if worker_claim is not None and worker_claim.principal_id
+                else (self._mcp_effective_user_id or self._user_id or "")
+            )
+            if principal_id is None
+            else principal_id
+        ).strip()
         parts = cmd_line.strip().split(None, 1)
         cmd = parts[0].lower()
         arg = parts[1] if len(parts) > 1 else ""
@@ -22683,7 +26807,7 @@ class ChatSession:
                     self.ui.on_info("No instructions set. Usage: /instructions <text>")
             else:
                 self.instructions = arg.strip()
-                self._init_system_messages()
+                self._init_system_messages(principal_id=command_principal)
                 self._save_config()
                 self.ui.on_info("Instructions updated.")
 
@@ -22702,7 +26826,7 @@ class ChatSession:
                 )
                 self.ui.on_info("Skill cleared; using defaults.")
             else:
-                tpl = get_skill_by_name(arg.strip())
+                tpl = self._get_skill_by_name(arg.strip())
                 if tpl:
                     self.set_skill(tpl["name"])
                     self._append_system_turn(
@@ -22718,28 +26842,39 @@ class ChatSession:
             self._read_files.clear()
             self._repeat_detector.clear()
             self._last_usage = None
-            self._calibrated_msg_count = 0
+            self._invalidate_token_calibration_anchors()
             self._msg_tokens = []
+            self._activate_token_calibration(self._primary_lane())
             self.ui.on_info("Context cleared (messages preserved in database).")
 
         elif cmd == "/new":
-            from turnstone.core.memory import register_workstream
-
-            # Flush any stranded queued text BEFORE the identity swap so it
-            # is persisted into the workstream it was ADDRESSED to.  Sends
-            # during the command window itself defer in the /send route
+            # Settle stranded queued text BEFORE the identity swap so it is
+            # persisted into the workstream it was ADDRESSED to (or discarded
+            # with a notice when it cannot land — gone latch / foreign owner).
+            # Sends during the command window itself defer in the /send route
             # (ws._pending_sends) and never queue; this covers only a
             # message stranded by a dying send worker's closing race
             # before this command started.
-            self._flush_queued_messages()
+            self._drain_queue_for_identity_swap()
             self.messages.clear()
             self._read_files.clear()
             self._repeat_detector.clear()
             self._last_usage = None
-            self._calibrated_msg_count = 0
+            self._invalidate_token_calibration_anchors()
             self._msg_tokens = []
             old_ws_id = self._ws_id
-            self._ws_id = uuid.uuid4().hex
+            while True:
+                candidate_ws_id = uuid.uuid4().hex
+                inserted = get_storage().register_workstream(
+                    candidate_ws_id,
+                    node_id=self._node_id,
+                    persona=self._persona_name or None,
+                )
+                if inserted is not False:
+                    break
+            self._ws_id = candidate_ws_id
+            self._fork_reservation_token = ""
+            self._memory_index_snapshot = None
             # A brand-new ws_id is the same class of identity change as a
             # non-fork resume(): the old workstream's participant state must
             # not leak into this empty one, its trust nonces must not carry
@@ -22753,19 +26888,20 @@ class ChatSession:
             self._sender_label_nonce = fence.mint_nonce()
             self._follow_watch_registration(old_ws_id)
             self._title_generated = False
-            # The session keeps its persona across /new (the stamp is
-            # re-written by _save_config below) — carry the display slug
-            # onto the fresh row so projections agree with the config.
-            register_workstream(
-                self._ws_id,
-                node_id=self._node_id,
-                persona=self._persona_name or None,
-            )
+            # The cached prefix carries the workstream identity and both trust
+            # nonces even when memory is disabled. Rebuild it immediately for
+            # the replacement CLI workstream so the next request cannot reuse
+            # the predecessor's envelope declaration.
+            self._init_system_messages()
+            self._activate_token_calibration(self._primary_lane())
+            # The session keeps its persona across /new. The row reservation
+            # above carries the display slug, and _save_config writes the full
+            # immutable stamp below.
             self._save_config()
             self.ui.on_info("New workstream started.")
 
         elif cmd == "/workstreams":
-            rows = list_workstreams_with_history(limit=20)
+            rows = list_workstreams_with_history(20)
             if not rows:
                 self.ui.on_info("No saved workstreams.")
             else:
@@ -22794,10 +26930,10 @@ class ChatSession:
                 elif target_id == self._ws_id:
                     self.ui.on_info("Already in that workstream.")
                 else:
-                    # Same pre-swap flush as /new: stranded queued text is
-                    # persisted into the CURRENT workstream before resume()
-                    # swaps this session's identity to the target.
-                    self._flush_queued_messages()
+                    # Same pre-swap settlement as /new: stranded queued text
+                    # persists into the CURRENT workstream (or is discarded
+                    # with a notice) before resume() swaps identities.
+                    self._drain_queue_for_identity_swap()
                     try:
                         resumed: bool | None = self.resume(target_id)
                     except ValueError as exc:
@@ -22844,7 +26980,11 @@ class ChatSession:
         elif cmd == "/history":
             query = arg.strip() if arg else None
             if query:
-                rows = search_history(query, limit=20, user_id=self._history_scope_user_id())
+                rows = search_history(
+                    query,
+                    limit=20,
+                    user_id=command_principal or None,
+                )
                 if not rows:
                     self.ui.on_info(f"No results for {query!r}")
                 else:
@@ -22856,7 +26996,7 @@ class ChatSession:
                     self.ui.on_info("\n".join(lines))
             else:
                 # Show recent conversations (last 20 messages)
-                rows = search_history_recent(limit=20, user_id=self._history_scope_user_id())
+                rows = search_history_recent(20, user_id=command_principal or None)
                 if not rows:
                     self.ui.on_info("No conversation history yet.")
                 else:
@@ -22924,7 +27064,8 @@ class ChatSession:
                         if cfg.max_tokens is not None
                         else (cs.get("model.max_tokens") if cs else self.max_tokens)
                     )
-                    self._init_system_messages()
+                    self._init_system_messages(principal_id=command_principal)
+                    self._activate_token_calibration(self._primary_lane())
                     self._save_config()
                     self.ui.on_info(f"Switched to {cyan(arg)}: {self.model}")
                 elif construction_error is not None:
@@ -22970,7 +27111,7 @@ class ChatSession:
             # with no try/except — re-raising would crash the whole REPL on
             # a compaction failure (history is untouched on raising exits).
             with contextlib.suppress(GenerationCancelled, Exception):
-                self.compact_now()
+                self.compact_now(principal_id=command_principal or None)
 
         elif cmd == "/creative":
             # Recognized but decommissioned: print a live migration pointer
@@ -22999,9 +27140,9 @@ class ChatSession:
                 # Phase 7 + 7b: pass the effective user_id so the /mcp
                 # listing surfaces this user's pool tools, resources,
                 # and prompts alongside the static catalog.
-                tools = self._mcp_client.get_tools(user_id=self._mcp_effective_user_id)
-                resources = self._mcp_client.get_resources(user_id=self._mcp_effective_user_id)
-                prompts = self._mcp_client.get_prompts(user_id=self._mcp_effective_user_id)
+                tools = self._mcp_client.get_tools(user_id=command_principal or None)
+                resources = self._mcp_client.get_resources(user_id=command_principal or None)
+                prompts = self._mcp_client.get_prompts(user_id=command_principal or None)
                 mcp_lines = []
                 if tools:
                     mcp_lines.append(f"MCP tools ({len(tools)}):")
@@ -23033,12 +27174,26 @@ class ChatSession:
                     self.ui.on_info("\n".join(mcp_lines))
 
         elif cmd == "/retry":
-            user_msg = self.retry()
-            if user_msg is None:
-                self.ui.on_info("Nothing to retry.")
+            # retry() raises since the durable truncation became raising:
+            # GenerationCancelled (BaseException) on a refused admission
+            # (gone latch, racing close) and storage errors from the tail
+            # delete. The REPL dispatches commands uncaught, so convert to
+            # messages here instead of killing the process (round-4 review).
+            try:
+                user_msg = self.retry()
+            except GenerationCancelled:
+                self.ui.on_error(
+                    "Retry refused — the workstream is busy or no longer accepts history changes."
+                )
+            except Exception as exc:
+                log.warning("cli.retry_failed ws=%s", self._ws_id[:8], exc_info=True)
+                self.ui.on_error(f"Retry failed: {exc}")
             else:
-                self._pending_retry = user_msg
-                self.ui.on_info(f"Retrying: {user_msg[:80]}...")
+                if user_msg is None:
+                    self.ui.on_info("Nothing to retry.")
+                else:
+                    self._pending_retry = user_msg
+                    self.ui.on_info(f"Retrying: {user_msg[:80]}...")
 
         elif cmd == "/rewind":
             if not arg:
@@ -23054,14 +27209,25 @@ class ChatSession:
                     else:
                         turns_available = len(self._find_turn_boundaries())
                         actual_n = min(n, turns_available)
-                        removed = self.rewind(n)
-                        if removed == 0:
-                            self.ui.on_info("No turns to rewind.")
-                        else:
-                            self.ui.on_info(
-                                f"Rewound {actual_n} turn(s) ({removed} messages removed). "
-                                f"{len(self.messages)} messages remain."
+                        # Same raising contract as /retry above.
+                        try:
+                            removed = self.rewind(n)
+                        except GenerationCancelled:
+                            self.ui.on_error(
+                                "Rewind refused — the workstream is busy or "
+                                "no longer accepts history changes."
                             )
+                        except Exception as exc:
+                            log.warning("cli.rewind_failed ws=%s", self._ws_id[:8], exc_info=True)
+                            self.ui.on_error(f"Rewind failed: {exc}")
+                        else:
+                            if removed == 0:
+                                self.ui.on_info("No turns to rewind.")
+                            else:
+                                self.ui.on_info(
+                                    f"Rewound {actual_n} turn(s) ({removed} messages "
+                                    f"removed). {len(self.messages)} messages remain."
+                                )
 
         elif cmd == "/help":
             self.ui.on_info(

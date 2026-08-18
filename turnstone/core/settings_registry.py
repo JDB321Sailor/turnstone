@@ -9,6 +9,7 @@ excluded — they are needed before storage is available.
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -36,6 +37,12 @@ class SettingDef:
 # with the ChatSession constructor (default + sub-0.1 coercion fallback) so the
 # "invalid → default" behavior cannot drift between the registry and the engine.
 DEFAULT_AUTO_COMPACT_PCT = 0.8
+
+# A human approval is an operator-owned wait, not an execution deadline. Zero
+# disables passive timeout denial; cancel/close still wakes every pending gate.
+# Shared with ChatSession so the registry default and the value stamped onto
+# approval batches cannot drift.
+DEFAULT_APPROVAL_TIMEOUT_SECONDS = 0
 
 
 def _build_registry() -> dict[str, SettingDef]:
@@ -157,7 +164,8 @@ def _build_registry() -> dict[str, SettingDef]:
             "session.retention_days",
             "int",
             90,
-            "Days to retain conversation history (0 = disabled)",
+            "Days to keep unnamed workstreams (0 = no age pruning; "
+            "empty unnamed workstreams are still removed after a two-hour grace)",
             "session",
             min_value=0,
         ),
@@ -192,6 +200,19 @@ def _build_registry() -> dict[str, SettingDef]:
             "tools",
             min_value=1,
             max_value=3600,
+        ),
+        SettingDef(
+            "tools.approval_timeout_seconds",
+            "int",
+            DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+            "Human approval timeout in seconds (0 = wait indefinitely)",
+            "tools",
+            min_value=0,
+            max_value=int(threading.TIMEOUT_MAX),
+            help="How long a workstream waits for an operator to approve or deny a "
+            "pending action. The default 0 waits until someone decides or the "
+            "workstream is cancelled or closed. Set 3600 to restore the previous "
+            "one-hour timeout.",
         ),
         SettingDef(
             "tools.truncation",
@@ -235,7 +256,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "can be approved instead of being refused outright — the approval prompt "
             "marks it as a private-network request. A public site that redirects into "
             "your private network is still refused either way: that address never "
-            "appeared in the approval prompt, so it is never fetched.",
+            "appeared in the approval prompt, so it is never fetched. Cloud metadata "
+            "endpoints and link-local, multicast and reserved addresses stay refused "
+            "even with this on, including as a redirect target from a private address "
+            "you approved — no legitimate service of yours lives there.",
         ),
         SettingDef(
             "tools.search",
@@ -336,13 +360,14 @@ def _build_registry() -> dict[str, SettingDef]:
             "tools.rerank_bm25",
             "bool",
             True,
-            "Rerank BM25-backed retrieval (tool/skill search, memory) when configured",
+            "Rerank BM25-backed tool/skill search and live memory pointers when configured",
             "tools",
             help="When a rerank endpoint is configured, rerank BM25-backed retrieval "
-            "(tool search, skill search, memory composition). Disable on low-power hosts "
-            "to keep web_search reranking without paying the per-turn memory-composition "
-            "rerank. Reranking sends the candidate text (tool/skill names + descriptions, "
-            "and memory name/description/content) to the configured rerank endpoint; "
+            "(tool search, skill search, and live memory-pointer selection). Disable on "
+            "low-power hosts to keep web_search reranking without paying the per-user-turn "
+            "pointer rerank. Reranking sends the current query and candidate metadata "
+            "(tool/skill names + descriptions, and memory names + descriptions) to the "
+            "configured rerank endpoint; memory bodies are never sent. "
             "self-hosted (vLLM/llama.cpp/TEI) keeps it on your infrastructure, a hosted "
             "provider (Cohere/Jina/Voyage) sends it off-box.",
         ),
@@ -350,10 +375,10 @@ def _build_registry() -> dict[str, SettingDef]:
             "tools.rerank_bm25_threshold",
             "float",
             0.0,
-            "Fallback relevance floor (0-1) for proactive memory surfacing; 0 disables",
+            "Fallback relevance floor (0-1) for live memory pointers; 0 disables",
             "tools",
-            help="0-1 relevance-probability FALLBACK floor for PROACTIVE memory surfacing, used "
-            "only when the active reranker model has no per-model calibration (calibrate a "
+            help="0-1 relevance-probability FALLBACK floor for live memory-pointer selection, "
+            "used only when the active reranker model has no per-model calibration (calibrate a "
             "reranker via the Models tab to set its own floor, which takes precedence); 0 "
             "disables it. Reranker scores are normalised to 0-1 first (logit rerankers like "
             "bge/TEI are sigmoid-mapped), so the scale is uniform across endpoints.",
@@ -786,24 +811,34 @@ def _build_registry() -> dict[str, SettingDef]:
             "memory.relevance_k",
             "int",
             5,
-            "Top-K memories for relevance injection",
+            "Max relevant pointers per user turn",
             "memory",
             min_value=1,
             max_value=50,
-            help="How many saved memories to automatically include in each conversation. "
-            "Memories are ranked by text relevance and the top K are injected into the "
-            "model's context so it can recall past information.",
+            help="How many live, metadata-only memory pointers may be appended after a user "
+            "turn. The complete immutable index remains in the initial system prefix.",
         ),
         SettingDef(
-            "memory.fetch_limit",
+            "memory.index_budget_chars",
             "int",
-            50,
-            "Max memories fetched from storage",
+            65536,
+            "Soft memory-index budget in characters",
             "memory",
-            min_value=1,
-            max_value=500,
-            help="How many memories to load from the database for ranking. The top relevance_k "
-            "are selected from this pool. Higher values find better matches but cost more.",
+            min_value=1024,
+            max_value=1048576,
+            help="Persistent operator warnings appear when a live complete index exceeds this "
+            "size. The index is never silently truncated or filtered.",
+        ),
+        SettingDef(
+            "memory.model_index_over_budget_notice",
+            "bool",
+            False,
+            "Show memory-index over-budget notices to models",
+            "memory",
+            help="When enabled, a successful model memory-tool save reports that the "
+            "complete live index is above its soft character budget. REST and SDK save "
+            "responses are unchanged. Console admin health remains available regardless "
+            "of this setting.",
         ),
         SettingDef(
             "memory.max_content",
@@ -832,14 +867,13 @@ def _build_registry() -> dict[str, SettingDef]:
             "memory.nudges",
             "bool",
             True,
-            "Enable metacognitive nudges",
+            "Enable live memory pointers and metacognitive nudges",
             "memory",
-            help="When enabled, the system periodically reminds the AI to save important "
-            "information from conversations into long-term memory. This helps the AI "
-            "remember context across separate conversations. Also gates the coordinator's "
-            "open-task reminder. Does not affect coordinator liveness wakes (the 'children "
-            "still running' nudge), which fire regardless so an idle coordinator is never "
-            "silently stranded.",
+            help="When disabled, suppress live memory pointers and memory-directed nudges, "
+            "including save reminders, plus the coordinator's open-task reminder. The "
+            "immutable initial memory index and memory tool remain available. Coordinator "
+            "liveness wakes (the 'children still running' nudge) still fire so an idle "
+            "coordinator is never silently stranded.",
         ),
         # -- tls ----------------------------------------------------------------
         SettingDef(
@@ -851,7 +885,7 @@ def _build_registry() -> dict[str, SettingDef]:
             restart_required=True,
             help="When enabled, the console runs an internal Certificate Authority and "
             "ACME server. All cluster services (servers, channels) auto-provision "
-            "short-lived certificates for mutual TLS. Requires lacme: pip install turnstone[tls]",
+            "short-lived certificates for mutual TLS. ACME support is included with Turnstone.",
         ),
         SettingDef(
             "tls.acme_directory",

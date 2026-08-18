@@ -458,7 +458,9 @@ def test_recompute_is_memoized_per_turn():
     # _init_system_messages fires many times within a turn; between user-turn
     # appends the recompute is a no-op flag check, not an O(n) rescan.
     s = make_session(user_id="owner")
-    with patch("turnstone.core.session.get_storage", return_value=None):
+    storage = MagicMock()
+    storage.list_message_senders.return_value = []
+    with patch("turnstone.core.session.get_storage", return_value=storage):
         s._reset_shared_state()
         s._recompute_shared_state()
         s.messages.append(turn_from_dict({"role": "user", "content": "b", "_sender": "alice"}))
@@ -478,8 +480,13 @@ def test_append_user_turn_invalidates_shared_state():
     assert s._senders_dirty is True
 
 
-def test_new_participant_flips_shared_and_emits_join_note_once():
+def test_new_participant_flips_shared_and_emits_join_note_once(tmp_db):
+    from turnstone.core.memory import register_workstream
+
     s = make_session(user_id="owner")
+    # A participant-joined note is a keyed SYSTEM row.  Production creates the
+    # parent first; preserve that prerequisite in this direct-session test.
+    register_workstream(s.ws_id, user_id="owner")
     s._known_senders = {"owner"}
     # _maybe_note_new_participant recomputes (not hand-mutates) shared state,
     # deriving it from self.messages -- so, matching its real call contract
@@ -523,9 +530,11 @@ def test_resume_resets_shared_state():
     s._known_senders = {"alice"}
     s._shared_workstream = True
     turns = [turn_from_dict({"role": "user", "content": "x", "_sender": "owner"})]
+    storage = MagicMock()
+    storage.ensure_workstream_incarnation_snapshot.return_value = None
     with (
         patch("turnstone.core.session.load_message_turns", return_value=turns),
-        patch("turnstone.core.session.get_storage", return_value=None),
+        patch("turnstone.core.session.get_storage", return_value=storage),
         patch.object(s, "_reset_shared_state", wraps=s._reset_shared_state) as rst,
         patch.object(s, "_save_config"),
         patch.object(s, "_init_system_messages"),

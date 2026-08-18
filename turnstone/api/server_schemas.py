@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Pydantic evaluates this annotation while building the schema, so the symbol
 # must remain available at runtime rather than behind TYPE_CHECKING.
 from pydantic.json_schema import SkipJsonSchema  # noqa: TC002
 
-from turnstone.core.workstream import WorkstreamKind
+from turnstone.core.workstream import ConversationPersistenceState, WorkstreamKind
 
 # ---------------------------------------------------------------------------
 # Workstream management
@@ -19,6 +19,17 @@ from turnstone.core.workstream import WorkstreamKind
 
 class SendRequest(BaseModel):
     message: str = Field(description="User message text")
+    client_send_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description=(
+            "Opaque browser correlation token echoed in the accepted `user_turn` "
+            "event and history row. It is not an idempotency key; repeated sends "
+            "with the same value remain distinct turns."
+        ),
+    )
     attachment_ids: list[str] | None = Field(
         default=None,
         description=(
@@ -131,9 +142,19 @@ class TextToSpeechRequest(BaseModel):
 
 class ApproveRequest(BaseModel):
     approved: bool = Field(description="True to approve, false to deny")
-    feedback: str | None = Field(default=None, description="Optional denial reason")
+    feedback: str | None = Field(
+        default=None,
+        description=(
+            "Optional feedback forwarded under the initiating execution principal; "
+            "authorized peer resolvers must omit it."
+        ),
+    )
     always: bool = Field(
-        default=False, description="Auto-approve the tools in this batch going forward"
+        default=False,
+        description=(
+            "For a same-principal approval, auto-approve these tools for future "
+            "calls executing as that principal. Authorized peers cannot set this."
+        ),
     )
     cycle_id: str | None = Field(
         default=None,
@@ -369,6 +390,15 @@ class WorkstreamInfo(BaseModel):
     parent_ws_id: str | None = None
     user_id: str = ""
     project_id: str | None = None
+    persistence_state: ConversationPersistenceState = Field(
+        default="healthy",
+        description=(
+            "Sanitized durable-history status for the loaded workstream: "
+            "healthy, pending its first save, retrying automatically, or blocked "
+            "by a permanent commit conflict. Older servers and unloaded rows "
+            "default to healthy."
+        ),
+    )
 
 
 class ListWorkstreamsResponse(BaseModel):
@@ -499,6 +529,13 @@ class DashboardWorkstream(BaseModel):
     parent_ws_id: str | None = None
     user_id: str = ""
     project_id: str | None = None
+    persistence_state: ConversationPersistenceState = Field(
+        default="healthy",
+        description=(
+            "Sanitized durable-history status for this live row. Contains no "
+            "storage error, commit key, retry count, or conversation content."
+        ),
+    )
     pending_approval_details: list[PendingApprovalDetail] = Field(
         default_factory=list,
         description=(
@@ -595,6 +632,13 @@ class WorkstreamDetailResponse(BaseModel):
     state: str
     user_id: str
     kind: WorkstreamKind = WorkstreamKind.INTERACTIVE
+    persistence_state: ConversationPersistenceState = Field(
+        default="healthy",
+        description=(
+            "Sanitized durable-history status: healthy, pending its first save, "
+            "retrying automatically, or blocked by a permanent commit conflict."
+        ),
+    )
     pending_approval: bool = Field(
         default=False,
         description=(
@@ -635,12 +679,16 @@ class WorkstreamHistoryResponse(BaseModel):
     messages: list[dict[str, Any]] = Field(
         default_factory=list,
         description=(
-            "Tail of the workstream's message history, projected to the "
-            "canonical render shape (``role`` may be ``system`` for "
-            "operator-context turns; flat tool_calls with verdict / "
-            "output_assessment; top-level source / attachments / reasoning; "
-            "derived denied / is_error / pending). Bounded "
-            "by the ``limit`` query parameter (default 100, max 500)."
+            "Requested limit-bounded tail of one authoritative total accepted "
+            "conversation-row prefix, projected to the canonical render shape. "
+            "Roles include "
+            "``user``, ``assistant``, ``tool``, and ``system``; compaction "
+            "checkpoints project as ``role=system, source=compaction`` and "
+            "cancellation-generated assistant/tool markers appear when present. "
+            "The projection also carries flat tool_calls with verdict / "
+            "output_assessment; top-level source / attachments / reasoning; and "
+            "derived denied / is_error / pending. Bounded by the ``limit`` query "
+            "parameter (default 100, max 500)."
         ),
     )
     cursor: int | None = Field(
@@ -654,6 +702,18 @@ class WorkstreamHistoryResponse(BaseModel):
             "in-flight turn (tool calls, results, prompts) instead of the "
             "lossy synthetic snapshot. Null on every other read — the "
             "client connects fresh."
+        ),
+    )
+    handoff_token: str | None = Field(
+        default=None,
+        description=(
+            "Opaque token naming the exact accepted conversation-row prefix used "
+            "for this render. Present only while the workstream is loaded. A "
+            "client that renders this response passes the token once as the "
+            "initial event stream's ``history_token`` query parameter; the server "
+            "atomically validates it while registering the listener. Admission of "
+            "a later row changes the token; durable acknowledgement does not. "
+            "Clients must not inspect, persist, or reuse it for later reconnects."
         ),
     )
 
@@ -700,18 +760,49 @@ class HealthResponse(BaseModel):
 
 MemoryType = Literal["user", "general", "feedback", "reference"]
 MemoryScope = Literal["global", "workstream", "user"]
+MEMORY_NAME_INPUT_DESCRIPTION = (
+    "Memory identifier. Raw aliases may contain supported Latin letters that fold to "
+    "ASCII, ASCII digits, Unicode space separators, Unicode hyphens, and single "
+    "underscores. The server normalizes them to a lowercase ASCII snake_case key of "
+    "at most 256 characters. Other characters and leading, trailing, or repeated "
+    "underscores are rejected."
+)
 
 
 class SaveMemoryRequest(BaseModel):
-    name: str = Field(description="Memory identifier (normalized to snake_case)")
-    content: str = Field(description="Memory content", max_length=65536)
-    description: str = Field(default="", description="Short description for relevance matching")
-    type: MemoryType = Field(default="general", description="Memory type")
+    name: str = Field(
+        description=MEMORY_NAME_INPUT_DESCRIPTION,
+        min_length=1,
+    )
+    content: str = Field(description="Memory content", min_length=1, max_length=65536)
+    description: str = Field(
+        description="Required authored one-line memory-index hook",
+        min_length=1,
+        max_length=512,
+    )
+    type: MemoryType | None = Field(
+        default=None,
+        description="Memory type; omission preserves it on update and defaults on insert",
+    )
     scope: MemoryScope = Field(default="global", description="Memory scope")
     scope_id: str = Field(
         default="",
         description="Scope identifier (ws_id for workstream, user_id for user scope)",
     )
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _normalize_name(cls, value: object) -> str:
+        from turnstone.core.memory import normalize_memory_name
+
+        return normalize_memory_name(value)
+
+    @field_validator("description", mode="before")
+    @classmethod
+    def _normalize_description(cls, value: object) -> str:
+        from turnstone.core.memory_index import normalize_memory_description
+
+        return normalize_memory_description(value)
 
     @model_validator(mode="after")
     def _validate_scope_scope_id(self) -> SaveMemoryRequest:
@@ -723,20 +814,25 @@ class SaveMemoryRequest(BaseModel):
         return self
 
 
-class MemoryInfo(BaseModel):
+class MemorySummary(BaseModel):
     memory_id: str
     name: str
     description: str = ""
     type: MemoryType
     scope: MemoryScope
     scope_id: str = ""
-    content: str
     created: str
     updated: str
+    last_accessed: str = ""
+    access_count: int = 0
+
+
+class MemoryInfo(MemorySummary):
+    content: str
 
 
 class ListMemoriesResponse(BaseModel):
-    memories: list[MemoryInfo]
+    memories: list[MemorySummary]
     total: int = 0
 
 
@@ -745,7 +841,7 @@ MemoryScopeFilter = Literal["", "global", "workstream", "user"]
 
 
 class SearchMemoriesRequest(BaseModel):
-    query: str = Field(description="Search query text")
+    query: str = Field(description="Search query text", min_length=1)
     type: MemoryTypeFilter = Field(default="", description="Filter by memory type")
     scope: MemoryScopeFilter = Field(default="", description="Filter by scope")
     scope_id: str = Field(default="", description="Filter by scope_id")
@@ -758,6 +854,8 @@ class SearchMemoriesRequest(BaseModel):
             raise ValueError("scope_id is not allowed with global scope")
         if scope_id and not self.scope:
             raise ValueError("scope is required when scope_id is provided")
+        if self.scope == "workstream" and not scope_id:
+            raise ValueError("scope_id is required for workstream scope")
         return self
 
 

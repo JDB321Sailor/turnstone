@@ -3,9 +3,9 @@
 # Bump version, regenerate lockfile, commit, and tag.
 #
 # Usage:
-#   scripts/release.sh 1.0.0          # stable release
-#   scripts/release.sh 1.1.0a1        # experimental pre-release
-#   scripts/release.sh 1.0.1 --push   # bump + push tag to origin
+#   scripts/release.sh 1.8.1 --push   # stable release from main
+#   scripts/release.sh 1.9.0a1 --push # pre-release from dev
+#   scripts/release.sh 1.8.2 --push   # prior-line patch from stable/1.8
 #
 set -euo pipefail
 
@@ -20,6 +20,43 @@ if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(a[0-9]+|b[0-9]+|rc[0-9]
 fi
 
 TAG="v${VERSION}"
+
+# Enforce the release topology before changing any files. main is the current
+# stable line, dev is the next-release line, and stable/X.Y is a maintained
+# prior line whose branch name must match the version being released.
+BRANCH=$(git symbolic-ref --quiet --short HEAD || true)
+if [ -z "$BRANCH" ]; then
+    echo "error: releases must be cut from a branch, not detached HEAD" >&2
+    exit 1
+fi
+
+if echo "$VERSION" | grep -qE '(a|b|rc)[0-9]+$'; then
+    if [ "$BRANCH" != "dev" ]; then
+        echo "error: pre-releases must be cut from dev (current branch: $BRANCH)" >&2
+        exit 1
+    fi
+else
+    case "$BRANCH" in
+        main)
+            ;;
+        stable/*)
+            RELEASE_LINE="${VERSION%.*}"
+            if [ "$BRANCH" != "stable/$RELEASE_LINE" ]; then
+                echo "error: $VERSION belongs on stable/$RELEASE_LINE, not $BRANCH" >&2
+                exit 1
+            fi
+            ;;
+        dev)
+            echo "error: stable releases must be cut from main or matching stable/X.Y" >&2
+            exit 1
+            ;;
+        *)
+            echo "error: releases must be cut from main, dev, or stable/X.Y" >&2
+            echo "  current branch: $BRANCH" >&2
+            exit 1
+            ;;
+    esac
+fi
 
 # Check for clean working tree
 if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -54,9 +91,8 @@ echo ""
 echo "Created commit and tag $TAG"
 
 if [ "$PUSH" = "--push" ]; then
-    BRANCH=$(git rev-parse --abbrev-ref HEAD)
     echo "Pushing $BRANCH + $TAG to origin..."
-    git push origin "$BRANCH" "$TAG"
+    git push --atomic origin "$BRANCH" "$TAG"
 else
-    echo "Run 'git push origin <branch> $TAG' to publish"
+    echo "Run 'git push --atomic origin $BRANCH $TAG' to publish"
 fi

@@ -119,6 +119,7 @@ def _register_cycle(
     judge_event: object | None = None,
     cancel_witness: object | None = None,
     cycle_id: str | None = None,
+    execution_principal_id: str = "",
 ) -> Any:
     """Register a live ApprovalCycle the way ``approve_tools`` does.
 
@@ -129,7 +130,13 @@ def _register_cycle(
     from turnstone.core.session_ui_base import ApprovalCycle
 
     items = [
-        {"call_id": cid, "func_name": "bash", "approval_label": "bash", "needs_approval": True}
+        {
+            "call_id": cid,
+            "func_name": "bash",
+            "approval_label": "bash",
+            "needs_approval": True,
+            "_principal_id": execution_principal_id,
+        }
         for cid in call_ids
     ]
     if cancel_witness is not None:
@@ -178,6 +185,88 @@ def test_resolve_approval_broadcasts_approval_resolved() -> None:
     # Cycle identity rides the event so clients dismiss the RIGHT card.
     assert event["cycle_id"] == cycle.cycle_id
     assert event["call_ids"] == ["c1"]
+
+
+def test_peer_can_make_binary_decision_but_cannot_add_feedback_or_always() -> None:
+    from turnstone.core.session_ui_base import CrossPrincipalApprovalError
+
+    storage = MagicMock()
+    ui = _make_ui()
+    feedback_cycle = _register_cycle(ui, ["feedback"], execution_principal_id="alice")
+    feedback_cycle.pending_verdicts = [{"verdict_id": "v-peer", "call_id": "feedback"}]
+    with pytest.raises(CrossPrincipalApprovalError, match="only the initiating principal"):
+        ui.resolve_approval(
+            False,
+            "please change this",
+            cycle_id=feedback_cycle.cycle_id,
+            resolver_principal_id="bob",
+        )
+    assert not feedback_cycle.resolved
+
+    always_cycle = _register_cycle(ui, ["always"], execution_principal_id="alice")
+    with pytest.raises(CrossPrincipalApprovalError, match="only the initiating principal"):
+        ui.resolve_approval(
+            True,
+            always=True,
+            cycle_id=always_cycle.cycle_id,
+            resolver_principal_id="bob",
+        )
+    assert not always_cycle.resolved
+
+    reject_cycle = _register_cycle(ui, ["reject"], execution_principal_id="alice")
+    assert (
+        ui.resolve_approval(
+            False,
+            cycle_id=reject_cycle.cycle_id,
+            resolver_principal_id="bob",
+        )
+        == reject_cycle.cycle_id
+    )
+    assert reject_cycle.result == (False, None)
+
+    with _patch_get_storage(storage):
+        assert (
+            ui.resolve_approval(
+                True,
+                cycle_id=feedback_cycle.cycle_id,
+                resolver_principal_id="bob",
+            )
+            == feedback_cycle.cycle_id
+        )
+    assert feedback_cycle.resolver_principal_id == "bob"
+    assert feedback_cycle.execution_principal_id == "alice"
+    storage.update_intent_verdict.assert_called_once_with(
+        "v-peer",
+        user_decision="approved",
+        resolver_principal_id="bob",
+        execution_principal_id="alice",
+    )
+
+
+def test_same_principal_feedback_and_always_are_preserved_and_attributed() -> None:
+    storage = MagicMock()
+    ui = _make_ui()
+    cycle = _register_cycle(ui, ["c1"], execution_principal_id="alice")
+    cycle.pending_verdicts = [{"verdict_id": "v1", "call_id": "c1"}]
+
+    with _patch_get_storage(storage):
+        resolved = ui.resolve_approval(
+            True,
+            "ship it",
+            always=True,
+            cycle_id=cycle.cycle_id,
+            resolver_principal_id="alice",
+        )
+
+    assert resolved == cycle.cycle_id
+    assert cycle.result == (True, "ship it")
+    assert ui._always_approve_tools_by_principal["alice"] == {"bash"}
+    storage.update_intent_verdict.assert_called_once_with(
+        "v1",
+        user_decision="approved",
+        resolver_principal_id="alice",
+        execution_principal_id="alice",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -570,12 +659,17 @@ def test_resolve_approval_timeout_kwarg_writes_timeout_value() -> None:
     string used to carry this distinction but the column alone could not."""
     storage = MagicMock()
     ui = _make_ui()
-    _register_cycle(ui, ["c1"])
+    _register_cycle(ui, ["c1"], execution_principal_id="alice")
     with _patch_get_storage(storage):
         ui.on_intent_verdict({"verdict_id": "v1", "call_id": "c1"})
     with _patch_get_storage(storage):
         ui.resolve_approval(False, "expired", timeout=True)
-    storage.update_intent_verdict.assert_any_call("v1", user_decision="timeout")
+    storage.update_intent_verdict.assert_any_call(
+        "v1",
+        user_decision="timeout",
+        resolver_principal_id="",
+        execution_principal_id="alice",
+    )
     assert ui._recent_decisions.get("c1") == ("timeout", None)
 
 
@@ -1547,7 +1641,7 @@ def test_register_listener_with_in_progress_snapshot_empty() -> None:
     lq, snap = ui.register_listener_with_in_progress_snapshot()
     assert isinstance(lq, queue.Queue)
     assert lq in ui._listeners
-    assert snap == {"content": "", "reasoning": "", "seq": 0}
+    assert snap == {"content": "", "reasoning": "", "seq": 0, "agent_contexts": []}
 
 
 def test_register_listener_with_in_progress_snapshot_populated() -> None:
@@ -2461,6 +2555,115 @@ class TestAgentChildTagging:
         assert lq.get_nowait()["parent_call_id"] == "task-B"
 
 
+class TestAgentContextSnapshots:
+    """Running task-agent usage is live fan-out plus a reconnect snapshot."""
+
+    def test_live_event_and_fresh_snapshot_share_one_shape(self) -> None:
+        ui = _make_ui()
+        listener = ui._register_listener()
+
+        ui.on_agent_context("task-A", 41_000, 128_000, generation=7)
+
+        event = listener.get_nowait()
+        assert event == {
+            "type": "agent_context",
+            "ws_id": "ws-1",
+            "parent_call_id": "task-A",
+            "prompt_tokens": 41_000,
+            "context_window": 128_000,
+            "_event_id": 1,
+        }
+        _, snapshot = ui.register_listener_with_in_progress_snapshot()
+        assert snapshot["agent_contexts"] == [
+            {
+                "type": "agent_context",
+                "ws_id": "ws-1",
+                "parent_call_id": "task-A",
+                "prompt_tokens": 41_000,
+                "context_window": 128_000,
+            }
+        ]
+
+    def test_parallel_agents_keep_independent_latest_readings(self) -> None:
+        ui = _make_ui()
+        ui.on_agent_context("task-A", 10, 100, generation=3)
+        ui.on_agent_context("task-B", 70, 200, generation=3)
+        ui.on_agent_context("task-A", 80, 100, generation=3)
+
+        _, snapshot = ui.register_listener_with_in_progress_snapshot()
+        readings = {event["parent_call_id"]: event for event in snapshot["agent_contexts"]}
+        assert readings["task-A"]["prompt_tokens"] == 80
+        assert readings["task-B"]["prompt_tokens"] == 70
+
+    def test_clear_and_overwrite_are_generation_scoped(self) -> None:
+        ui = _make_ui()
+        ui.on_agent_context("reused", 10, 100, generation=4)
+        ui.on_agent_context("reused", 20, 100, generation=5)
+
+        # The retiring predecessor can neither overwrite nor clear generation 5.
+        ui.on_agent_context("reused", 99, 100, generation=4)
+        ui.clear_agent_context("reused", generation=4)
+        assert ui._snapshot_agent_contexts()[0]["prompt_tokens"] == 20
+
+        ui.clear_agent_context("reused", generation=5)
+        assert ui._snapshot_agent_contexts() == []
+
+    def test_force_cutoff_clears_only_retired_generations(self) -> None:
+        ui = _make_ui()
+        ui.on_agent_context("old-A", 10, 100, generation=4)
+        ui.on_agent_context("old-B", 20, 100, generation=4)
+        ui.on_agent_context("successor", 30, 100, generation=5)
+
+        ui.clear_agent_contexts_before_generation(5)
+
+        readings = ui._snapshot_agent_contexts()
+        assert [event["parent_call_id"] for event in readings] == ["successor"]
+
+    def test_replay_registration_captures_active_contexts(self) -> None:
+        ui = _make_ui()
+        ui.on_agent_context("task-A", 10, 100, generation=1)
+
+        _, _events, status, _lost, _earliest, snapshot = ui.register_listener_with_replay(-1)
+
+        assert status == "truncated"
+        assert snapshot["agent_contexts"][0]["parent_call_id"] == "task-A"
+
+    def test_store_before_enqueue_closes_registration_loss_window(self) -> None:
+        """A subscriber in the store/enqueue gap gets snapshot and live copies.
+
+        Duplicate delivery is intentional and harmless because ``agent_context``
+        is a keyed replacement event. Missing both copies would strand a
+        refreshed badge until the task agent made another model call.
+        """
+        ui = _make_ui()
+        stored = threading.Event()
+        release = threading.Event()
+        original_enqueue = ui._enqueue
+
+        def blocked_enqueue(event: dict[str, Any]) -> int:
+            stored.set()
+            assert release.wait(timeout=2)
+            return original_enqueue(event)
+
+        with patch.object(ui, "_enqueue", side_effect=blocked_enqueue):
+            writer = threading.Thread(
+                target=ui.on_agent_context,
+                args=("task-A", 50, 100),
+                kwargs={"generation": 2},
+            )
+            writer.start()
+            try:
+                assert stored.wait(timeout=2)
+                listener, snapshot = ui.register_listener_with_in_progress_snapshot()
+                assert snapshot["agent_contexts"][0]["prompt_tokens"] == 50
+            finally:
+                release.set()
+                writer.join(timeout=2)
+
+        assert not writer.is_alive()
+        assert listener.get_nowait()["type"] == "agent_context"
+
+
 class TestAgentScopeInfoSuppression:
     """While a task agent runs, its ``on_info`` progress chatter ("[task done] N
     chars", a tool's "fetched N chars") carries no call_id, so it can't nest
@@ -2626,6 +2829,61 @@ def _wait_for_cycles(ui: SessionUIBase, count: int, deadline: float = 5.0) -> No
     raise AssertionError(f"never saw {count} live cycles")
 
 
+def test_zero_approval_timeout_waits_until_explicit_resolution() -> None:
+    """The registry's zero sentinel reaches ``Event.wait`` as ``None``."""
+    ui = _make_ui()
+    item = _pending_item("no-timeout")
+    item["_approval_wait_seconds"] = None
+
+    with _gate_harness(ui) as spawn:
+        gate, outcome = spawn(item)
+        _wait_for_cycles(ui, 1)
+        assert gate.is_alive(), "zero was passed through as an immediate timeout"
+        assert ui.resolve_approval(True, "approved later", call_id="no-timeout") is not None
+        gate.join(timeout=2.0)
+
+    assert not gate.is_alive()
+    assert outcome == {"approved": True, "feedback": "approved later"}
+
+
+def test_hard_delete_terminal_barrier_wakes_unbounded_approval() -> None:
+    """The hard-delete barrier signals gates after advancing their witness."""
+    from tests._session_helpers import make_session
+    from turnstone.core.session import _ApprovalCancelWitness
+
+    session = make_session(ws_id="hard-delete-approval")
+    ui = session.ui
+    item = _pending_item("hard-delete-call")
+    item["_approval_cancel_witness"] = _ApprovalCancelWitness(session)
+    item["_approval_wait_seconds"] = None
+
+    with _gate_harness(ui) as spawn:
+        gate, outcome = spawn(item)
+        _wait_for_cycles(ui, 1)
+        session.shutdown_publication_and_drain_durability()
+        gate.join(timeout=2.0)
+
+    assert not gate.is_alive()
+    assert outcome == {"approved": False, "feedback": "Workstream closed"}
+    assert ui._approval_cycles == {}
+
+
+def test_finite_approval_timeout_uses_captured_batch_value() -> None:
+    """A positive setting retains passive denial and its exact audit text."""
+    ui = _make_ui()
+    item = _pending_item("finite-timeout")
+    item["_approval_wait_seconds"] = 0.01
+
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        approved, feedback = ui.approve_tools([item])
+
+    assert approved is False
+    assert feedback == "Approval timed out after 0.01s"
+    assert item["denied"] is True
+    assert item["denial_msg"] == "Denied by user: Approval timed out after 0.01s"
+    assert ui._recent_decisions["finite-timeout"] == ("timeout", None)
+
+
 def test_concurrent_gates_resolve_independently() -> None:
     """THE cross-approval regression: two parallel gates, two separate
     decisions.  Approving A's cycle must not wake B, and B's later
@@ -2647,6 +2905,36 @@ def test_concurrent_gates_resolve_independently() -> None:
         assert not tb.is_alive()
         assert box_b["approved"] is False
         assert box_b["feedback"] == "not this one"
+
+
+def test_always_grant_is_isolated_by_execution_principal() -> None:
+    ui = _make_ui()
+    seed = _register_cycle(ui, ["seed"], execution_principal_id="alice")
+    assert (
+        ui.resolve_approval(
+            True,
+            always=True,
+            cycle_id=seed.cycle_id,
+            resolver_principal_id="alice",
+        )
+        == seed.cycle_id
+    )
+
+    alice_item = _pending_item("alice-next")
+    alice_item["_principal_id"] = "alice"
+    with _patch_get_storage(MagicMock()), _patch_policies({}):
+        assert ui.approve_tools([alice_item]) == (True, None)
+    assert alice_item["auto_approve_reason"] == "always"
+
+    bob_item = _pending_item("bob-next")
+    bob_item["_principal_id"] = "bob"
+    with _gate_harness(ui) as spawn:
+        bob_thread, bob_result = spawn(bob_item)
+        _wait_for_cycles(ui, 2)  # seed remains registered + Bob's live gate
+        assert bob_thread.is_alive()
+        assert ui.resolve_approval(False, call_id="bob-next") is not None
+        bob_thread.join(timeout=5.0)
+        assert bob_result["approved"] is False
 
 
 def test_sibling_gate_entry_cannot_eat_a_resolution() -> None:
@@ -2702,6 +2990,34 @@ def test_resolve_all_approvals_wakes_every_gate() -> None:
         assert box_a["approved"] is False
         assert box_b["approved"] is False
         assert "Cancelled by user" in (box_a["feedback"] or "")
+
+
+def test_resolve_all_approvals_stamps_authenticated_resolver() -> None:
+    storage = MagicMock()
+    ui = _make_ui()
+    first = _register_cycle(ui, ["a-1"], execution_principal_id="alice")
+    second = _register_cycle(ui, ["b-1"], execution_principal_id="bob")
+    with _patch_get_storage(storage):
+        ui.on_intent_verdict({"verdict_id": "v-a", "call_id": "a-1"})
+
+    with _patch_get_storage(storage):
+        assert (
+            ui.resolve_all_approvals(
+                False,
+                "Cancelled by user",
+                resolver_principal_id="operator",
+            )
+            == 2
+        )
+
+    assert first.resolver_principal_id == "operator"
+    assert second.resolver_principal_id == "operator"
+    storage.update_intent_verdict.assert_any_call(
+        "v-a",
+        user_decision="denied",
+        resolver_principal_id="operator",
+        execution_principal_id="alice",
+    )
 
 
 def test_resolve_all_continues_after_first_resolution_transport_failure(
@@ -3776,8 +4092,8 @@ def test_concurrent_smart_gate_and_human_gate() -> None:
         assert box_a["approved"] is True
 
 
-def test_chat_session_stamps_one_smart_config_snapshot_without_mutating_ui() -> None:
-    """The gate producer copies one JudgeConfig generation onto every item."""
+def test_chat_session_stamps_live_approval_config_without_mutating_ui() -> None:
+    """Each batch captures Smart settings plus the current human deadline."""
     from turnstone.core.judge import JudgeConfig
     from turnstone.core.session import ChatSession
 
@@ -3793,13 +4109,30 @@ def test_chat_session_stamps_one_smart_config_snapshot_without_mutating_ui() -> 
         confidence_threshold=0.87,
         timeout=4.5,
     )
+    session._config_store = MagicMock()
+    session._config_store.get.return_value = 0
+    session._approval_wait_seconds.side_effect = lambda: ChatSession._approval_wait_seconds(session)
     items = [_pending_item("snapshot-a"), _pending_item("snapshot-b")]
 
     ChatSession._push_smart_approval_config(session, items)
 
     snapshot = items[0]["_smart_approval_config"]
-    assert snapshot == _SmartApprovalConfig(enabled=True, threshold=0.87, wait_seconds=4.5)
+    assert snapshot == _SmartApprovalConfig(
+        enabled=True,
+        threshold=0.87,
+        wait_seconds=4.5,
+    )
     assert items[1]["_smart_approval_config"] is snapshot
+    assert items[0]["_approval_wait_seconds"] is None
+    assert items[1]["_approval_wait_seconds"] is None
+
+    # A hot reload affects the next gate but cannot mutate this batch's
+    # already-captured immutable deadline.
+    session._config_store.get.return_value = 90_000
+    next_items = [_pending_item("snapshot-next")]
+    ChatSession._push_smart_approval_config(session, next_items)
+    assert next_items[0]["_approval_wait_seconds"] == 90_000.0
+    assert items[0]["_approval_wait_seconds"] is None
     assert (
         ui.smart_approvals_enabled,
         ui.smart_approval_threshold,

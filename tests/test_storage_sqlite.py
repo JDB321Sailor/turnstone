@@ -598,7 +598,16 @@ class TestDeleteWorkstream:
 
 class TestPruneWorkstreams:
     def test_orphan_removed(self, backend):
+        import sqlalchemy as sa
+
         backend.register_workstream("orphan")
+        # Age past the orphan grace; a fresh empty row is deliberately kept
+        # (round-3 review) — pinned in test_sessions.py.
+        with backend._engine.connect() as conn:
+            conn.execute(
+                sa.text("UPDATE workstreams SET updated = '2020-01-01' WHERE ws_id = 'orphan'")
+            )
+            conn.commit()
         orphans, stale = backend.prune_workstreams()
         assert orphans == 1
 
@@ -790,73 +799,6 @@ class TestWorkstreams:
         # Columns: ws_id, alias, title, name, created, updated, count, node_id
         assert rows[0][0] == "ws1"
         assert rows[0][7] == "node-a"
-
-
-# -- Structured memory touch ---------------------------------------------------
-
-
-class TestTouchStructuredMemory:
-    @staticmethod
-    def _create_memory(
-        backend: Any, name: str = "m1", scope: str = "global", scope_id: str = ""
-    ) -> None:
-        import uuid
-
-        backend.create_structured_memory(
-            memory_id=str(uuid.uuid4()),
-            name=name,
-            description="test desc",
-            mem_type="general",
-            scope=scope,
-            scope_id=scope_id,
-            content="test content",
-        )
-
-    def test_batch_touch_multiple(self, backend):
-        self._create_memory(backend, name="a")
-        self._create_memory(backend, name="b")
-        self._create_memory(backend, name="c")
-
-        count = backend.touch_structured_memories(
-            [
-                ("a", "global", ""),
-                ("b", "global", ""),
-                ("c", "global", ""),
-            ]
-        )
-        assert count == 3
-
-        for name in ("a", "b", "c"):
-            mem = backend.get_structured_memory_by_name(name, "global", "")
-            assert int(mem["access_count"]) == 1
-
-    def test_batch_touch_empty_list(self, backend):
-        assert backend.touch_structured_memories([]) == 0
-
-    def test_batch_touch_partial_match(self, backend):
-        self._create_memory(backend, name="exists")
-
-        count = backend.touch_structured_memories(
-            [
-                ("exists", "global", ""),
-                ("missing", "global", ""),
-            ]
-        )
-        assert count == 1
-
-        mem = backend.get_structured_memory_by_name("exists", "global", "")
-        assert int(mem["access_count"]) == 1
-
-    def test_batch_touch_with_duplicates(self, backend):
-        """Duplicate keys in batch should each increment access_count once."""
-        self._create_memory(backend, name="dup")
-
-        # Two identical keys — storage gets called twice for the same row
-        count = backend.touch_structured_memories([("dup", "global", ""), ("dup", "global", "")])
-        assert count == 2
-
-        mem = backend.get_structured_memory_by_name("dup", "global", "")
-        assert int(mem["access_count"]) == 2
 
 
 # -- Per-workstream usage aggregation -----------------------------------------

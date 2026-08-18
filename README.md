@@ -36,6 +36,25 @@ Named after the [Ruddy Turnstone](https://en.wikipedia.org/wiki/Ruddy_turnstone)
 | **Stable** | `pip install turnstone` | `ghcr.io/turnstonelabs/turnstone:stable` | Production-grade. Bugfixes only. |
 | **Experimental** | `pip install turnstone --pre` | `ghcr.io/turnstonelabs/turnstone:experimental` | New features. May have rough edges. |
 
+### Repository branches
+
+Beginning with 1.8.0, stable releases and next-release development use distinct
+branches:
+
+| Branch | Role | Pull requests |
+|--------|------|---------------|
+| `main` | Current stable release and install source | Fixes that should ship on the current stable line |
+| `dev` | Next release integration and GitHub default | Features, refactors, and development-only fixes |
+| `stable/X.Y` | Maintained prior release line | Fixes for that supported older minor |
+
+GitHub defaults to `dev`, so new pull requests and ordinary source clones start
+on the development line. Stable-source install paths explicitly select `main`.
+There is no independently writable `stable/X.Y` mirror for the minor currently
+on `main`. Before `main` advances to the next stable minor, its current tip is
+preserved as that minor's maintenance branch. Maintainers then merge fixes
+forward (`stable/X.Y` → `main` → `dev`) so the branches retain shared ancestry
+without recurring cherry-picks.
+
 See [docs/releasing.md](docs/releasing.md) for the full release process.
 
 ## What it does
@@ -86,9 +105,11 @@ installs git + Docker if missing, generates secrets, and starts the stack:
 curl -fsSL https://raw.githubusercontent.com/turnstonelabs/turnstone/main/run.sh | bash
 ```
 
-Or, if you already have Docker, clone the repo and run it yourself:
+Or, if you already have Docker, clone the stable source and run it yourself:
 
 ```bash
+git clone --branch main https://github.com/turnstonelabs/turnstone
+cd turnstone
 docker compose up
 ```
 

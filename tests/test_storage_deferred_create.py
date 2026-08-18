@@ -511,6 +511,8 @@ def test_postgresql_register_uses_returning_when_driver_rowcount_is_unknown() ->
     backend, conn = _scripted_postgres_backend(
         _UnknownRowcountResult(row=(ws_id,)),
         _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
     )
 
     assert (
@@ -554,6 +556,8 @@ def test_postgresql_conditional_delete_uses_returning_when_rowcount_is_unknown()
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
         _UnknownRowcountResult(row=(ws_id,)),
     )
 
@@ -571,6 +575,8 @@ def test_postgresql_stale_creating_reaper_locks_state_age_and_exact_incarnation(
         _UnknownRowcountResult(row=(token,)),
         _UnknownRowcountResult(row=(ws_id,)),
         _UnknownRowcountResult(rows=[]),
+        _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
@@ -615,6 +621,8 @@ def test_postgresql_stale_creating_reaper_recovers_tokenless_locked_row(
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
         _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
+        _UnknownRowcountResult(),
         _UnknownRowcountResult(row=(ws_id,)),
     )
 
@@ -636,6 +644,16 @@ def test_postgresql_stale_creating_reaper_recovers_tokenless_locked_row(
 
 
 def test_postgresql_retention_prune_excludes_creating_rows() -> None:
+    """Both candidate discoveries exclude provisional rows, and take no locks.
+
+    Discovery moved out of the deleting transaction when prune became one
+    bounded transaction per candidate: it is a plain read now, with no
+    ``FOR UPDATE SKIP LOCKED`` and nothing to commit.  That lock rides each
+    candidate's own transaction instead — see
+    ``test_postgresql_prune_candidate_locks_rechecks_and_commits_alone`` in
+    tests/test_storage_prune_commit_races.py.  The predicates themselves are
+    unchanged, which is what this test pins.
+    """
     backend, conn = _scripted_postgres_backend(
         _UnknownRowcountResult(rows=[]),
         _UnknownRowcountResult(rows=[]),
@@ -644,12 +662,96 @@ def test_postgresql_retention_prune_excludes_creating_rows() -> None:
     assert backend.prune_workstreams(retention_days=30) == (0, 0)
 
     conn.assert_consumed()
-    assert conn.commits == 1
+    assert conn.commits == 0
+    orphan_select_sql = str(
+        conn.statements[0].compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    ).lower()
     stale_select_sql = str(
         conn.statements[1].compile(
             dialect=postgresql.dialect(),
             compile_kwargs={"literal_binds": True},
         )
     ).lower()
-    assert "workstreams.state" in stale_select_sql
-    assert "creating" in stale_select_sql
+    for candidate_sql in (orphan_select_sql, stale_select_sql):
+        assert "workstreams.state" in candidate_sql
+        assert "creating" in candidate_sql
+        assert "for update" not in candidate_sql
+    assert "not (exists" in orphan_select_sql
+    # Round-3 review guards: the orphan category excludes named workstreams
+    # (explicit user intent) and rows younger than the grace (a user
+    # mid-first-turn whose rows may still be journal-held on another node).
+    assert "workstreams.alias is null" in orphan_select_sql
+    assert "workstreams.updated" in orphan_select_sql
+    assert "workstreams.updated" in stale_select_sql
+
+
+def test_live_workstream_id_collision_is_rejected(backend) -> None:
+    ws_id = "live-collision-id"
+    assert backend.register_workstream(ws_id, state="idle", user_id="u1") is True
+    assert backend.register_workstream(ws_id, state="idle", user_id="u2") is False
+    row = backend.get_workstream(ws_id)
+    assert row is not None
+    assert row["user_id"] == "u1"
+
+
+def test_hard_deleted_workstream_id_can_be_reused_without_memory_state(backend) -> None:
+    ws_id = "reusable-deleted-id"
+    assert backend.register_workstream(ws_id, state="idle", user_id="u1") is True
+    backend.save_message(ws_id, "user", "predecessor history")
+    backend.create_structured_memory(
+        "predecessor-memory",
+        "predecessor_note",
+        "Memory owned by the predecessor",
+        "general",
+        "workstream",
+        ws_id,
+        "predecessor body",
+    )
+    snapshot = backend.acquire_memory_index_snapshot(ws_id, "u1")
+    assert snapshot is not None
+    assert "predecessor_note" in snapshot["content"]
+
+    assert backend.delete_workstream(ws_id) is True
+    assert backend.get_memory_index_snapshot(ws_id) is None
+    assert backend.get_structured_memory("predecessor-memory") is None
+    assert backend.load_message_turns(ws_id) == []
+
+    assert backend.register_workstream(ws_id, state="idle", user_id="u2") is True
+    replacement = backend.get_workstream(ws_id)
+    assert replacement is not None
+    assert replacement["user_id"] == "u2"
+    assert backend.get_memory_index_snapshot(ws_id) is None
+    assert (
+        backend.list_structured_memories(
+            scope="workstream",
+            scope_id=ws_id,
+        )
+        == []
+    )
+    assert backend.load_message_turns(ws_id) == []
+
+
+def test_exact_delete_releases_creating_reservation_id(backend) -> None:
+    ws_id = "retryable-create-id"
+    assert (
+        backend.register_workstream(
+            ws_id,
+            state="creating",
+            user_id="u1",
+            fork_reservation_token="reservation-one",
+        )
+        is True
+    )
+    assert backend.delete_workstream_if_fork_reserved(ws_id, "reservation-one") is True
+    assert (
+        backend.register_workstream(
+            ws_id,
+            state="creating",
+            user_id="u1",
+            fork_reservation_token="reservation-two",
+        )
+        is True
+    )

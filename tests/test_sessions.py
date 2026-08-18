@@ -1,5 +1,6 @@
 """Tests for workstream persistence and resume functionality."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 import sqlalchemy as sa
@@ -879,13 +880,47 @@ class TestWorkstreamConfig:
 # ── Prune workstreams ─────────────────────────────────────────────────
 
 
+def _backdate_updated(ws_id: str) -> None:
+    """Age a row past the orphan grace (and any retention cutoff)."""
+    engine = get_storage()._engine  # noqa: SLF001
+    with engine.connect() as conn:
+        conn.execute(
+            sa.text("UPDATE workstreams SET updated = '2020-01-01' WHERE ws_id = :ws"),
+            {"ws": ws_id},
+        )
+        conn.commit()
+
+
 class TestPruneWorkstreams:
     def test_orphan_removed(self, tmp_db):
-        """Workstream registered with no messages should be pruned."""
+        """An AGED empty workstream is pruned as an orphan (round-3 review:
+        eligibility now requires outliving the grace — see the fresh/named
+        twins below for the guards)."""
         register_workstream("orphan")
+        _backdate_updated("orphan")
         orphans, stale = prune_workstreams()
         assert orphans == 1
         assert list_workstreams_with_history() == []
+
+    def test_fresh_empty_workstream_survives_the_grace(self, tmp_db):
+        """A just-registered empty workstream is a user mid-first-turn (its
+        rows may still be journal-held on a serving node another node's prune
+        cannot see) — never housekeeping debris.  Round-3 review pin."""
+        register_workstream("fresh-empty")
+        orphans, stale = prune_workstreams()
+        assert (orphans, stale) == (0, 0)
+        assert get_storage().get_workstream("fresh-empty") is not None
+
+    def test_named_empty_workstream_never_pruned(self, tmp_db):
+        """An aliased workstream is explicit user intent: excluded from the
+        orphan category regardless of age, mirroring the stale category's
+        alias exclusion.  Round-3 review pin."""
+        register_workstream("named-empty")
+        set_workstream_alias("named-empty", "keep-me")
+        _backdate_updated("named-empty")
+        orphans, stale = prune_workstreams(retention_days=30)
+        assert (orphans, stale) == (0, 0)
+        assert get_storage().get_workstream("named-empty") is not None
 
     def test_workstream_with_messages_kept(self, tmp_db):
         """Workstream with messages should not be pruned."""
@@ -936,6 +971,7 @@ class TestPruneWorkstreams:
     def test_prune_removes_workstream_config(self, tmp_db):
         """Pruning orphan/stale workstreams should also remove their config rows."""
         register_workstream("orphan_cfg")
+        _backdate_updated("orphan_cfg")
         save_workstream_config("orphan_cfg", {"temperature": "0.5"})
 
         register_workstream("stale_cfg")
@@ -1374,10 +1410,19 @@ class TestMCPActingUserBinding:
         session._report_tool_result = MagicMock()  # type: ignore[method-assign]
         return session, mcp_client
 
+    @staticmethod
+    def _prepare(session, call_id, name, arguments):
+        return session._prepare_tool(
+            {
+                "id": call_id,
+                "function": {"name": name, "arguments": json.dumps(arguments)},
+            }
+        )
+
     def test_effective_identity_defaults_to_owner(self, tmp_db, mock_openai_client):
         session, mcp_client = self._make(mock_openai_client)
         assert session._mcp_effective_user_id == "alice"
-        item = session._prepare_mcp_tool("c1", "mcp__srv__tool", {})
+        item = self._prepare(session, "c1", "mcp__srv__tool", {})
         session._exec_mcp_tool(item)
         assert mcp_client.call_tool_sync.call_args.kwargs["user_id"] == "alice"
 
@@ -1388,7 +1433,7 @@ class TestMCPActingUserBinding:
         session.bind_acting_user("bob")
 
         # Dispatch identity follows the acting user.
-        item = session._prepare_mcp_tool("c1", "mcp__srv__tool", {})
+        item = self._prepare(session, "c1", "mcp__srv__tool", {})
         session._exec_mcp_tool(item)
         assert mcp_client.call_tool_sync.call_args.kwargs["user_id"] == "bob"
         # Listener registrations swapped from owner to acting user for
@@ -1430,7 +1475,7 @@ class TestMCPActingUserBinding:
     def test_prepared_item_pins_identity_across_rebind(self, tmp_db, mock_openai_client):
         session, mcp_client = self._make(mock_openai_client)
         session.bind_acting_user("bob")
-        item = session._prepare_mcp_tool("c1", "mcp__srv__tool", {})
+        item = self._prepare(session, "c1", "mcp__srv__tool", {})
         # A different user takes over the session while the item is
         # pending approval — execution must stay under the requester.
         session.bind_acting_user("carol")
@@ -1440,16 +1485,37 @@ class TestMCPActingUserBinding:
     def test_resource_and_prompt_items_pin_identity(self, tmp_db, mock_openai_client):
         session, mcp_client = self._make(mock_openai_client)
         session.bind_acting_user("bob")
-        res_item = session._prepare_read_resource("c1", {"uri": "res://x"})
+        res_item = self._prepare(session, "c1", "read_resource", {"uri": "res://x"})
         mcp_client.is_mcp_prompt.return_value = True
-        prompt_item = session._prepare_use_prompt("c2", {"name": "p"})
+        prompt_item = self._prepare(session, "c2", "use_prompt", {"name": "p"})
         session.bind_acting_user("carol")
-        assert res_item["mcp_user_id"] == "bob"
-        assert prompt_item["mcp_user_id"] == "bob"
+        assert res_item["_principal_id"] == "bob"
+        assert prompt_item["_principal_id"] == "bob"
+        session._exec_read_resource(res_item)
+        assert mcp_client.read_resource_sync.call_args.kwargs["user_id"] == "bob"
+        session._exec_use_prompt(prompt_item)
+        assert mcp_client.get_prompt_sync.call_args.kwargs["user_id"] == "bob"
         # And the prompt-existence gate consults the CURRENT effective
         # identity (carol) for new preparations.
         session._prepare_use_prompt("c3", {"name": "p"})
         assert mcp_client.is_mcp_prompt.call_args.kwargs["user_id"] == "carol"
+
+    def test_system_catalog_composition_uses_explicit_turn_identity(
+        self, tmp_db, mock_openai_client
+    ):
+        session, mcp_client = self._make(mock_openai_client)
+        mcp_client.get_resources.return_value = [
+            {"uri": "resource://private", "description": "private", "template": False}
+        ]
+        mcp_client.get_prompts.return_value = [{"name": "private_prompt", "arguments": []}]
+
+        session._init_system_messages(principal_id="bob")
+        assert mcp_client.get_resources.call_args.kwargs["user_id"] == "bob"
+        assert mcp_client.get_prompts.call_args.kwargs["user_id"] == "bob"
+
+        session._init_system_messages(principal_id="carol")
+        assert mcp_client.get_resources.call_args.kwargs["user_id"] == "carol"
+        assert mcp_client.get_prompts.call_args.kwargs["user_id"] == "carol"
 
     def test_bind_noops_on_empty_and_same_user(self, tmp_db, mock_openai_client):
         session, mcp_client = self._make(mock_openai_client)

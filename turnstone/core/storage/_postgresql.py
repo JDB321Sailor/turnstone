@@ -12,17 +12,21 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
     from turnstone.core.storage._notify import Notify, NotifyStream
     from turnstone.core.trajectory import Turn
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 
 from turnstone.core.log import get_logger
+from turnstone.core.project_access import fold_role_permissions
 from turnstone.core.storage._protocol import (
     FORK_RESERVATION_CONFIG_KEY,
     USER_SCOPED_AUTH_TYPES,
+    AttachmentWrite,
+    ConversationCommitWorkstreamGoneError,
     ForkCloneExpectation,
     ForkCloneSnapshot,
     MCPOAuthPendingState,
@@ -45,6 +49,7 @@ from turnstone.core.storage._schema import (
     mcp_pending_consent,
     mcp_servers,
     mcp_user_tokens,
+    memory_index_snapshots,
     metadata,
     model_definitions,
     oidc_identities,
@@ -65,6 +70,7 @@ from turnstone.core.storage._schema import (
     skill_resources,
     skill_versions,
     structured_memories,
+    structured_memory_summary_columns,
     system_settings,
     tls_account_keys,
     tls_ca,
@@ -137,24 +143,44 @@ from turnstone.core.storage._utils import (
     VERDICT_MUTABLE as _VERDICT_MUTABLE,
 )
 from turnstone.core.storage._utils import (
+    KeyedAttachmentSaveWrappers as _KeyedAttachmentSaveWrappers,
+)
+from turnstone.core.storage._utils import (
+    acquire_memory_index_snapshot_on_connection,
+    build_memory_scope_or_clause,
+    clone_workstream_transaction,
+    find_orphan_conversations,
+    memory_index_health_inputs_on_connection,
+    parse_checkpoint_watermark,
+    prepare_attachment_commit,
+    prepare_conversation_row_values,
+    prepare_provider_data_for_save,
+    purge_orphan_conversations,
+    release_attachment_refs,
+    require_active_workstream_on_connection,
+    require_project_memory_access_on_connection,
+    require_project_memory_scopes_on_connection,
+    retain_attachment_refs,
+    sanitize_text,
+    save_attachment_commit_transaction,
+    senders_from_user_meta,
+    structured_memory_exact_scope_predicate,
+    structured_memory_filter_scope_predicate,
+)
+from turnstone.core.storage._utils import (
     assert_single_default_persona as _assert_single_default_persona,
 )
 from turnstone.core.storage._utils import (
     build_attachments_by_msg as _build_attachments_by_msg,
 )
 from turnstone.core.storage._utils import (
-    clone_workstream_transaction,
-    find_orphan_conversations,
-    parse_checkpoint_watermark,
-    prepare_provider_data_for_save,
-    purge_orphan_conversations,
-    release_attachment_refs,
-    retain_attachment_refs,
-    sanitize_text,
-    senders_from_user_meta,
+    delete_messages_after_core as _delete_messages_after_core,
 )
 from turnstone.core.storage._utils import (
     escape_like as _escape_like,
+)
+from turnstone.core.storage._utils import (
+    get_compaction_floor_on_connection as _get_compaction_floor_shared,
 )
 from turnstone.core.storage._utils import (
     normalize_search_terms as _normalize_search_terms,
@@ -166,6 +192,9 @@ from turnstone.core.storage._utils import (
     persona_row_to_dict as _persona_row_to_dict,
 )
 from turnstone.core.storage._utils import (
+    prune_workstreams_shared as _prune_workstreams_shared,
+)
+from turnstone.core.storage._utils import (
     reconstruct_messages as _reconstruct_messages,
 )
 from turnstone.core.storage._utils import (
@@ -173,6 +202,9 @@ from turnstone.core.storage._utils import (
 )
 from turnstone.core.storage._utils import (
     recover_trajectory as _recover_trajectory,
+)
+from turnstone.core.storage._utils import (
+    resolve_keyed_commit_conflict as _resolve_keyed_commit_conflict,
 )
 from turnstone.core.storage._utils import (
     row_to_dict as _row_to_dict,
@@ -187,6 +219,9 @@ from turnstone.core.storage._utils import (
     split_perms as _split_perms,
 )
 from turnstone.core.storage._utils import (
+    truncate_messages_tail_core as _truncate_messages_tail_core,
+)
+from turnstone.core.storage._utils import (
     validate_and_clear_default_persona as _validate_and_clear_default_persona,
 )
 from turnstone.core.workstream import BULK_CLOSE_STATE_VALUES, WorkstreamKind
@@ -199,6 +234,14 @@ log = get_logger(__name__)
 # case a tsvector runs ~4x its input (unique short lexemes + position data),
 # so 250K chars keeps even pathological rows safely under the limit.
 _FTS_INPUT_CAP_CHARS = 250_000
+
+
+def _version_role_authority(conn: Any, role_ids: set[str], now: str) -> None:
+    """Version already-locked role parents after assignment children change."""
+    if role_ids:
+        conn.execute(
+            sa.update(roles).where(roles.c.role_id.in_(sorted(role_ids))).values(updated=now)
+        )
 
 
 def _resolve_pg_listen_url(override: str, sqlalchemy_url: str) -> str:
@@ -289,7 +332,7 @@ class _PostgreSQLNotifyStream:
             conn.close()
 
 
-class PostgreSQLBackend:
+class PostgreSQLBackend(_KeyedAttachmentSaveWrappers):
     """PostgreSQL implementation of the StorageBackend protocol."""
 
     def __init__(
@@ -365,38 +408,142 @@ class PostgreSQLBackend:
         is_error: bool = False,
         producer: str | None = None,
         meta: str | None = None,
+        commit_key: str | None = None,
     ) -> int:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        content = sanitize_text(content)
-        provider_data = prepare_provider_data_for_save(
-            role, sanitize_text(provider_data), tool_calls, producer
+        values = prepare_conversation_row_values(
+            ws_id,
+            role,
+            content,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            provider_data=provider_data,
+            tool_calls=tool_calls,
+            source=source,
+            event_id=event_id,
+            is_error=is_error,
+            producer=producer,
+            meta=meta,
+            commit_key=commit_key,
+            now=now,
         )
-        source = sanitize_text(source)
         with self._conn() as conn:
-            result = conn.execute(
-                sa.insert(conversations)
-                .values(
-                    ws_id=ws_id,
-                    timestamp=now,
-                    role=role,
-                    content=content,
-                    tool_name=tool_name,
-                    tool_call_id=tool_call_id,
-                    provider_data=provider_data,
-                    tool_calls=tool_calls,
-                    _source=source,
-                    event_id=event_id,
-                    is_error=is_error,
-                    meta=meta,
+            inserted = True
+            parent_observed = None
+            if commit_key is None:
+                # A non-locking MVCC observation distinguishes a call that
+                # genuinely began parentless from one that arrived while prune
+                # held (and would shortly delete) an existing parent. At READ
+                # COMMITTED an uncommitted delete remains visible here.
+                parent_observed = conn.execute(
+                    sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id)
+                ).fetchone()
+            # Hard delete and every conditional delete lock this durable row
+            # before scanning/deleting conversations. Every writer takes the
+            # same parent-first order when the row exists. This closes the
+            # PostgreSQL READ COMMITTED anomaly where prune's earlier
+            # NOT EXISTS snapshot could delete the parent while an unlocked
+            # NULL-key insert became visible only afterwards.
+            #
+            # A call that genuinely begins without a parent remains a
+            # deliberate legacy/offline seam for NULL keys. A call that saw a
+            # parent but wakes after prune deleted it is refused below rather
+            # than reclassified as a parentless import. Keyed live admission
+            # always refuses a missing parent.
+            parent = conn.execute(
+                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id).with_for_update()
+            ).fetchone()
+            if commit_key is None and parent_observed is not None and parent is None:
+                raise RuntimeError("legacy conversation append crossed workstream deletion")
+            if parent is None and commit_key is not None:
+                raise ConversationCommitWorkstreamGoneError(
+                    "keyed conversation commit workstream no longer exists"
                 )
-                .returning(conversations.c.id)
-            )
-            rowid = int(result.scalar_one())
-            conn.execute(
-                sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
-            )
+            statement = postgresql_insert(conversations).values(**values)
+            if commit_key is not None:
+                statement = statement.on_conflict_do_nothing(
+                    index_elements=[conversations.c.ws_id, conversations.c.commit_key],
+                    index_where=conversations.c.commit_key.is_not(None),
+                )
+            result = conn.execute(statement.returning(conversations.c.id))
+            resolved = result.scalar_one_or_none()
+            if resolved is None:
+                if commit_key is None:
+                    raise RuntimeError("save_message: row id missing after insert")
+                inserted = False
+                rowid = _resolve_keyed_commit_conflict(conn, ws_id, values)
+            else:
+                rowid = int(resolved)
+            if inserted:
+                conn.execute(
+                    sa.update(workstreams).where(workstreams.c.ws_id == ws_id).values(updated=now)
+                )
             conn.commit()
             return rowid
+
+    def _save_message_with_attachments(
+        self,
+        ws_id: str,
+        role: str,
+        content: str,
+        attachments: list[AttachmentWrite] | tuple[AttachmentWrite, ...],
+        *,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+        source: str | None = None,
+        event_id: int | None = None,
+        is_error: bool = False,
+        meta: str | None = None,
+        commit_key: str,
+        origin: str,
+        exact_blob_metadata: bool,
+    ) -> int:
+        """Dialect-local transaction shared by keyed USER and TOOL rows."""
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        attachment_ids, blobs, values = prepare_attachment_commit(
+            ws_id,
+            role,
+            content,
+            attachments,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            source=source,
+            event_id=event_id,
+            is_error=is_error,
+            meta=meta,
+            commit_key=commit_key,
+            now=now,
+        )
+        with self._conn() as conn:
+            try:
+                # Match hard-delete's durable-row-first lock order so no
+                # attachment-bearing insert can commit behind deletion.  Holding
+                # it for the shared body below makes the parent check and every
+                # row/blob/refcount mutation one indivisible transaction.
+                parent = conn.execute(
+                    sa.select(workstreams.c.ws_id)
+                    .where(workstreams.c.ws_id == ws_id)
+                    .with_for_update()
+                ).fetchone()
+                if parent is None:
+                    raise ConversationCommitWorkstreamGoneError(
+                        "keyed conversation commit workstream no longer exists"
+                    )
+                row_id = save_attachment_commit_transaction(
+                    conn,
+                    postgresql_insert,
+                    values=values,
+                    attachment_ids=attachment_ids,
+                    blobs=blobs,
+                    now=now,
+                    origin=origin,
+                    exact_blob_metadata=exact_blob_metadata,
+                )
+                conn.commit()
+                return row_id
+            except Exception:
+                conn.rollback()
+                raise
 
     def list_message_senders(self, ws_id: str) -> list[str]:
         # DISTINCT on the raw meta blob: a user row's meta carries only
@@ -452,21 +599,58 @@ class PostgreSQLBackend:
                 }
             )
         with self._conn() as conn:
+            self._lock_parents_refusing_crossed_deletion(conn, ws_ids)
             retain_attachment_refs(conn, attachment_ids)
             conn.execute(sa.insert(conversations), insert_rows)
-            for wid in ws_ids:
-                conn.execute(
-                    sa.update(workstreams).where(workstreams.c.ws_id == wid).values(updated=now)
-                )
+            conn.execute(
+                sa.update(workstreams)
+                .where(workstreams.c.ws_id.in_(sorted(ws_ids)))
+                .values(updated=now)
+            )
             conn.commit()
+
+    def _lock_parents_refusing_crossed_deletion(
+        self,
+        conn: sa.engine.Connection,
+        ws_ids: set[str],
+    ) -> None:
+        """Batched READ COMMITTED anomaly gate for the bulk import path.
+
+        The set-shaped twin of ``save_message``'s single-row
+        observed→lock→refuse sequence (its NULL-commit-key arm) — keep the
+        two semantically in lockstep. Matches prune/delete's parent-first
+        order; the ``ORDER BY ws_id`` on the locking read preserves the
+        sorted lock order that keeps concurrent bulk writers from
+        deadlocking one another. Missing parents retain the historical
+        import behavior and do not abort the batch; a parent OBSERVED but
+        not lockable crossed a concurrent deletion and refuses.
+        """
+        ordered = sorted(ws_ids)
+        observed = {
+            row[0]
+            for row in conn.execute(
+                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id.in_(ordered))
+            ).fetchall()
+        }
+        locked = {
+            row[0]
+            for row in conn.execute(
+                sa.select(workstreams.c.ws_id)
+                .where(workstreams.c.ws_id.in_(ordered))
+                .order_by(workstreams.c.ws_id)
+                .with_for_update()
+            ).fetchall()
+        }
+        if observed - locked:
+            raise RuntimeError("legacy conversation append crossed workstream deletion")
 
     def _conversation_rows(
         self, ws_id: str, limit: int | None
     ) -> tuple[list[tuple[Any, ...]], dict[int, list[dict[str, Any]]] | None]:
         """Fetch a ws's conversation rows + resolved attachment map (shared by
-        :meth:`load_messages` and :meth:`load_message_turns`).  The trailing
-        ``attachments`` ref-list column is split off and is NOT part of the
-        positional tuple ``reconstruct_*`` unpacks (id..meta)."""
+        :meth:`load_messages` and :meth:`load_message_turns`). The trailing
+        ``attachments`` ref-list and ``commit_key`` columns stay internal to
+        reconstruction."""
         _cols = (
             conversations.c.id,
             conversations.c.role,
@@ -480,6 +664,7 @@ class PostgreSQLBackend:
             conversations.c.is_error,
             conversations.c.meta,
             conversations.c.attachments,
+            conversations.c.commit_key,
         )
         with self._conn() as conn:
             if limit is not None and limit > 0:
@@ -650,27 +835,7 @@ class PostgreSQLBackend:
         twin).  ``0`` when the ws never compacted.
         """
         with self._conn() as conn:
-            marker_id = conn.execute(
-                sa.select(sa.func.max(conversations.c.id)).where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c._source == _COMPACTION_SOURCE,
-                    )
-                )
-            ).scalar()
-            if marker_id is None:
-                return 0
-            n = conn.execute(
-                sa.select(sa.func.count())
-                .select_from(conversations)
-                .where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c.id <= marker_id,
-                    )
-                )
-            ).scalar()
-        return int(n or 0)
+            return _get_compaction_floor_shared(conn, ws_id)
 
     def get_compaction_checkpoint(self, ws_id: str) -> int | None:
         """Latest persisted marker's watermark — see the protocol docstring.
@@ -689,45 +854,65 @@ class PostgreSQLBackend:
             ).fetchone()
         return parse_checkpoint_watermark(row[0]) if row is not None else None
 
+    def _delete_messages_after_on_connection(
+        self,
+        conn: sa.engine.Connection,
+        ws_id: str,
+        keep_count: int,
+    ) -> int:
+        """Delete one conversation tail; caller owns the parent lock."""
+        return _delete_messages_after_core(conn, ws_id, keep_count)
+
     def delete_messages_after(self, ws_id: str, keep_count: int) -> int:
         with self._conn() as conn:
-            cutoff_row = conn.execute(
-                sa.select(conversations.c.id)
-                .where(conversations.c.ws_id == ws_id)
-                .order_by(conversations.c.id)
-                .limit(1)
-                .offset(keep_count)
+            # Keyed commits, hard delete, and prune all lock the durable parent
+            # before touching conversation rows. Take the same lock for a tail
+            # truncation. A missing legacy parent has no row to lock; continue
+            # for orphan-truncation compatibility. Fencing same-id recreation
+            # across that gap requires a separate incarnation boundary.
+            conn.execute(
+                sa.select(workstreams.c.ws_id).where(workstreams.c.ws_id == ws_id).with_for_update()
             ).fetchone()
-            if cutoff_row is None:
-                return 0
-            cutoff_id = cutoff_row[0]
-            # Refcount GC: read the doomed rows' content-addressed ref-lists,
-            # decrement each blob's refcount once per reference, and prune
-            # blobs that hit 0 — so a deduped blob still referenced by a kept
-            # turn survives.  Replaces the old message_id-cascade delete.
-            doomed = conn.execute(
-                sa.select(conversations.c.attachments).where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c.id >= cutoff_id,
-                        conversations.c.attachments.is_not(None),
-                    )
-                )
-            ).fetchall()
-            doomed_ids: list[str] = []
-            for (refs,) in doomed:
-                doomed_ids.extend(_parse_attachment_refs(refs))
-            release_attachment_refs(conn, doomed_ids)
-            result = conn.execute(
-                sa.delete(conversations).where(
-                    sa.and_(
-                        conversations.c.ws_id == ws_id,
-                        conversations.c.id >= cutoff_id,
-                    )
-                )
-            )
+            deleted = self._delete_messages_after_on_connection(conn, ws_id, keep_count)
             conn.commit()
-            return result.rowcount
+            return deleted
+
+    def truncate_messages_tail(self, ws_id: str, remove_count: int) -> int:
+        """Atomically remove a compaction-floored number of newest rows."""
+        if remove_count < 0:
+            raise ValueError("remove_count must be non-negative")
+        with self._conn() as conn:
+            try:
+                # A truncation runs on a non-abandonable worker slot: operator
+                # force-cancel deliberately refuses to supersede it, so an
+                # unbounded FOR UPDATE wait here would pin the workstream until
+                # node restart. Bound the wait; timing out surfaces as an
+                # ordinary persist failure the rewind route reports as
+                # retryable while the slot is released.
+                conn.execute(sa.text("SET LOCAL lock_timeout = '10s'"))
+                # Every keyed conversation commit takes this row lock first.
+                # Hold it across both count queries and the exact tail delete so
+                # another process cannot turn ``remove_count`` into an
+                # over-delete by committing in between them.
+                parent = conn.execute(
+                    sa.select(workstreams.c.ws_id)
+                    .where(workstreams.c.ws_id == ws_id)
+                    .with_for_update()
+                ).fetchone()
+                if parent is None:
+                    raise RuntimeError("tail truncation workstream no longer exists")
+
+                deleted = _truncate_messages_tail_core(
+                    conn,
+                    ws_id,
+                    remove_count,
+                    delete_after=self._delete_messages_after_on_connection,
+                )
+                conn.commit()
+                return deleted
+            except Exception:
+                conn.rollback()
+                raise
 
     # -- Workstream management -------------------------------------------------
 
@@ -788,61 +973,73 @@ class PostgreSQLBackend:
                 ).fetchall()
             )
 
-    def prune_workstreams(self, retention_days: int = 90) -> tuple[int, int]:
-        orphans = stale = 0
+    def _delete_prune_candidate(
+        self,
+        ws_id: str,
+        predicates: tuple[Any, ...],
+    ) -> bool:
+        """Recheck and delete one prune candidate in its own transaction.
+
+        Candidate admission takes the same durable-row-first lock as all
+        conversation writers and hard deletion.  ``SKIP LOCKED`` leaves a
+        workstream a writer already owns to the next prune; a writer that
+        arrives after admission waits for this transaction instead: keyed
+        admission then fails closed, and a NULL-key writer that observed the
+        pre-delete parent also refuses rather than becoming an invisible
+        orphan.
+
+        The exact predicate is rechecked as a second statement so it reads a
+        fresh READ COMMITTED snapshot rather than the lock statement's — a
+        commit that landed while this transaction waited for the row is
+        therefore visible, and its workstream is no longer a candidate.  One
+        transaction per candidate keeps that lock and the per-workstream
+        attachment GC off every unrelated keyed commit for the rest of the run.
+        """
         with self._conn() as conn:
-            # 1. Remove workstreams with no messages
-            orphan_rows = conn.execute(
-                sa.text(
-                    "SELECT ws_id FROM workstreams "
-                    "WHERE state != 'creating' AND NOT EXISTS "
-                    "  (SELECT 1 FROM conversations c "
-                    "   WHERE c.ws_id = workstreams.ws_id)"
-                )
-            ).fetchall()
-            orphan_ids = [r[0] for r in orphan_rows]
-            if orphan_ids:
-                chunk_size = 10_000
-                for i in range(0, len(orphan_ids), chunk_size):
-                    chunk = orphan_ids[i : i + chunk_size]
+            try:
+                locked = conn.execute(
+                    sa.select(workstreams.c.ws_id)
+                    .where(workstreams.c.ws_id == ws_id)
+                    .with_for_update(skip_locked=True)
+                ).fetchone()
+                exact = (
                     conn.execute(
-                        sa.delete(workstream_config).where(workstream_config.c.ws_id.in_(chunk))
-                    )
-                    result = conn.execute(
-                        sa.delete(workstreams).where(workstreams.c.ws_id.in_(chunk))
-                    )
-                    orphans += result.rowcount
-
-            # 2. Remove old unnamed workstreams
-            if retention_days > 0:
-                cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).strftime(
-                    "%Y-%m-%dT%H:%M:%S"
+                        sa.select(workstreams.c.ws_id).where(
+                            workstreams.c.ws_id == ws_id,
+                            *predicates,
+                        )
+                    ).fetchone()
+                    if locked is not None
+                    else None
                 )
-                stale_rows = conn.execute(
-                    sa.select(workstreams.c.ws_id).where(
-                        workstreams.c.state != "creating",
-                        workstreams.c.alias.is_(None),
-                        workstreams.c.updated < cutoff,
-                    )
-                ).fetchall()
-                stale_ids = [r[0] for r in stale_rows]
-                if stale_ids:
-                    chunk_size = 10_000
-                    for i in range(0, len(stale_ids), chunk_size):
-                        chunk = stale_ids[i : i + chunk_size]
-                        conn.execute(
-                            sa.delete(conversations).where(conversations.c.ws_id.in_(chunk))
-                        )
-                        conn.execute(
-                            sa.delete(workstream_config).where(workstream_config.c.ws_id.in_(chunk))
-                        )
-                        result = conn.execute(
-                            sa.delete(workstreams).where(workstreams.c.ws_id.in_(chunk))
-                        )
-                        stale += result.rowcount
+                deleted = bool(
+                    exact is not None and self._delete_workstream_on_connection(conn, ws_id)
+                )
+                conn.commit()
+                return deleted
+            except Exception:
+                conn.rollback()
+                raise
 
-            conn.commit()
-        return (orphans, stale)
+    def prune_workstreams(self, retention_days: int = 90) -> tuple[int, int]:
+        # Discovery holds no row locks: every candidate is relocked and
+        # rechecked in its own bounded transaction by
+        # ``_delete_prune_candidate``, so a long prune never blocks keyed
+        # commits to workstreams it has not reached yet.
+        def _select_ids(predicates: tuple[Any, ...]) -> list[str]:
+            with self._conn() as conn:
+                return [
+                    str(row[0])
+                    for row in conn.execute(
+                        sa.select(workstreams.c.ws_id).where(*predicates)
+                    ).fetchall()
+                ]
+
+        return _prune_workstreams_shared(
+            retention_days,
+            select_ids=_select_ids,
+            delete_candidate=self._delete_prune_candidate,
+        )
 
     def resolve_workstream(self, alias_or_id: str) -> str | None:
         with self._conn() as conn:
@@ -1255,6 +1452,18 @@ class PostgreSQLBackend:
             inserted_row = conn.execute(insert_stmt).fetchone()
             inserted = inserted_row is not None
             if inserted:
+                # Defensive cleanup for orphan data left by historical delete
+                # paths. A newly inserted row must not inherit memory state
+                # from an earlier workstream that used the same id.
+                conn.execute(
+                    sa.delete(memory_index_snapshots).where(memory_index_snapshots.c.ws_id == ws_id)
+                )
+                conn.execute(
+                    sa.delete(structured_memories).where(
+                        structured_memories.c.scope == "workstream",
+                        structured_memories.c.scope_id == ws_id,
+                    )
+                )
                 if fork_reservation_token:
                     # Keep the row reservation and its incarnation fence in
                     # one transaction, replacing any stale orphan key.
@@ -1457,6 +1666,15 @@ class PostgreSQLBackend:
             ref_ids.extend(_parse_attachment_refs(refs))
         release_attachment_refs(conn, ref_ids)
         conn.execute(sa.delete(conversations).where(conversations.c.ws_id == ws_id))
+        conn.execute(
+            sa.delete(memory_index_snapshots).where(memory_index_snapshots.c.ws_id == ws_id)
+        )
+        conn.execute(
+            sa.delete(structured_memories).where(
+                structured_memories.c.scope == "workstream",
+                structured_memories.c.scope_id == ws_id,
+            )
+        )
         conn.execute(sa.delete(workstream_config).where(workstream_config.c.ws_id == ws_id))
         conn.execute(sa.delete(workstream_overrides).where(workstream_overrides.c.ws_id == ws_id))
         # Null-out parent_ws_id on children — see sqlite sibling for rationale.
@@ -1957,9 +2175,28 @@ class PostgreSQLBackend:
             return {r[0] for r in rows}
 
     def delete_user(self, user_id: str) -> bool:
-
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            conn.execute(sa.delete(user_roles).where(user_roles.c.user_id == user_id))
+            # Authority mutations that touch both principal and role parents
+            # lock the principal first, then role ids in canonical order.
+            user = conn.execute(
+                sa.select(users.c.user_id).where(users.c.user_id == user_id).with_for_update()
+            ).fetchone()
+            if user is None:
+                conn.rollback()
+                return False
+            conn.execute(
+                sa.select(roles.c.role_id).order_by(roles.c.role_id).with_for_update()
+            ).fetchall()
+            removed_roles = {
+                str(row[0])
+                for row in conn.execute(
+                    sa.delete(user_roles)
+                    .where(user_roles.c.user_id == user_id)
+                    .returning(user_roles.c.role_id)
+                ).fetchall()
+            }
+            _version_role_authority(conn, removed_roles, now)
             conn.execute(sa.delete(channel_users).where(channel_users.c.user_id == user_id))
             conn.execute(sa.delete(api_tokens).where(api_tokens.c.user_id == user_id))
             conn.execute(sa.delete(oidc_identities).where(oidc_identities.c.user_id == user_id))
@@ -2929,6 +3166,16 @@ class PostgreSQLBackend:
         fields = {k: v for k, v in fields.items() if k in _ROLE_MUTABLE}
         fields["updated"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            # Explicit stable-row lock keeps every role authority mutation on
+            # the same role -> assignment/override order.  The UPDATE would
+            # take this lock eventually, but doing it first makes the order a
+            # visible invariant and aligns with set/clear/delete.
+            role = conn.execute(
+                sa.select(roles.c.role_id).where(roles.c.role_id == role_id).with_for_update()
+            ).fetchone()
+            if role is None:
+                conn.rollback()
+                return False
             result = conn.execute(
                 sa.update(roles).where(roles.c.role_id == role_id).values(**fields)
             )
@@ -2937,6 +3184,12 @@ class PostgreSQLBackend:
 
     def delete_role(self, role_id: str) -> bool:
         with self._conn() as conn:
+            role = conn.execute(
+                sa.select(roles.c.role_id).where(roles.c.role_id == role_id).with_for_update()
+            ).fetchone()
+            if role is None:
+                conn.rollback()
+                return False
             conn.execute(sa.delete(user_roles).where(user_roles.c.role_id == role_id))
             # No FK on role_permission_overrides (migration 057 omitted
             # to match the rest of the governance schema), so clean up
@@ -2955,6 +3208,16 @@ class PostgreSQLBackend:
     def assign_role(self, user_id: str, role_id: str, assigned_by: str = "") -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            user = conn.execute(
+                sa.select(users.c.user_id).where(users.c.user_id == user_id).with_for_update()
+            ).fetchone()
+            if user is None:
+                raise ValueError(f"user {user_id!r} does not exist")
+            role = conn.execute(
+                sa.select(roles.c.role_id).where(roles.c.role_id == role_id).with_for_update()
+            ).fetchone()
+            if role is None:
+                raise ValueError(f"role {role_id!r} does not exist")
             existing = conn.execute(
                 sa.select(user_roles.c.user_id).where(
                     (user_roles.c.user_id == user_id) & (user_roles.c.role_id == role_id)
@@ -2970,15 +3233,25 @@ class PostgreSQLBackend:
                         "created": now,
                     },
                 )
+                _version_role_authority(conn, {role_id}, now)
             conn.commit()
 
     def unassign_role(self, user_id: str, role_id: str) -> bool:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            role = conn.execute(
+                sa.select(roles.c.role_id).where(roles.c.role_id == role_id).with_for_update()
+            ).fetchone()
+            if role is None:
+                conn.rollback()
+                return False
             result = conn.execute(
                 sa.delete(user_roles).where(
                     (user_roles.c.user_id == user_id) & (user_roles.c.role_id == role_id)
                 )
             )
+            if result.rowcount > 0:
+                _version_role_authority(conn, {role_id}, now)
             conn.commit()
             return result.rowcount > 0
 
@@ -3009,25 +3282,38 @@ class PostgreSQLBackend:
 
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            # `with_for_update()` takes per-row locks on this user's
-            # `user_roles` rows for the duration of the transaction.
-            # Two concurrent OIDC callbacks for the same `user_id` (e.g.
-            # racing token refreshes with differing claim sets) would
-            # otherwise both read the same baseline under READ COMMITTED
-            # and produce a final role state matching neither caller's
-            # intent. The lock is per-`user_id`, so unrelated user writes
-            # are unaffected.
-            #
-            # Note: FOR UPDATE on an empty result set acquires no locks,
-            # so on a brand-new user with no rows yet, two concurrent
-            # callers can proceed in parallel; their inserts merge via
-            # ON CONFLICT DO NOTHING (final state is the union of the
-            # two desired sets). The next single-caller reconciliation
-            # cycle self-heals.
+            # Match delete_user's principal -> sorted-role lock order.
+            user = conn.execute(
+                sa.select(users.c.user_id).where(users.c.user_id == user_id).with_for_update()
+            ).fetchone()
+            if user is None:
+                raise ValueError(f"user {user_id!r} does not exist")
+            initial_rows = conn.execute(
+                sa.select(user_roles.c.role_id, user_roles.c.assigned_by).where(
+                    user_roles.c.user_id == user_id
+                )
+            ).fetchall()
+            role_ids = sorted({str(row[0]) for row in initial_rows} | desired_role_ids)
+            existing_role_ids = {
+                str(row[0])
+                for row in conn.execute(
+                    sa.select(roles.c.role_id)
+                    .where(roles.c.role_id.in_(role_ids))
+                    .order_by(roles.c.role_id)
+                    .with_for_update()
+                ).fetchall()
+            }
+            missing = desired_role_ids - existing_role_ids
+            if missing:
+                raise ValueError(f"roles do not exist: {sorted(missing)!r}")
+            # Ordinary assign/unassign calls serialize on the same role rows
+            # but do not take the per-user OIDC lock. Re-read the assignments
+            # after acquiring every affected role lock so the returned diff
+            # and the authority versions describe the transition we commit.
             existing_rows = conn.execute(
-                sa.select(user_roles.c.role_id, user_roles.c.assigned_by)
-                .where(user_roles.c.user_id == user_id)
-                .with_for_update()
+                sa.select(user_roles.c.role_id, user_roles.c.assigned_by).where(
+                    user_roles.c.user_id == user_id
+                )
             ).fetchall()
             current_oidc: set[str] = {r[0] for r in existing_rows if r[1] == "oidc"}
             # Roles assigned by any other source (admin-ui, oidc-default, etc.)
@@ -3061,6 +3347,7 @@ class PostgreSQLBackend:
                         & (user_roles.c.role_id.in_(removed))
                     )
                 )
+            _version_role_authority(conn, added | removed, now)
             conn.commit()
             return added, removed
 
@@ -3091,9 +3378,13 @@ class PostgreSQLBackend:
                         revokes.setdefault(rid, set()).add(perm)
             perms: set[str] = set()
             for rid, perms_str, builtin in role_rows:
-                role_perms = _split_perms(perms_str)
+                role_perms = fold_role_permissions(perms_str)
                 if builtin:
-                    role_perms = (role_perms | grants.get(rid, set())) - revokes.get(rid, set())
+                    role_perms = fold_role_permissions(
+                        role_perms,
+                        grants=grants.get(rid, set()),
+                        revokes=revokes.get(rid, set()),
+                    )
                 perms |= role_perms
             return perms
 
@@ -3133,9 +3424,13 @@ class PostgreSQLBackend:
                         revokes.setdefault(rid, set()).add(perm)
             holders: set[str] = set()
             for user_id, role_id, perms_str, builtin in rows:
-                eff = _split_perms(perms_str)
+                eff = fold_role_permissions(perms_str)
                 if builtin:
-                    eff = (eff | grants.get(role_id, set())) - revokes.get(role_id, set())
+                    eff = fold_role_permissions(
+                        eff,
+                        grants=grants.get(role_id, set()),
+                        revokes=revokes.get(role_id, set()),
+                    )
                 if permission in eff:
                     holders.add(user_id)
             return holders
@@ -3163,6 +3458,11 @@ class PostgreSQLBackend:
             raise ValueError("grants and revokes must be disjoint")
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            role = conn.execute(
+                sa.select(roles.c.role_id).where(roles.c.role_id == role_id).with_for_update()
+            ).fetchone()
+            if role is None:
+                raise ValueError(f"role {role_id!r} does not exist")
             conn.execute(
                 sa.delete(role_permission_overrides).where(
                     role_permission_overrides.c.role_id == role_id
@@ -3189,15 +3489,27 @@ class PostgreSQLBackend:
             ]
             if rows:
                 conn.execute(sa.insert(role_permission_overrides), rows)
+            # Version the stable row as part of the replacement. A
+            # REPEATABLE READ/SERIALIZABLE authorization that fixed its
+            # snapshot before waiting on this lock must retry instead of
+            # reading pre-replacement override children after our commit.
+            conn.execute(sa.update(roles).where(roles.c.role_id == role_id).values(updated=now))
             conn.commit()
 
     def clear_role_overrides(self, role_id: str) -> None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            role = conn.execute(
+                sa.select(roles.c.role_id).where(roles.c.role_id == role_id).with_for_update()
+            ).fetchone()
+            if role is None:
+                raise ValueError(f"role {role_id!r} does not exist")
             conn.execute(
                 sa.delete(role_permission_overrides).where(
                     role_permission_overrides.c.role_id == role_id
                 )
             )
+            conn.execute(sa.update(roles).where(roles.c.role_id == role_id).values(updated=now))
             conn.commit()
 
     def effective_role_permissions(self, role_id: str) -> dict[str, list[str]]:
@@ -3222,7 +3534,7 @@ class PostgreSQLBackend:
                         grants.add(perm)
                     elif action == "revoke":
                         revokes.add(perm)
-            effective = (baseline | grants) - revokes
+            effective = fold_role_permissions(baseline, grants=grants, revokes=revokes)
             return {
                 "baseline": sorted(baseline),
                 "grants": sorted(grants),
@@ -3264,7 +3576,11 @@ class PostgreSQLBackend:
                 baseline = _split_perms(perms_str)
                 role_grants = grants.get(rid, set()) if builtin else set()
                 role_revokes = revokes.get(rid, set()) if builtin else set()
-                effective = (baseline | role_grants) - role_revokes
+                effective = fold_role_permissions(
+                    baseline,
+                    grants=role_grants,
+                    revokes=role_revokes,
+                )
                 out[rid] = {
                     "baseline": sorted(baseline),
                     "grants": sorted(role_grants),
@@ -4276,6 +4592,8 @@ class PostgreSQLBackend:
         judge_model: str,
         latency_ms: int,
         user_decision: str = "pending",
+        resolver_principal_id: str = "",
+        execution_principal_id: str = "",
     ) -> None:
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
@@ -4297,6 +4615,8 @@ class PostgreSQLBackend:
                     "judge_model": judge_model,
                     "latency_ms": latency_ms,
                     "user_decision": user_decision,
+                    "resolver_principal_id": resolver_principal_id,
+                    "execution_principal_id": execution_principal_id,
                     "created": now,
                 },
             )
@@ -4319,6 +4639,8 @@ class PostgreSQLBackend:
         judge_model: str,
         latency_ms: int,
         user_decision: str = "pending",
+        resolver_principal_id: str = "",
+        execution_principal_id: str = "",
     ) -> None:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -4339,6 +4661,8 @@ class PostgreSQLBackend:
             judge_model=judge_model,
             latency_ms=latency_ms,
             user_decision=user_decision,
+            resolver_principal_id=resolver_principal_id,
+            execution_principal_id=execution_principal_id,
             created=now,
         )
         # On verdict_id conflict, update only the three fields that
@@ -4382,6 +4706,8 @@ class PostgreSQLBackend:
                 "judge_model": v.get("judge_model", ""),
                 "latency_ms": v.get("latency_ms", 0),
                 "user_decision": v.get("user_decision", "pending"),
+                "resolver_principal_id": v.get("resolver_principal_id", ""),
+                "execution_principal_id": v.get("execution_principal_id", ""),
                 "created": now,
             }
             for v in verdicts
@@ -4568,8 +4894,13 @@ class PostgreSQLBackend:
         scope_id: str,
         content: str,
     ) -> None:
+        from turnstone.core.memory_index import normalize_memory_description
+
+        description = normalize_memory_description(description)
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
+            if scope == "workstream":
+                require_active_workstream_on_connection(conn, ws_id=scope_id)
             conn.execute(
                 sa.insert(structured_memories),
                 {
@@ -4582,7 +4913,7 @@ class PostgreSQLBackend:
                     "content": content,
                     "created": now,
                     "updated": now,
-                    "last_accessed": now,
+                    "last_accessed": "",
                     "access_count": 0,
                 },
             )
@@ -4592,45 +4923,73 @@ class PostgreSQLBackend:
         self,
         memory_id: str,
         name: str,
-        description: str | None,
+        description: str,
         mem_type: str | None,
         scope: str,
         scope_id: str,
         content: str,
+        *,
+        require_active_project: bool = False,
+        acting_principal_id: str = "",
     ) -> tuple[dict[str, str], bool]:
         from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+        from turnstone.core.memory_index import normalize_memory_description
+
+        description = normalize_memory_description(description)
         now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         insert_stmt = pg_insert(structured_memories).values(
             memory_id=memory_id,
             name=name,
-            description="" if description is None else description,
+            description=description,
             type="general" if mem_type is None else mem_type,
             scope=scope,
             scope_id=scope_id,
             content=content,
             created=now,
             updated=now,
-            last_accessed=now,
+            last_accessed="",
             access_count=0,
         )
-        # On conflict, refresh content + timestamps.  description/type are
-        # overwritten only when the caller supplied them; None means "unset" ->
-        # keep the stored value.  created and access_count are left untouched.
+        # On conflict, refresh authored content and metadata. Access fields record
+        # explicit full-body fetches only, so writes leave them untouched.
         set_: dict[str, Any] = {
             "content": insert_stmt.excluded.content,
             "updated": now,
-            "last_accessed": now,
         }
-        if description is not None:
-            set_["description"] = insert_stmt.excluded.description
+        set_["description"] = insert_stmt.excluded.description
         if mem_type is not None:
             set_["type"] = insert_stmt.excluded.type
         stmt = insert_stmt.on_conflict_do_update(
             index_elements=["name", "scope", "scope_id"],
             set_=set_,
-        ).returning(structured_memories)
+        ).returning(*structured_memory_summary_columns)
         with self._conn() as conn:
+            if scope == "workstream":
+                require_active_workstream_on_connection(conn, ws_id=scope_id)
+            if scope == "project" and acting_principal_id:
+                require_project_memory_access_on_connection(
+                    conn,
+                    project_id=scope_id,
+                    principal_id=acting_principal_id,
+                    write=True,
+                )
+            elif require_active_project:
+                if scope != "project" or not scope_id:
+                    raise ValueError("active-project guard requires project scope")
+                project = conn.execute(
+                    sa.select(projects.c.project_id)
+                    .where(
+                        sa.and_(
+                            projects.c.project_id == scope_id,
+                            projects.c.state == "active",
+                        )
+                    )
+                    .with_for_update(read=True)
+                ).fetchone()
+                if project is None:
+                    conn.rollback()
+                    raise ValueError("project is missing, archived, or no longer writable")
             row = conn.execute(stmt).fetchone()
             conn.commit()
             if row is None:  # unreachable: ON CONFLICT DO UPDATE returns one row
@@ -4646,43 +5005,176 @@ class PostgreSQLBackend:
             return dict(row._mapping) if row else None
 
     def get_structured_memory_by_name(
-        self, name: str, scope: str = "global", scope_id: str = ""
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
     ) -> dict[str, str] | None:
         with self._conn() as conn:
             row = conn.execute(
                 sa.select(structured_memories).where(
-                    sa.and_(
-                        structured_memories.c.name == name,
-                        structured_memories.c.scope == scope,
-                        structured_memories.c.scope_id == scope_id,
-                    )
+                    structured_memories.c.name == name,
+                    structured_memory_exact_scope_predicate(
+                        scope,
+                        scope_id,
+                    ),
                 )
             ).fetchone()
             return dict(row._mapping) if row else None
 
-    def delete_structured_memory(
-        self, name: str, scope: str = "global", scope_id: str = ""
-    ) -> bool:
+    def get_and_touch_structured_memory(self, memory_id: str) -> dict[str, str] | None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
         with self._conn() as conn:
-            result = conn.execute(
-                sa.delete(structured_memories).where(
-                    sa.and_(
-                        structured_memories.c.name == name,
-                        structured_memories.c.scope == scope,
-                        structured_memories.c.scope_id == scope_id,
-                    )
+            row = conn.execute(
+                sa.update(structured_memories)
+                .where(structured_memories.c.memory_id == memory_id)
+                .values(
+                    last_accessed=now,
+                    access_count=structured_memories.c.access_count + 1,
                 )
-            )
+                .returning(structured_memories)
+            ).fetchone()
             conn.commit()
-            return result.rowcount > 0
+            return dict(row._mapping) if row is not None else None
+
+    def get_and_touch_structured_memory_by_name(
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
+        *,
+        acting_principal_id: str = "",
+    ) -> dict[str, str] | None:
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            if scope == "project" and acting_principal_id:
+                require_project_memory_access_on_connection(
+                    conn,
+                    project_id=scope_id,
+                    principal_id=acting_principal_id,
+                    write=False,
+                )
+            row = conn.execute(
+                sa.update(structured_memories)
+                .where(
+                    structured_memories.c.name == name,
+                    structured_memory_exact_scope_predicate(
+                        scope,
+                        scope_id,
+                    ),
+                )
+                .values(
+                    last_accessed=now,
+                    access_count=structured_memories.c.access_count + 1,
+                )
+                .returning(structured_memories)
+            ).fetchone()
+            conn.commit()
+            return dict(row._mapping) if row is not None else None
+
+    def update_structured_memory_description(
+        self, memory_id: str, description: str
+    ) -> dict[str, str] | None:
+        from turnstone.core.memory_index import normalize_memory_description
+
+        normalized = normalize_memory_description(description)
+        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.update(structured_memories)
+                .where(structured_memories.c.memory_id == memory_id)
+                .values(description=normalized, updated=now)
+                .returning(*structured_memory_summary_columns)
+            ).fetchone()
+            conn.commit()
+            return dict(row._mapping) if row is not None else None
+
+    def delete_structured_memory(
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
+    ) -> bool:
+        return (
+            self.delete_structured_memory_returning(
+                name,
+                scope,
+                scope_id,
+            )
+            is not None
+        )
+
+    def delete_structured_memory_returning(
+        self,
+        name: str,
+        scope: str = "global",
+        scope_id: str = "",
+        *,
+        acting_principal_id: str = "",
+    ) -> dict[str, str] | None:
+        stmt = (
+            sa.delete(structured_memories)
+            .where(
+                structured_memories.c.name == name,
+                structured_memory_exact_scope_predicate(
+                    scope,
+                    scope_id,
+                ),
+            )
+            .returning(*structured_memory_summary_columns)
+        )
+        with self._conn() as conn:
+            if scope == "project" and acting_principal_id:
+                require_project_memory_access_on_connection(
+                    conn,
+                    project_id=scope_id,
+                    principal_id=acting_principal_id,
+                    write=True,
+                )
+            row = conn.execute(stmt).fetchone()
+            conn.commit()
+            return dict(row._mapping) if row is not None else None
 
     def delete_structured_memory_by_id(self, memory_id: str) -> bool:
+        return self.delete_structured_memory_by_id_returning(memory_id) is not None
+
+    def delete_structured_memory_by_id_returning(self, memory_id: str) -> dict[str, str] | None:
         with self._conn() as conn:
-            result = conn.execute(
-                sa.delete(structured_memories).where(structured_memories.c.memory_id == memory_id)
-            )
+            row = conn.execute(
+                sa.delete(structured_memories)
+                .where(structured_memories.c.memory_id == memory_id)
+                .returning(*structured_memory_summary_columns)
+            ).fetchone()
             conn.commit()
-            return result.rowcount > 0
+            return dict(row._mapping) if row is not None else None
+
+    def find_structured_memory_scopes(
+        self,
+        name: str,
+        scopes: list[tuple[str, str]],
+        *,
+        acting_principal_id: str = "",
+    ) -> list[tuple[str, str]]:
+        if not scopes:
+            return []
+        with self._conn() as conn:
+            if acting_principal_id:
+                require_project_memory_scopes_on_connection(
+                    conn,
+                    scopes=scopes,
+                    principal_id=acting_principal_id,
+                    write=False,
+                )
+            scope_clauses, params = self._build_scope_or_clause(scopes)
+            rows = conn.execute(
+                sa.text(
+                    "SELECT scope, scope_id FROM structured_memories "
+                    f"WHERE name = :name AND ({scope_clauses}) "
+                    "ORDER BY scope, scope_id"
+                ),
+                {**params, "name": name},
+            ).fetchall()
+            return [(str(row.scope), str(row.scope_id)) for row in rows]
 
     def list_structured_memories(
         self,
@@ -4692,16 +5184,30 @@ class PostgreSQLBackend:
         limit: int = 100,
     ) -> list[dict[str, str]]:
         with self._conn() as conn:
-            q = sa.select(structured_memories).order_by(
+            q = sa.select(
+                structured_memories.c.memory_id,
+                structured_memories.c.name,
+                structured_memories.c.description,
+                structured_memories.c.type,
+                structured_memories.c.scope,
+                structured_memories.c.scope_id,
+                structured_memories.c.created,
+                structured_memories.c.updated,
+                structured_memories.c.last_accessed,
+                structured_memories.c.access_count,
+            ).order_by(
                 structured_memories.c.updated.desc(),
                 structured_memories.c.memory_id.asc(),
             )
             if mem_type:
                 q = q.where(structured_memories.c.type == mem_type)
             if scope:
-                q = q.where(structured_memories.c.scope == scope)
-            if scope_id and scope:
-                q = q.where(structured_memories.c.scope_id == scope_id)
+                q = q.where(
+                    structured_memory_filter_scope_predicate(
+                        scope,
+                        scope_id,
+                    )
+                )
             q = q.limit(limit)
             rows = conn.execute(q).fetchall()
             return [dict(r._mapping) for r in rows]
@@ -4717,12 +5223,18 @@ class PostgreSQLBackend:
         """OR-of-terms ILIKE search; ranking is the caller's job (BM25 downstream)."""
         if not query or not query.strip():
             return self.list_structured_memories(
-                mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+                mem_type=mem_type,
+                scope=scope,
+                scope_id=scope_id,
+                limit=limit,
             )
         terms = _normalize_search_terms(query)
         if not terms:
             return self.list_structured_memories(
-                mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit
+                mem_type=mem_type,
+                scope=scope,
+                scope_id=scope_id,
+                limit=limit,
             )
         with self._conn() as conn:
             clauses = []
@@ -4730,13 +5242,10 @@ class PostgreSQLBackend:
             for i, t in enumerate(terms):
                 escaped = _escape_like(t)
                 clauses.append(
-                    f"(name ILIKE :n{i} ESCAPE '\\' "
-                    f"OR description ILIKE :d{i} ESCAPE '\\' "
-                    f"OR content ILIKE :c{i} ESCAPE '\\')"
+                    f"(name ILIKE :n{i} ESCAPE '\\' OR description ILIKE :d{i} ESCAPE '\\')"
                 )
                 params[f"n{i}"] = f"%{escaped}%"
                 params[f"d{i}"] = f"%{escaped}%"
-                params[f"c{i}"] = f"%{escaped}%"
             term_clause = " OR ".join(clauses)
             scope_filters = ""
             if mem_type:
@@ -4745,12 +5254,14 @@ class PostgreSQLBackend:
             if scope:
                 scope_filters += " AND scope = :scope_filter"
                 params["scope_filter"] = scope
-            if scope_id and scope:
-                scope_filters += " AND scope_id = :scope_id_filter"
-                params["scope_id_filter"] = scope_id
+                if scope_id:
+                    scope_filters += " AND scope_id = :scope_id_filter"
+                    params["scope_id_filter"] = scope_id
             rows = conn.execute(
                 sa.text(
-                    f"SELECT * FROM structured_memories WHERE ({term_clause}){scope_filters} "
+                    "SELECT memory_id, name, description, type, scope, scope_id, "
+                    "created, updated, last_accessed, access_count "
+                    f"FROM structured_memories WHERE ({term_clause}){scope_filters} "
                     f"ORDER BY updated DESC, memory_id ASC LIMIT :lim"
                 ),
                 {**params, "lim": limit},
@@ -4762,6 +5273,8 @@ class PostgreSQLBackend:
         scopes: list[tuple[str, str]],
         mem_type: str = "",
         limit: int = 100,
+        *,
+        acting_principal_id: str = "",
     ) -> list[dict[str, str]]:
         """Single-query union across visible (scope, scope_id) pairs.
 
@@ -4771,6 +5284,13 @@ class PostgreSQLBackend:
         if not scopes:
             return []
         with self._conn() as conn:
+            if acting_principal_id:
+                require_project_memory_scopes_on_connection(
+                    conn,
+                    scopes=scopes,
+                    principal_id=acting_principal_id,
+                    write=False,
+                )
             scope_clauses, params = self._build_scope_or_clause(scopes)
             extra = ""
             if mem_type:
@@ -4778,7 +5298,9 @@ class PostgreSQLBackend:
                 params["type_filter"] = mem_type
             rows = conn.execute(
                 sa.text(
-                    f"SELECT * FROM structured_memories WHERE ({scope_clauses}){extra} "
+                    "SELECT memory_id, name, description, type, scope, scope_id, "
+                    "created, updated, last_accessed, access_count "
+                    f"FROM structured_memories WHERE ({scope_clauses}){extra} "
                     f"ORDER BY updated DESC, memory_id ASC LIMIT :lim"
                 ),
                 {**params, "lim": limit},
@@ -4791,6 +5313,8 @@ class PostgreSQLBackend:
         scopes: list[tuple[str, str]],
         mem_type: str = "",
         limit: int = 20,
+        *,
+        acting_principal_id: str = "",
     ) -> list[dict[str, str]]:
         """OR-of-terms search joined with a single visibility OR-group.
 
@@ -4799,23 +5323,37 @@ class PostgreSQLBackend:
         if not scopes:
             return []
         if not query or not query.strip():
-            return self.list_visible_structured_memories(scopes, mem_type=mem_type, limit=limit)
+            return self.list_visible_structured_memories(
+                scopes,
+                mem_type=mem_type,
+                limit=limit,
+                acting_principal_id=acting_principal_id,
+            )
         terms = _normalize_search_terms(query)
         if not terms:
-            return self.list_visible_structured_memories(scopes, mem_type=mem_type, limit=limit)
+            return self.list_visible_structured_memories(
+                scopes,
+                mem_type=mem_type,
+                limit=limit,
+                acting_principal_id=acting_principal_id,
+            )
         with self._conn() as conn:
+            if acting_principal_id:
+                require_project_memory_scopes_on_connection(
+                    conn,
+                    scopes=scopes,
+                    principal_id=acting_principal_id,
+                    write=False,
+                )
             scope_clauses, params = self._build_scope_or_clause(scopes)
             term_clauses = []
             for i, t in enumerate(terms):
                 escaped = _escape_like(t)
                 term_clauses.append(
-                    f"(name ILIKE :n{i} ESCAPE '\\' "
-                    f"OR description ILIKE :d{i} ESCAPE '\\' "
-                    f"OR content ILIKE :c{i} ESCAPE '\\')"
+                    f"(name ILIKE :n{i} ESCAPE '\\' OR description ILIKE :d{i} ESCAPE '\\')"
                 )
                 params[f"n{i}"] = f"%{escaped}%"
                 params[f"d{i}"] = f"%{escaped}%"
-                params[f"c{i}"] = f"%{escaped}%"
             term_clause = " OR ".join(term_clauses)
             extra = ""
             if mem_type:
@@ -4823,7 +5361,9 @@ class PostgreSQLBackend:
                 params["type_filter"] = mem_type
             rows = conn.execute(
                 sa.text(
-                    f"SELECT * FROM structured_memories "
+                    "SELECT memory_id, name, description, type, scope, scope_id, "
+                    "created, updated, last_accessed, access_count "
+                    "FROM structured_memories "
                     f"WHERE ({scope_clauses}) AND ({term_clause}){extra} "
                     f"ORDER BY updated DESC, memory_id ASC LIMIT :lim"
                 ),
@@ -4831,59 +5371,139 @@ class PostgreSQLBackend:
             ).fetchall()
             return [dict(r._mapping) for r in rows]
 
+    def list_visible_memory_index_entries(
+        self,
+        scopes: list[tuple[str, str]],
+        *,
+        acting_principal_id: str = "",
+    ) -> list[dict[str, str]]:
+        if not scopes:
+            return []
+        with self._conn() as conn:
+            if acting_principal_id:
+                require_project_memory_scopes_on_connection(
+                    conn,
+                    scopes=scopes,
+                    principal_id=acting_principal_id,
+                    write=False,
+                )
+            scope_clauses, params = self._build_scope_or_clause(scopes)
+            rows = conn.execute(
+                sa.text(
+                    "SELECT memory_id, name, description, type, scope, scope_id "
+                    "FROM structured_memories "
+                    f"WHERE ({scope_clauses}) ORDER BY scope, name, memory_id"
+                ),
+                params,
+            ).fetchall()
+            return [dict(row._mapping) for row in rows]
+
+    def get_memory_index_health_inputs(self) -> dict[str, list[dict[str, Any]]]:
+        with self._conn() as conn:
+            conn = conn.execution_options(isolation_level="REPEATABLE READ")
+            result = memory_index_health_inputs_on_connection(conn)
+            conn.commit()
+            return result
+
+    def get_memory_index_snapshot(
+        self,
+        ws_id: str,
+    ) -> dict[str, Any] | None:
+        if not ws_id:
+            return None
+        with self._conn() as conn:
+            row = conn.execute(
+                sa.select(memory_index_snapshots).where(
+                    memory_index_snapshots.c.ws_id == ws_id,
+                )
+            ).fetchone()
+            return dict(row._mapping) if row is not None else None
+
+    def acquire_memory_index_snapshot(
+        self,
+        ws_id: str,
+        principal_id: str,
+        *,
+        commit_context: Callable[[dict[str, Any]], contextlib.AbstractContextManager[None]]
+        | None = None,
+    ) -> dict[str, Any] | None:
+        for attempt in range(3):
+            with self._conn() as base_conn:
+                # A single MVCC snapshot prevents a revoke followed by a new
+                # memory write from being combined with the pre-revoke ACL
+                # decision. Override replacement versions its locked stable
+                # role row, so a snapshot that began before that replacement
+                # receives 40001 and retries the complete capture here.
+                conn = base_conn.execution_options(isolation_level="REPEATABLE READ")
+                try:
+                    row = acquire_memory_index_snapshot_on_connection(
+                        conn,
+                        ws_id=ws_id,
+                        principal_id=principal_id,
+                    )
+                    context = (
+                        commit_context(row)
+                        if commit_context is not None and row is not None
+                        else contextlib.nullcontext()
+                    )
+                    with context:
+                        conn.commit()
+                    return row
+                except sa.exc.DBAPIError as exc:
+                    conn.rollback()
+                    original = exc.orig
+                    sqlstate = getattr(original, "sqlstate", None) or getattr(
+                        original, "pgcode", None
+                    )
+                    diag = getattr(original, "diag", None)
+                    constraint = (
+                        getattr(diag, "constraint_name", "") or "" if diag is not None else ""
+                    )
+                    snapshot_insert_race = (
+                        sqlstate == "23505" and constraint == "memory_index_snapshots_pkey"
+                    )
+                    if (sqlstate in {"40001", "40P01"} or snapshot_insert_race) and attempt < 2:
+                        time.sleep(0.01 * (attempt + 1))
+                        continue
+                    raise
+                except Exception:
+                    conn.rollback()
+                    raise
+        raise RuntimeError("memory index snapshot retry loop exhausted")
+
     @staticmethod
     def _build_scope_or_clause(
         scopes: list[tuple[str, str]],
     ) -> tuple[str, dict[str, str]]:
-        """Build a parameterized OR-group of (scope[, scope_id]) predicates."""
-        params: dict[str, str] = {}
-        clauses: list[str] = []
-        for i, (s, sid) in enumerate(scopes):
-            params[f"sc{i}"] = s
-            if sid:
-                params[f"sid{i}"] = sid
-                clauses.append(f"(scope = :sc{i} AND scope_id = :sid{i})")
-            else:
-                clauses.append(f"scope = :sc{i}")
-        return " OR ".join(clauses), params
-
-    def touch_structured_memories(self, keys: list[tuple[str, str, str]]) -> int:
-        """Batch-touch multiple memories by (name, scope, scope_id)."""
-        if not keys:
-            return 0
-        now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S")
-        total = 0
-        with self._conn() as conn:
-            for name, scope, scope_id in keys:
-                result = conn.execute(
-                    sa.update(structured_memories)
-                    .where(
-                        sa.and_(
-                            structured_memories.c.name == name,
-                            structured_memories.c.scope == scope,
-                            structured_memories.c.scope_id == scope_id,
-                        )
-                    )
-                    .values(
-                        last_accessed=now,
-                        access_count=structured_memories.c.access_count + 1,
-                    )
-                )
-                total += result.rowcount
-            conn.commit()
-        return total
+        """Build a parameterized OR-group of exact (scope, scope_id) pairs."""
+        return build_memory_scope_or_clause(scopes)
 
     def count_structured_memories(
-        self, mem_type: str = "", scope: str = "", scope_id: str = ""
+        self,
+        mem_type: str = "",
+        scope: str = "",
+        scope_id: str = "",
+        *,
+        acting_principal_id: str = "",
     ) -> int:
         with self._conn() as conn:
+            if scope == "project" and acting_principal_id:
+                require_project_memory_access_on_connection(
+                    conn,
+                    project_id=scope_id,
+                    principal_id=acting_principal_id,
+                    write=False,
+                )
             q = sa.select(sa.func.count()).select_from(structured_memories)
             if mem_type:
                 q = q.where(structured_memories.c.type == mem_type)
             if scope:
-                q = q.where(structured_memories.c.scope == scope)
-            if scope_id and scope:
-                q = q.where(structured_memories.c.scope_id == scope_id)
+                q = q.where(
+                    structured_memory_filter_scope_predicate(
+                        scope,
+                        scope_id,
+                    )
+                )
             result = conn.execute(q).scalar()
             return int(result or 0)
 
@@ -5727,6 +6347,17 @@ class PostgreSQLBackend:
 
     def delete_project(self, project_id: str) -> bool:
         with self._conn() as conn:
+            # Serialize with guarded project-memory upserts.  If a writer got
+            # the row first, its memory is committed before our purge; if this
+            # delete wins, the later writer's active-project check finds no row.
+            project = conn.execute(
+                sa.select(projects.c.project_id)
+                .where(projects.c.project_id == project_id)
+                .with_for_update()
+            ).fetchone()
+            if project is None:
+                conn.rollback()
+                return False
             # No FK cascade in the schema family, so purge the project's scoped
             # memory + member rows explicitly (same transaction) before the
             # project row — honouring the "destroys the container AND its scoped

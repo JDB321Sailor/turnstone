@@ -15,6 +15,8 @@ import contextlib
 import queue
 from typing import TYPE_CHECKING, Any
 
+from turnstone.core.workstream import concrete_method
+
 if TYPE_CHECKING:
     from turnstone.core.session import SessionUI
     from turnstone.core.workstream import Workstream
@@ -49,10 +51,20 @@ def cleanup_session_ui(ws: Workstream) -> None:
         ws.session.cancel()
     ui = ws.ui
     if ui is not None:
-        if hasattr(ui, "resolve_all_approvals"):
+        resolve_close = (
+            concrete_method(ws.session, "resolve_close_approvals")
+            if ws.session is not None
+            else None
+        )
+        if resolve_close is not None:
+            # Production ChatSession owns the one close-sweep helper shared by
+            # soft-close preparation, direct close, and adapter cleanup.
+            with contextlib.suppress(Exception):
+                resolve_close()
+        elif hasattr(ui, "resolve_all_approvals"):
             # Deny + unblock EVERY live approval cycle — with parallel
-            # task agents several gate threads can be parked at once,
-            # and each must wake with its own (denied) result.
+            # task agents several gate threads can be parked at once. This is
+            # the compatibility path for non-ChatSession implementations.
             with contextlib.suppress(Exception):
                 ui.resolve_all_approvals(False, "Workstream closed")
         elif hasattr(ui, "_approval_event"):
@@ -83,6 +95,12 @@ def _broadcast_ws_closed_to_listeners(ui: SessionUI) -> None:
     if listeners is None or listeners_lock is None:
         return
     with listeners_lock:
+        # Fence stale events requests that already captured the Workstream/UI
+        # but have not yet reached listener registration. SessionUIBase's
+        # registration helpers observe this under the same lock and return a
+        # pre-closed, non-retained queue.
+        ui_any: Any = ui
+        ui_any._listeners_terminal = True
         for lq in listeners:
             # Mark the stream closing BEFORE attempting the sentinel: a
             # poisoned/full ``_ListenerQueue`` rejects every put (the

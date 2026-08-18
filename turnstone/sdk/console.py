@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from turnstone.api.console_schemas import (
     AdminMemoryInfo,
+    AdminMemorySummary,
     ClusterNodesResponse,
     ClusterOverviewResponse,
     ClusterSnapshotResponse,
@@ -36,6 +37,7 @@ from turnstone.api.console_schemas import (
     ListToolPoliciesResponse,
     ListUserRolesResponse,
     McpServerDetail,
+    MemoryIndexHealthResponse,
     NodeDetailResponse,
     OrgInfo,
     ParseSkillResponse,
@@ -363,6 +365,7 @@ class AsyncTurnstoneConsole(_BaseClient):
         message: str,
         *,
         attachment_ids: list[str] | None = None,
+        client_send_id: str | None = None,
     ) -> dict[str, Any]:
         """Send a message to a coordinator workstream.
 
@@ -373,6 +376,8 @@ class AsyncTurnstoneConsole(_BaseClient):
         body: dict[str, Any] = {"message": message}
         if attachment_ids is not None:
             body["attachment_ids"] = attachment_ids
+        if client_send_id is not None:
+            body["client_send_id"] = client_send_id
         return await self._request("POST", f"/v1/api/workstreams/{ws_id}/send", json_body=body)
 
     async def coordinator_upload_attachment(
@@ -959,6 +964,27 @@ class AsyncTurnstoneConsole(_BaseClient):
             response_model=AdminMemoryInfo,
         )
 
+    async def update_memory_description(
+        self,
+        memory_id: str,
+        description: str,
+    ) -> AdminMemorySummary:
+        from turnstone.core.memory_index import normalize_memory_description
+
+        return await self._request(
+            "PATCH",
+            f"/v1/api/admin/memories/{memory_id}",
+            json_body={"description": normalize_memory_description(description)},
+            response_model=AdminMemorySummary,
+        )
+
+    async def memory_index_health(self) -> MemoryIndexHealthResponse:
+        return await self._request(
+            "GET",
+            "/v1/api/admin/memories/index-health",
+            response_model=MemoryIndexHealthResponse,
+        )
+
     async def delete_memory(self, memory_id: str) -> StatusResponse:
         return await self._request(
             "DELETE",
@@ -1346,9 +1372,15 @@ class TurnstoneConsole:
         message: str,
         *,
         attachment_ids: list[str] | None = None,
+        client_send_id: str | None = None,
     ) -> dict[str, Any]:
         return self._runner.run(
-            self._async.coordinator_send(ws_id, message, attachment_ids=attachment_ids)
+            self._async.coordinator_send(
+                ws_id,
+                message,
+                attachment_ids=attachment_ids,
+                client_send_id=client_send_id,
+            )
         )
 
     def coordinator_upload_attachment(
@@ -1703,6 +1735,16 @@ class TurnstoneConsole:
 
     def get_memory(self, memory_id: str) -> AdminMemoryInfo:
         return self._runner.run(self._async.get_memory(memory_id))
+
+    def update_memory_description(
+        self,
+        memory_id: str,
+        description: str,
+    ) -> AdminMemorySummary:
+        return self._runner.run(self._async.update_memory_description(memory_id, description))
+
+    def memory_index_health(self) -> MemoryIndexHealthResponse:
+        return self._runner.run(self._async.memory_index_health())
 
     def delete_memory(self, memory_id: str) -> StatusResponse:
         return self._runner.run(self._async.delete_memory(memory_id))

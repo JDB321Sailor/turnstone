@@ -97,7 +97,7 @@ turnstone/
     discord/          Discord adapter (bot, cog, views, streaming, config)
     slack/            Slack adapter (Socket Mode bot, DM routing, approval buttons)
   shared_static/      Shared design system (base.css, auth.js, theme.js, toast.js, utils.js, kb.js)
-    katex-0.18.1/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
+    katex-0.18.4/    Vendored KaTeX math rendering library (MIT, woff2 fonts)
   ui/
     colors.py         ANSI color constants with NO_COLOR support
     markdown.py       Streaming terminal markdown renderer (line-buffered)
@@ -336,6 +336,36 @@ that fuel the SSE refresh-resume `in_progress_snapshot` event — see
 the per-workstream events stream in
 [`docs/api-reference.md`](api-reference.md#get-v1apiworkstreamsws_idevents).
 
+For web-backed sessions, every accepted live conversation row enters one
+ordered history handoff journal before durability. This includes user,
+assistant, tool, and system rows, compaction checkpoints, partial-assistant
+cancellation markers, and synthesized cancellation tool receipts. Admission
+shares the short handoff lock with the row's live UI transition or a
+`history_resync` repair event, so a row either changes the history token before
+listener registration or reaches the listener registered under the old token.
+Each journal entry has a stable per-workstream `commit_key`; the storage
+backends insert it idempotently, so an acknowledgement lost after commit can be
+resolved without duplicating the row. Attachment-bearing user and tool rows
+commit their conversation row, content-addressed blobs, reference counts, and
+ordered attachment list in one transaction.
+
+`/history` loads the durable prefix and overlays unacknowledged journal entries
+under a separate visibility lane. Its `messages` is the requested tail
+projection of one total accepted row prefix; an opaque token names that exact
+prefix. The initial SSE connection validates the token while registering its
+listener. A changed revision or session epoch emits `history_resync`, closes the
+stream, and requires another history read rather than assuming numeric
+event-ring coverage can reconstruct a complete row. A durable-history load
+failure returns 503 and supplies no usable token, so clients retain their
+current transcript and keep the repair latch closed.
+
+Storage acknowledgement removes the journal representation without advancing
+the accepted revision: durable and pending forms are the same logical row. An
+unresolved save fail-stops every later conversation-row suffix, remains visible
+through the live journal, and prevents soft close, idle eviction, or capacity
+eviction from discarding that recovery state. Soft close returns 409 and leaves
+the workstream loaded; hard delete remains the explicit discard boundary.
+
 `on_stream_discarded` removes a failed attempt's partial projection before a
 mid-stream retry. `on_system_turn` and `on_compaction` return the assigned SSE
 event ID when the frontend has one; persistence stamps the corresponding row
@@ -421,13 +451,15 @@ class Workstream:
     _state_tail_lock: threading.Lock  # durable state/observer ordering
 ```
 
-The durable incarnation token and lifecycle fields are internal and never appear in
-public workstream/config projections. They distinguish successive objects that
-reuse one logical ID. Manager-created rows receive the token at registration;
-legacy rows acquire one atomically when rehydration, delete, or fork preflight
-takes its authoritative snapshot. This prevents an old manager state
-transition, buffered lifecycle-state write, stale delete authorization, or
-fork operation from targeting a replacement incarnation.
+The durable reservation token and lifecycle fields are internal and never
+appear in public workstream/config projections. `workstreams.ws_id` is the
+authoritative live-ID reservation: a concurrent or caller-selected collision is
+rejected while the row exists, and successful hard deletion releases the ID
+after removing its owned state. The token identifies the exact retryable
+reservation and is installed atomically for legacy rows during rehydration,
+delete, or fork preflight. It prevents an old provisional create, buffered
+lifecycle-state write, stale delete authorization, or fork operation from
+targeting a replacement row that reused the same ID.
 
 ### SessionManager
 
@@ -493,8 +525,8 @@ after the committed snapshot is adopted in memory does the normal
 `creating -> idle -> ws_created` publication run.
 
 Rehydration binds the private token before constructing the session, then
-rechecks it after configuration and history are loaded; a delete/re-register
-crossing retires the hybrid candidate and retries from a fresh snapshot.
+rechecks it after configuration and history are loaded; a concurrent lifecycle
+change retires the hybrid candidate and retries from a fresh snapshot.
 Loaded hard-delete similarly compares the endpoint's authorized token with
 both the local and current durable incarnations before making any terminal
 mutation. It closes generation publication, drains every already-admitted
@@ -505,9 +537,9 @@ a false `ws_closed` event.
 
 That drain covers manager-owned session durability admitted through the ticket
 lane. Direct legacy storage helpers that mutate only by `ws_id` are not made
-token-conditional by this refactor and must not be used as a same-ID reuse
-fence; the incarnation token guarantees exact create/fork/delete target
-selection, not a new transaction contract for every maintenance API.
+token-conditional by this refactor. The reservation token guarantees exact
+create/fork/delete target selection during provisional lifecycle races; the
+primary key separately prevents reuse while the durable row exists.
 
 #### Crash-Abandoned Create Recovery
 
@@ -599,14 +631,19 @@ non-idle background workstreams above the input prompt.
   run outside it.
 - `Workstream._lock`: guards one workstream's worker pair and short state
   mutations.
-- The per-ID lifecycle lane orders create/open/close/hard-delete across object
-  incarnations; `Workstream._lifecycle_lock` orders one object's birth against
-  its terminal paths.
+- The per-ID lifecycle lane orders create/open/close/hard-delete, including a
+  rolled-back hidden reservation followed by its retry;
+  `Workstream._lifecycle_lock` orders one object's birth against its terminal
+  paths.
 - `Workstream._state_tail_lock` orders accepted state persistence and observer
   events. `_state_revision` rejects superseded tails, while
   `_state_incarnation` and `StateWriter` prevent close/reopen ABA writes.
 - `ChatSession._generation_lock` fences one turn's live mutations;
   `_durability_cond` tickets its deferred storage batches in admission order.
+- `ChatSession._history_handoff_lock` owns the total accepted conversation-row
+  journal, revision, and initial listener registration. The separate
+  `_history_visibility_lock` linearizes a storage history load with keyed row
+  save/ack; neither is held across generation admission or model/tool work.
 - `SessionUIBase._ws_lock` protects concurrent approval cycles, verdict caches,
   and SSE projection state; approval admission uses a separate condition so
   Stop never waits on database I/O.
@@ -809,23 +846,23 @@ boundary.
 
 ```
 ChatSession
-    |
     +-- ResolvedModelBinding
     |       +-- ModelLane (provider, client, model, capabilities, params)
     |       +-- immutable ModelConfig snapshot
     |       +-- registry generation
+    |       |
+    |       v
+    |   model_turn(ModelLane, list[Turn])
+    |       +-- lowering.py: Turn IR -> repaired provider-neutral wire dicts
+    |       +-- LLMProvider.create_streaming() (single model transport call site)
+    |               +--- OpenAIProvider --- OpenAI/vLLM/llama.cpp
+    |               +--- AnthropicProvider --- Anthropic Messages API
+    |               +--- GoogleProvider --- Gemini via /v1beta/openai/
     |
-    v
-model_turn(ModelLane, list[Turn])
-    |
-    +-- lowering.py: Turn IR -> repaired provider-neutral wire dicts
-    |
-    v
-LLMProvider.create_streaming()  (the single transport call site)
-    |
-    +--- OpenAIProvider  --- OpenAI, vLLM, llama.cpp, any /v1/chat/completions API
-    +--- AnthropicProvider --- Anthropic Messages API (native streaming, thinking)
-    +--- GoogleProvider  --- Google Gemini via /v1beta/openai/ (extends OpenAIProvider)
+    +-- RerankLane (runtime, alias admission, registry/config witnesses)
+            |
+            v
+        rerank(RerankLane, query, documents) --> Cohere/Jina-compatible endpoint
 ```
 
 **Protocol methods:**
@@ -845,6 +882,7 @@ LLMProvider.create_streaming()  (the single transport call site)
 | `StreamChunk` | `content_delta`, `reasoning_delta`, `tool_call_deltas`, `info_delta`, `usage`, `finish_reason`, `provider_blocks` |
 | `CompletionResult` | `content`, `tool_calls`, `finish_reason`, `usage`, `provider_blocks` |
 | `ModelLane` | Frozen per-loop provider/client/model binding, capabilities, sampling knobs, registry reference, and backend-auth seam |
+| `RerankLane` | Frozen per-batch binding to a registry-owned rerank runtime, stable alias admission gate, and registry/config version witnesses |
 | `ResolvedModelBinding` | A `ModelLane`, its immutable `ModelConfig`, and the registry generation read in the same snapshot |
 | `ModelTurnResult` | Canonical assistant `Turn`, tool-call dispatch mirror, serving-lane provenance, usage, and exact lowered wire facts |
 | `ModelCapabilities` | `context_window`, `max_output_tokens`, `supports_temperature`, `token_param`, `thinking_mode`, `supports_effort`, `supports_web_search`, `supports_tool_search`, `supports_vision`, `supports_reasoning_replay`, `supports_verbosity`, `verbosity`, `supports_pro_mode`, `reasoning_mode` |
@@ -857,6 +895,17 @@ one coherent backend binding or is cancelled; it never observes a mixture of
 old endpoint/client state and new capabilities/configuration. Per-call operator
 toggles that are intentionally live, such as reasoning replay, are re-read by
 `model_turn()` through the lane's registry reference.
+
+`RerankLane` is a deliberately narrow sibling rather than a subtype of
+`ModelLane`: endpoint reranking does not construct an LLM provider or SDK
+client. `ModelRegistry` owns the active rerank runtime, whose HTTP pool,
+per-endpoint circuit breaker, and active-call retirement state are shared by
+all sessions. Each retrieval batch resolves the Reranker alias and instruction
+from one ConfigStore snapshot and binds the matching registry generation.
+Relevant configuration changes retire the old runtime, reject new work on its
+stale lanes, and close its transport after active calls drain; cap-only reloads
+resize the stable alias admission gate without discarding the pool. Calibration
+remains an isolated one-shot client and always closes it after the probe.
 
 **OpenAIProvider** (`_openai.py`): passes messages through unchanged (they are
 already in OpenAI format), including multi-part content blocks (text + images)
@@ -964,14 +1013,20 @@ remain warm, but the session still receives a new coherent config/lane.
 simultaneous generations for that alias in one process. Every registry-backed
 role carries the same gate on its `ModelLane`, so main turns, judges, task
 agents, perception, compaction, and background generation coordinate through
-one FIFO. Two aliases never share a gate implicitly, even when their URLs are
-identical. `model_turn()` materializes attachment fallbacks before admission,
-then holds one lease across eager stream creation and the complete drain,
-releasing before retry backoff. Admission wait is credited out of deadline
-accounting, preventing queued judges from spending their request budget before
-dispatch. The gate survives cap-only reloads in place; the field is excluded
-from semantic `ModelConfig` equality so a capacity edit does not reset judges
-or output-guard state.
+one FIFO. Endpoint reranking carries the same gate on its `RerankLane`, so a
+reranker alias cannot exceed that cap or bypass capacity shared with another
+role. Two aliases never share a gate implicitly, even when their URLs are
+identical. For calls with context-first request admission, `model_turn()`
+admits the request before materializing attachment fallbacks; an oversized
+refusal therefore invokes neither attachment resolution nor nested
+perception/audio. Ordinary calls preserve their lowering cadence. Both paths
+finish attachment materialization before acquiring model capacity, then hold
+one lease across eager stream creation and the complete drain, releasing before
+retry backoff. Capacity wait is credited out of deadline accounting, preventing
+queued judges from spending their request budget before dispatch. The gate
+survives cap-only reloads in place; the field is excluded from semantic
+`ModelConfig` equality so a capacity edit does not reset judges or output-guard
+state.
 
 Primary loops, recursive compaction, judges, title generation, audio, and task
 agents all consume `ModelLane` rather than inspecting provider/client handles.
@@ -979,6 +1034,22 @@ Fallback is a lane change, so retry classification and result provenance come
 from the lane that actually served the call. A recursive compaction pins one
 lane for all leaf summaries and the merge; a hot reload never splices two model
 definitions into one summary transaction.
+
+Every accepted model turn carries an immutable provenance envelope captured
+from that successful serving attempt: model alias, backend model ID, registry
+generation, and the generation-pinned acting principal. It is stamped before
+the result leaves `model_turn()` and persisted in the assistant row's existing
+`meta` JSON, so a later fallback, hot reload, user rebind, or ambiguous storage
+acknowledgement cannot relabel the output at commit time. The principal-bearing
+envelope is internal audit metadata: ordinary history/SSE, coordinator
+inspection, exports, and provider lowering do not expose it.
+
+For browser-driven turns the principal is the authenticated initiator pinned to
+the generation. Headless session-backed turns (CLI, eval, scheduled, and
+internal work) stamp the effective owner credential principal they actually use;
+only a truly ownerless direct model call records an empty principal. This fourth
+axis remains private even where the three serving-kernel axes are logged for
+retry and completion diagnostics.
 
 **Model-backend authentication:** A model definition's `auth_mode` is one of
 `static`, `entra_obo`, `entra_app`, or `rfc8693_obo`. Dynamic modes keep only
@@ -1325,9 +1396,9 @@ ChatSession / SessionManager / HTTP lifecycle
   │ (FTS5 search) │    │ (tsvector/ILIKE)  │
   └─────────────┘    └──────────────────┘
         ↓                     ↓
-    storage._schema  (SQLAlchemy Core tables — single source of truth)
+    storage._schema  (current metadata / create-all SQLAlchemy tables)
         ↓
-    storage._migrate  (programmatic Alembic)
+    storage._migrate  (parallel, manually maintained Alembic history)
 ```
 
 **SQLite** is the default (zero-config, single file at `.turnstone.db`).
@@ -1374,7 +1445,10 @@ conversations
   event_id      BIGINT               -- per-workstream SSE resume cursor
   is_error      BOOLEAN
   attachments   TEXT                 -- ordered content-addressed refs
-  meta          TEXT                 -- source, effect, preview side metadata
+  meta          TEXT                 -- source/effect/preview/model provenance
+  commit_key    TEXT                 -- nullable idempotent live-row identity
+
+  UNIQUE (ws_id, commit_key) WHERE commit_key IS NOT NULL
 
 workstream_config
   ws_id       TEXT NOT NULL          -- composite PK with key
@@ -1383,18 +1457,26 @@ workstream_config
   -- private durable incarnation token also lives here but is filtered from
   -- every ordinary config read/snapshot
 
+memory_index_snapshots
+  ws_id                     TEXT PRIMARY KEY -- one binding per durable workstream row
+  principal_id, project_id, project_name     -- first-admission witnesses
+  visibility_key, content, format_version
+  entry_count, char_count, invalid_description_count, captured_at
+
 conversations_fts                    -- SQLite FTS5 virtual table (optional)
   content     (content=conversations, content_rowid=id)
 ```
 
-Table definitions live in `storage/_schema.py` (SQLAlchemy Core `Table` objects)
-and are the single source of truth for both backends and Alembic migrations.
+Current metadata and create-all definitions live in `storage/_schema.py`
+(SQLAlchemy Core `Table` objects). Alembic revisions are a parallel, manually
+maintained history rather than generated from that module; schema-parity tests
+keep the two definitions aligned.
 
 ### StorageBackend Protocol
 
 | Method | Purpose |
 |--------|---------|
-| `register_workstream(..., fork_reservation_token=...)` | Atomically insert `creating` row plus private incarnation token; report collision |
+| `register_workstream(..., fork_reservation_token=...)` | Atomically reserve a live ID and insert its row plus private reservation token; report current-row collisions |
 | `ensure_workstream_incarnation_snapshot(ws_id)` | Lock and return one exact row plus its private token, installing a token atomically for legacy rows |
 | `finalize_deferred_create(...)` | Apply alias/config/node writes only if row and token still match |
 | `publish_deferred_create(ws_id, token)` | Compare-and-swap the exact reservation from `creating` to `idle` |
@@ -1404,6 +1486,8 @@ and are the single source of truth for both backends and Alembic migrations.
 | `load_message_turns(ws_id, checkpointed=True)` | Rehydrate canonical `Turn` objects, bounded by the latest valid compaction checkpoint |
 | `load_messages(ws_id, include_compaction=...)` | Materialized display/export projection; optionally surface compaction cards |
 | `clone_workstream(source, destination, ..., expected_session=...)` | Transactionally compare source and destination incarnations, authorize, and copy canonical history/config/project/attachment ownership |
+| `get_memory_index_snapshot(ws_id)` | Load the immutable memory-index binding without creating it |
+| `acquire_memory_index_snapshot(ws_id, principal_id, commit_context=...)` | Transactionally resolve first-admission visibility, capture or load one immutable index, and let the caller validate before commit |
 | `get_compaction_watermark/floor/checkpoint(...)` | Maintain resume checkpoints without deleting audit history |
 | `update_workstream_state(...)` | Persist a lifecycle state after manager/state-writer fencing |
 | `resolve_workstream(alias_or_id)` | Resolve alias, exact ID, or ID prefix |
@@ -1495,11 +1579,16 @@ startup) are invisible until a message is sent.
 at startup (CLI and server). It deliberately excludes internal `creating`
 reservations, which belong to the crash-recovery path above. It removes:
 
-- Published workstreams with no messages (orphaned registrations)
+- Unnamed workstreams with no messages (orphaned registrations) whose
+  `updated` timestamp is older than a two-hour grace — a just-created
+  workstream is a user mid-first-turn (its first rows may still be held in a
+  serving node's in-memory commit journal, invisible to other nodes), never
+  housekeeping debris
 - Unnamed workstreams (`alias IS NULL`) older than `retention_days` days (default 90)
 
-Named (aliased) workstreams are never age-pruned. Configure with
-`--retention-days N` (0 = disable age pruning).
+Named (aliased) workstreams are never pruned by either category. Configure
+with `--retention-days N` (0 = disable age pruning; the orphan sweep still
+runs, grace-gated).
 
 ---
 
@@ -1561,6 +1650,14 @@ warns if the summary was truncated.
 - **SSE reconnect**: both `connectContentSSE()` and `connectGlobalSSE()` use
   exponential backoff on `onerror` -- starting at 1 second, doubling on each
   failure, capped at 30 seconds. On successful message, delay resets to 1s.
+- **Conversation history handoff**: a pane renders REST `/history`, then opens
+  its initial per-workstream SSE with that response's cursor and one-shot
+  handoff token. The token is present exactly when the session is live on the
+  serving node; a rendered token-less 200 is the cold storage-only read and
+  downgrades the pane to the token-less bootstrap (the server converges it
+  via `clear_ui`). `history_resync` closes the transport and latches a fresh
+  history read; a 503 retains the stale-but-real transcript and cannot fall
+  through to a cursorless stream.
 - **Disconnection indicator**: `#status-bar.disconnected` class turns the
   status text red and shows "Reconnecting..."
 - **Fetch error handling**: all `fetch()` calls use `.catch()` to prevent

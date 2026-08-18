@@ -42,7 +42,6 @@ from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
-from starlette.staticfiles import StaticFiles
 
 from turnstone import __version__
 from turnstone.api.docs import make_docs_handler, make_openapi_handler
@@ -73,11 +72,15 @@ from turnstone.core.model_turn import (
 from turnstone.core.ratelimit import resolve_client_ip
 from turnstone.core.session import ChatSession, GenerationCancelled, SessionUI  # noqa: F401
 from turnstone.core.session_manager import (
+    PERSISTENCE_RECONCILE_INTERVAL_SECONDS,
     STALE_CREATE_GRACE_SECONDS,
     STALE_CREATE_SWEEP_INTERVAL_SECONDS,
     SessionManager,
 )
-from turnstone.core.session_replay import session_replay_preamble
+from turnstone.core.session_replay import (
+    request_replay_project_name,
+    session_replay_preamble,
+)
 from turnstone.core.session_routes import (
     AttachmentUploadHelpers,
     CreatePreCommitError,
@@ -110,11 +113,14 @@ from turnstone.core.session_ui_base import (
 )
 from turnstone.core.tools import TOOLS  # noqa: F401 — available for introspection
 from turnstone.core.trajectory import final_assistant_text
+from turnstone.core.web_helpers import RevalidatingStaticFiles
 from turnstone.core.web_helpers import version_html as _version_html
 from turnstone.core.workstream import (
     Workstream,
     WorkstreamKind,
     WorkstreamState,
+    concrete_method,
+    workstream_persistence_state,
 )
 from turnstone.prompts import ClientType
 
@@ -189,6 +195,41 @@ class WebUI(SessionUIBase):
         """
         return self._kind, self._parent_ws_id
 
+    # ``_current_persistence_state`` inherited from :class:`SessionUIBase`:
+    # derives through the session bound at construction, never a registry
+    # lookup by id (which fails open to "healthy" exactly while tombstone
+    # retention or retirement has the row out of the map).
+
+    def _publish_global_state_snapshot(
+        self,
+        state: str,
+        payload: dict[str, Any],
+        *,
+        include_content: bool,
+    ) -> None:
+        """Fan out one rich state snapshot without mutating session state."""
+        if WebUI._global_queue is None:
+            return
+        kind, parent_ws_id = self._ws_kind_and_parent()
+        event: dict[str, Any] = {
+            "type": "ws_state",
+            "ws_id": self.ws_id,
+            "state": state,
+            "tokens": payload["tokens"],
+            "context_ratio": payload["context_ratio"],
+            "activity": payload["activity"],
+            "activity_state": payload["activity_state"],
+            "kind": kind,
+            "parent_ws_id": parent_ws_id,
+            "persistence_state": self._current_persistence_state(),
+        }
+        if include_content and state == "idle":
+            event["content"] = payload["content"]
+        try:
+            WebUI._global_queue.put_nowait(event)
+        except queue.Full:
+            log.debug("Global SSE queue full, dropping %s event", event.get("type"))
+
     def _broadcast_state(self, state: str) -> None:
         """Send a state-change event to the global SSE channel.
 
@@ -200,20 +241,6 @@ class WebUI(SessionUIBase):
         """
         if WebUI._global_queue is not None:
             payload = self.snapshot_and_consume_state_payload(state)
-            kind, parent_ws_id = self._ws_kind_and_parent()
-            event: dict[str, Any] = {
-                "type": "ws_state",
-                "ws_id": self.ws_id,
-                "state": state,
-                "tokens": payload["tokens"],
-                "context_ratio": payload["context_ratio"],
-                "activity": payload["activity"],
-                "activity_state": payload["activity_state"],
-                "kind": kind,
-                "parent_ws_id": parent_ws_id,
-            }
-            if state == "idle":
-                event["content"] = payload["content"]
             # ``pending_approval_detail`` is NO LONGER piggybacked on
             # state-change events (Stage 3 cleanup). Symmetric event
             # flow now: initial approval items arrive via bulk fetch
@@ -222,10 +249,31 @@ class WebUI(SessionUIBase):
             # ``intent_verdict`` event class, and resolution via
             # ``approval_resolved``. Reducer no longer has to dedupe
             # the piggyback path against the explicit one.
-            try:
-                WebUI._global_queue.put_nowait(event)
-            except queue.Full:
-                log.debug("Global SSE queue full, dropping %s event", event.get("type"))
+            self._publish_global_state_snapshot(state, payload, include_content=True)
+
+    def on_persistence_state_changed(self) -> None:
+        """Refresh the operator row after journal failure or recovery.
+
+        This intentionally uses the global node stream only. Conversation-pane
+        SSE is a transcript/control channel and must not receive operator-only
+        storage diagnostics. Unlike a real state transition, this snapshot does
+        not consume the terminal turn-content accumulator.
+        """
+        # The registry read serves ONLY the row-state field (``ws.state``
+        # lives on the manager's row); the persistence field itself derives
+        # through the bound session inside the snapshot publish.  A miss
+        # here means the row left the roster — there is no operator row to
+        # refresh, so dropping is correct, and it can no longer launder a
+        # blocked journal into "healthy" (the pre-fix hazard).
+        mgr = WebUI._workstream_mgr
+        if mgr is None:
+            return
+        ws = mgr.get(self.ws_id)
+        if ws is None:
+            return
+        payload = self.snapshot_state_payload_non_consuming()
+        payload["content"] = ""
+        self._publish_global_state_snapshot(ws.state.value, payload, include_content=False)
 
     def _broadcast_activity(self) -> None:
         """Send an activity-change event to the global SSE channel."""
@@ -751,79 +799,14 @@ def _audit_retry_workstream(
     )
 
 
-def _interactive_dispatch_retry(ws: Workstream, user_msg: str) -> None:
-    """Re-send ``user_msg`` on an interactive workstream after ``/retry``.
-
-    Passed to :func:`make_retry_handler` as ``dispatch_retry``; called
-    once :meth:`ChatSession.retry` has truncated the last turn. Drives
-    the shared :func:`turnstone.core.session_worker.send` dispatcher with
-    an interactive ``run`` closure (surfaces ``GenerationCancelled`` /
-    errors through the WebUI hooks) and a hard-reject ``enqueue`` closure
-    (a retry must not silently queue behind an in-flight turn — preserves
-    the pre-lift inline behaviour). The shared dispatcher owns the
-    ``_worker_running`` lifecycle, so the ``run`` closure needs no
-    ``finally`` flag-clear of its own.
-
-    Deliberately NOT gated on the /send order barrier
-    (``ws._pending_sends``): a retry is an explicit user action that
-    rewinds a COMPLETED turn — dispatching it ahead of deferred sends is
-    an accepted overtake (the user just asked for exactly that turn to
-    run again), not the silent send-vs-send inversion the barrier exists
-    to prevent.  Deferred entries dispatch after it, order among
-    themselves preserved.
-    """
-    from turnstone.core import session_worker
-
-    session = ws.session
-    ui = ws.ui
-    if session is None or ui is None:
-        return
-
-    def _run() -> None:
-        me = threading.current_thread()
-        try:
-            session.send(user_msg)
-        except GenerationCancelled:
-            if ws.worker_thread is me:
-                ui.on_stream_end()
-                ui.on_state_change("idle")
-        except Exception as exc:
-            # Deliberately NOT routed through session.ensure_error_recorded: on a
-            # REUSED session a pre-try raise after a prior errored turn finds
-            # _has_persisted_error stale-True (it is session-lifetime — cleared
-            # only by _emit_state idle/running, not per-turn), so the recorder
-            # would no-op and swallow the fresh error.  The DISPLAY string is
-            # sanitized inline (a credential-bearing base-URL in the exception
-            # text must not cross into the dashboard SSE, the confidentiality
-            # floor _record_fatal_error also enforces); the double state emit and
-            # the pre-try no-persist (a reused-session retry can then have the
-            # coordinator read a STALE last_error) still need the per-turn
-            # error-signal redesign and are tracked in #865, matching the /send
-            # and coord-send sibling closures.
-            if ws.worker_thread is me:
-                from turnstone.core.memory import sanitize_error_text
-
-                ui.on_error(f"Error: {sanitize_error_text(str(exc))}")
-                ui.on_stream_end()
-                ui.on_state_change("error")
-
-    def _enqueue() -> None:
-        ui.on_error("Cannot retry: workstream is busy")
-
-    session_worker.send(ws, enqueue=_enqueue, run=_run, thread_name=f"retry-{ws.id[:8]}")
-
-
 def _interactive_events_replay(
     ws: Workstream, ui: Any, request: Request
 ) -> Iterable[dict[str, Any]]:
     """Initial SSE replay payload for interactive ``events`` connections.
 
-    Yields a ``connected`` event (model + skip_permissions), a
-    ``status`` event with the workstream's last token usage + context %
-    (when a turn has completed), and the pending approval prompt + cached
-    intent verdicts (if a prompt is pending). The lifted
-    ``make_events_handler`` body delegates that yield sequence to this
-    callback so the kind-specific shape stays in this module.
+    Yields the shared ``connected`` / ``status`` preamble, followed by pending
+    approval prompts and cached intent verdicts. The lifted handler resolves
+    viewer-specific project metadata off-loop before invoking this callback.
 
     Conversation history is NOT replayed over SSE: the frontend fetches
     it via ``GET /history`` on page load and re-fetches on the
@@ -832,17 +815,17 @@ def _interactive_events_replay(
 
     Pure read — never mutates ``ws`` / ``ui`` / ``session``.
     """
-    session = ws.session
-    if session is None:
+    if ws.session is None:
         # Defensive — the lifted body's UI presence check guarantees
         # the workstream made it past placeholder state, but the
         # session can still be detached on the close-then-reopen path.
         return
 
-    # Connected + status preamble — same shape coord replays use; the
-    # shared helper keeps the two surfaces from drifting on a future
-    # field add.
-    yield from session_replay_preamble(session, ui)
+    yield from session_replay_preamble(
+        ws.session,
+        ui,
+        project_name=request_replay_project_name(request),
+    )
 
     # Pending approval re-injection (so a reconnecting tab sees the
     # prompt) + cached LLM verdicts received since the prompt fired.
@@ -1062,6 +1045,7 @@ def _build_node_snapshot(app_state: Any) -> dict[str, Any]:
                 "model_alias": ws.session.model_alias if ws.session else "",
                 "kind": ws.kind,
                 "parent_ws_id": ws.parent_ws_id,
+                "persistence_state": workstream_persistence_state(ws),
                 "user_id": ws.user_id,
                 "project_id": ws.project_id,
                 "persona": ws.persona,
@@ -1441,6 +1425,7 @@ async def dashboard(request: Request) -> JSONResponse:
                 "model_alias": ws.session.model_alias if ws.session else "",
                 "kind": ws.kind,
                 "parent_ws_id": ws.parent_ws_id,
+                "persistence_state": workstream_persistence_state(ws),
                 "user_id": ws.user_id,
                 "project_id": ws.project_id,
                 "persona": ws.persona,
@@ -2128,6 +2113,7 @@ async def command(request: Request) -> JSONResponse:
                     ws,
                     enqueue=_reject_busy,
                     run=run,
+                    expected_session=session,
                     thread_name=thread_name,
                     worker_kind="command",
                 )
@@ -2245,7 +2231,10 @@ async def command(request: Request) -> JSONResponse:
         def _run_cmd() -> None:
             me = threading.current_thread()
             try:
-                should_exit = session.handle_command(cmd)
+                should_exit = session.handle_command(
+                    cmd,
+                    principal_id=command_principal,
+                )
                 # Post-command follow-ups run HERE, on the worker, not
                 # after the endpoint's done-wait: past the 25s backstop the
                 # endpoint has already answered {"status": "running"}, and
@@ -2274,6 +2263,16 @@ async def command(request: Request) -> JSONResponse:
                         updated_name = get_workstream_display_name(session.ws_id)
                         if updated_name:
                             ws.name = updated_name
+            except GenerationCancelled:
+                # Defense-in-depth, the sibling of _run_initial's arm (no
+                # generic command claims a generation today, so this is
+                # effectively unreachable).  ``session_worker._runner``
+                # catches only ``Exception`` — without this arm a stray
+                # cancel would kill the worker thread via
+                # ``threading.excepthook``; the finally below still
+                # unblocks the endpoint either way.
+                if ws.worker_thread is me:
+                    cmd_ui.on_info("Command cancelled.")
             except Exception as e:
                 # Same guard: a late "Command error:" from an abandoned
                 # worker would land mid-successor-turn.
@@ -2669,17 +2668,19 @@ async def _interactive_create_validate_request(
         body["_resume_incarnation_token"] = str(_src_row.get("fork_reservation_token") or "")
         body["project_id"] = source_project
         resume_inherited_pid = bool(source_project)
-    # Project attach gate (explicit or parent-inherited): a private
-    # project accepts new workstreams only from its owner/members, and a
-    # nonexistent EXPLICIT project_id is a caller error rather than a
-    # silent dangling link. Re-checking the inherited value is deliberate
+    # Project attach gate (explicit or parent-inherited): a project requires
+    # canonical active-runtime read access, and a nonexistent EXPLICIT
+    # project_id is a caller error rather than a silent dangling link.
+    # Re-checking the inherited value is deliberate
     # — a coordinator owner whose membership was revoked fails the child
     # spawn loudly here instead of minting rows they can no longer see.
     # The one asymmetry: an INHERITED project that no longer exists is
     # not the spawner's error — project deletion leaves the parent's
     # link dangling by design and must not disable spawn_workstream, so
     # the child simply isn't attached.
-    attach_pid = str(body.get("project_id") or "")
+    project_raw = body.get("project_id")
+    attach_pid = project_raw.strip() if isinstance(project_raw, str) else ""
+    body["project_id"] = attach_pid
     if attach_pid:
         from turnstone.core.auth import ensure_project_attachable
 
@@ -3037,13 +3038,11 @@ async def _interactive_create_post_install(
         session = ws.session
         send_id = uuid.uuid4().hex
         resolved_atts: list[Any] = []
-        staged_ord: list[str] = []
         if attachment_ids:
-            # Resolve (peek) the staged uploads.  The buffer DRAIN happens
-            # after the dispatch below, and only on the spawn path — the
-            # enqueue path can't deliver attachments, so there they must
-            # stay staged (see ``_enqueue_init``).
-            resolved_atts, staged_ord, _drop = _resolve_staged(attachment_ids, ws.id, uid)
+            # Resolve without draining. Accepted USER journal admission owns
+            # the atomic transfer; every pre-admission refusal keeps staging
+            # intact for a retry (including the enqueue path below).
+            resolved_atts, _staged_ord, _drop = _resolve_staged(attachment_ids, ws.id, uid)
 
         def _run_initial() -> None:
             me = threading.current_thread()
@@ -3168,6 +3167,7 @@ async def _interactive_create_post_install(
             ws,
             enqueue=_enqueue_init,
             run=_run_initial,
+            expected_session=session,
             thread_name=f"ws-init-{ws.id[:8]}",
         )
         if not init_ok:
@@ -3187,20 +3187,6 @@ async def _interactive_create_post_install(
                 ws.id[:8],
                 initial_message_status,
             )
-        if staged_ord and not init_enqueued and init_ok:
-            # Spawn path took the message: drain the staged copies NOW,
-            # before this handler returns — the pane's rehydrate can only
-            # start after it receives this response, so it can never
-            # observe the consumed uploads as still-pending composer
-            # chips.  (``enqueue`` runs synchronously inside ``send``, so
-            # ``init_enqueued`` is settled here.)  ``_append_user_turn``'s
-            # own per-id discard then no-ops.
-            from turnstone.core.attachment_buffer import get_attachment_buffer
-
-            _buf = get_attachment_buffer()
-            for _aid in staged_ord:
-                _buf.discard(_aid, ws_id=ws.id, user_id=uid)
-
     out: dict[str, Any] = {}
     if initial_message_status:
         # Only present when the initial message was NOT delivered — the
@@ -3297,13 +3283,10 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
             reservation_token,
         )
         mgr = getattr(request.app.state, "workstreams", None)
-        supports_atomic_delete = mgr is not None and callable(
-            getattr(type(mgr), "delete_persisted", None)
-        )
-        if supports_atomic_delete:
-            assert mgr is not None
+        delete_persisted = concrete_method(mgr, "delete_persisted")
+        if delete_persisted is not None:
             deleted = await asyncio.to_thread(
-                mgr.delete_persisted,
+                delete_persisted,
                 ws_id,
                 delete_fn=delete_exact,
                 name=name,
@@ -3322,7 +3305,7 @@ async def delete_workstream_endpoint(request: Request) -> JSONResponse:
             # ever-growing tree on the dashboard.  Best-effort: an
             # emit failure must not roll back the storage delete or
             # 500 the response.
-            if mgr is not None and not supports_atomic_delete:
+            if mgr is not None and delete_persisted is None:
                 try:
                     mgr.delete(ws_id, name=name)
                 except Exception:
@@ -3518,40 +3501,167 @@ def _resolve_user_scope_id(
     return uid, None
 
 
+def _resolve_workstream_memory_scope_id(
+    request: Request,
+    scope_id: str,
+) -> tuple[str, JSONResponse | None]:
+    """Bind REST workstream-memory access to the authenticated owner."""
+    from turnstone.core.storage._registry import get_storage
+
+    resolved = scope_id.strip()
+    if not resolved:
+        return "", JSONResponse(
+            {"error": "scope_id is required for workstream scope"},
+            status_code=400,
+        )
+    owner = get_storage().get_workstream_owner(resolved)
+    if owner is None:
+        return "", JSONResponse({"error": "Workstream not found"}, status_code=404)
+    caller = _auth_user_id(request)
+    if "service" not in _auth_scopes(request) and (not caller or owner != caller):
+        return "", JSONResponse(
+            {"error": "Cannot access another user's workstream memories"},
+            status_code=403,
+        )
+    return resolved, None
+
+
+def _resolve_rest_memory_scope(
+    request: Request,
+    scope: str,
+    scope_id: str,
+    *,
+    allow_empty: bool,
+) -> tuple[str, str, JSONResponse | None]:
+    """Validate a public memory scope and bind its caller-controlled id."""
+    normalized_scope = scope.strip().lower()
+    normalized_id = scope_id.strip()
+    if not normalized_scope and allow_empty:
+        err = _validate_scope_scope_id(normalized_scope, normalized_id)
+        return normalized_scope, normalized_id, err
+    if normalized_scope not in _VALID_MEMORY_SCOPES:
+        return (
+            "",
+            "",
+            JSONResponse(
+                {
+                    "error": (
+                        f"invalid scope: {normalized_scope}; "
+                        f"must be one of {sorted(_VALID_MEMORY_SCOPES)}"
+                    )
+                },
+                status_code=400,
+            ),
+        )
+    if normalized_scope == "user":
+        normalized_id, err = _resolve_user_scope_id(request, normalized_id)
+        if err:
+            return "", "", err
+    elif normalized_scope == "workstream":
+        normalized_id, err = _resolve_workstream_memory_scope_id(request, normalized_id)
+        if err:
+            return "", "", err
+    err = _validate_scope_scope_id(
+        normalized_scope,
+        normalized_id,
+        require_scope_id=True,
+    )
+    return normalized_scope, normalized_id, err
+
+
+def _rest_visible_memory_scopes(request: Request) -> list[tuple[str, str]]:
+    """Default public read envelope: global plus the caller's user scope."""
+    scopes = [("global", "")]
+    uid = _auth_user_id(request)
+    if uid:
+        scopes.append(("user", uid))
+    return scopes
+
+
+def _audit_rest_memory_mutation(
+    request: Request,
+    action: str,
+    row: dict[str, str],
+) -> None:
+    """Record one authenticated REST/SDK memory mutation."""
+    from turnstone.core.audit import record_audit
+    from turnstone.core.storage._registry import get_storage
+
+    uid, ip = _audit_context(request)
+    record_audit(
+        get_storage(),
+        uid,
+        action,
+        "memory",
+        row["memory_id"],
+        {
+            "name": row["name"],
+            "scope": row["scope"],
+            "scope_id": row["scope_id"],
+            "type": row["type"],
+            "surface": "rest",
+        },
+        ip,
+    )
+
+
 async def list_memories(request: Request) -> JSONResponse:
     """GET /v1/api/memories — list memories with optional filters."""
-    from turnstone.core.memory import list_structured_memories
+    from turnstone.core.storage._registry import get_storage
 
-    mem_type = request.query_params.get("type", "")
+    mem_type = request.query_params.get("type", "").strip().lower()
     scope = request.query_params.get("scope", "")
     scope_id = request.query_params.get("scope_id", "")
+    if mem_type and mem_type not in _VALID_MEMORY_TYPES:
+        return JSONResponse({"error": f"invalid type: {mem_type}"}, status_code=400)
     try:
-        limit = min(int(request.query_params.get("limit", "100")), 200)
+        limit = int(request.query_params.get("limit", "100"))
     except (ValueError, TypeError):
         return JSONResponse({"error": "limit must be an integer"}, status_code=400)
-    err = _validate_scope_scope_id(scope, scope_id)
+    if not 1 <= limit <= 200:
+        return JSONResponse({"error": "limit must be between 1 and 200"}, status_code=400)
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=True,
+    )
     if err:
         return err
-    if scope == "user":
-        scope_id, err = _resolve_user_scope_id(request, scope_id)
-        if err:
-            return err
-    rows = list_structured_memories(mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit)
+    try:
+        storage = get_storage()
+        if scope:
+            rows = storage.list_structured_memories(
+                mem_type=mem_type,
+                scope=scope,
+                scope_id=scope_id,
+                limit=limit,
+            )
+        else:
+            rows = storage.list_visible_structured_memories(
+                _rest_visible_memory_scopes(request),
+                mem_type=mem_type,
+                limit=limit,
+            )
+    except Exception:
+        log.warning("memory.rest_list_failed", exc_info=True)
+        return JSONResponse({"error": "Memory storage unavailable"}, status_code=500)
     return JSONResponse({"memories": rows, "total": len(rows)})
 
 
 async def save_memory(request: Request) -> JSONResponse:
     """POST /v1/api/memories — save (upsert) a structured memory."""
-    from turnstone.core.memory import save_structured_memory
+    from turnstone.core.memory import normalize_memory_name, save_structured_memory_strict
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
         return body
-    name = str(body.get("name", "")).strip()
+    try:
+        name = normalize_memory_name(body.get("name"))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     content = str(body.get("content", "")).strip()
-    if not name or len(name) > 256:
-        return JSONResponse({"error": "name is required (max 256 characters)"}, status_code=400)
     if not content:
         return JSONResponse({"error": "content is required"}, status_code=400)
     if len(content) > _MAX_MEMORY_CONTENT:
@@ -3559,12 +3669,17 @@ async def save_memory(request: Request) -> JSONResponse:
             {"error": f"content exceeds {_MAX_MEMORY_CONTENT} character limit"},
             status_code=400,
         )
-    # None (field omitted) means "leave unset": the upsert keeps the stored
-    # value on update and defaults on insert; an explicit value overwrites.
-    raw_desc = body.get("description")
-    description = None if raw_desc is None else str(raw_desc)
+    from turnstone.core.memory_index import normalize_memory_description
+
+    try:
+        description = normalize_memory_description(body.get("description"))
+    except ValueError as exc:
+        return JSONResponse(
+            {"error": str(exc)},
+            status_code=400,
+        )
     raw_type = body.get("type")
-    mem_type = None if raw_type is None else str(raw_type)
+    mem_type = None if raw_type is None else str(raw_type).strip().lower()
     scope = str(body.get("scope", "global"))
     scope_id = str(body.get("scope_id", ""))
     if mem_type is not None and mem_type not in _VALID_MEMORY_TYPES:
@@ -3572,24 +3687,31 @@ async def save_memory(request: Request) -> JSONResponse:
             {"error": f"invalid type: {mem_type}; must be one of {sorted(_VALID_MEMORY_TYPES)}"},
             status_code=400,
         )
-    if scope not in _VALID_MEMORY_SCOPES:
-        return JSONResponse(
-            {"error": f"invalid scope: {scope}; must be one of {sorted(_VALID_MEMORY_SCOPES)}"},
-            status_code=400,
-        )
-    if scope == "user":
-        scope_id, err = _resolve_user_scope_id(request, scope_id)
-        if err:
-            return err
-    err = _validate_scope_scope_id(scope, scope_id, require_scope_id=True)
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=False,
+    )
     if err:
         return err
-    # The upsert RETURNINGs the full saved row, so no follow-up read is needed.
-    row, was_update = save_structured_memory(
-        name, content, description=description, mem_type=mem_type, scope=scope, scope_id=scope_id
-    )
-    if not row:
+    try:
+        row, was_update = save_structured_memory_strict(
+            name,
+            content,
+            description=description,
+            mem_type=mem_type,
+            scope=scope,
+            scope_id=scope_id,
+        )
+    except Exception:
+        log.warning("memory.rest_save_failed", name=name, exc_info=True)
         return JSONResponse({"error": "Failed to save memory"}, status_code=500)
+    _audit_rest_memory_mutation(
+        request,
+        "memory.update" if was_update else "memory.save",
+        row,
+    )
     return JSONResponse(row, status_code=200 if was_update else 201)
 
 
@@ -3598,7 +3720,7 @@ async def search_memories(request: Request) -> JSONResponse:
 
     Uses POST for the request body but requires only read scope (non-mutating).
     """
-    from turnstone.core.memory import search_structured_memories as search_fn
+    from turnstone.core.storage._registry import get_storage
     from turnstone.core.web_helpers import read_json_or_400
 
     body = await read_json_or_400(request)
@@ -3607,46 +3729,109 @@ async def search_memories(request: Request) -> JSONResponse:
     query = str(body.get("query", "")).strip()
     if not query:
         return JSONResponse({"error": "query is required"}, status_code=400)
-    mem_type = str(body.get("type", ""))
+    mem_type = str(body.get("type", "")).strip().lower()
     scope = str(body.get("scope", ""))
     scope_id = str(body.get("scope_id", ""))
     try:
-        limit = min(int(body.get("limit", 20)), 50)
+        limit = int(body.get("limit", 20))
     except (ValueError, TypeError):
         return JSONResponse({"error": "limit must be an integer"}, status_code=400)
-    err = _validate_scope_scope_id(scope, scope_id)
+    if mem_type and mem_type not in _VALID_MEMORY_TYPES:
+        return JSONResponse({"error": f"invalid type: {mem_type}"}, status_code=400)
+    if not 1 <= limit <= 50:
+        return JSONResponse({"error": "limit must be between 1 and 50"}, status_code=400)
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=True,
+    )
     if err:
         return err
-    if scope == "user":
-        scope_id, err = _resolve_user_scope_id(request, scope_id)
-        if err:
-            return err
-    rows = search_fn(query, mem_type=mem_type, scope=scope, scope_id=scope_id, limit=limit)
+    try:
+        storage = get_storage()
+        if scope:
+            rows = storage.search_structured_memories(
+                query,
+                mem_type=mem_type,
+                scope=scope,
+                scope_id=scope_id,
+                limit=limit,
+            )
+        else:
+            rows = storage.search_visible_structured_memories(
+                query,
+                _rest_visible_memory_scopes(request),
+                mem_type=mem_type,
+                limit=limit,
+            )
+    except Exception:
+        log.warning("memory.rest_search_failed", exc_info=True)
+        return JSONResponse({"error": "Memory storage unavailable"}, status_code=500)
     return JSONResponse({"memories": rows, "total": len(rows)})
+
+
+async def get_memory_endpoint(request: Request) -> JSONResponse:
+    """GET /v1/api/memories/{name} — fetch one full body and record access."""
+    from turnstone.core.memory import (
+        get_and_touch_structured_memory_by_name_strict,
+        normalize_memory_name,
+    )
+
+    try:
+        name = normalize_memory_name(request.path_params["name"])
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    scope = request.query_params.get("scope", "global")
+    scope_id = request.query_params.get("scope_id", "")
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=False,
+    )
+    if err:
+        return err
+    try:
+        memory = get_and_touch_structured_memory_by_name_strict(name, scope, scope_id)
+    except Exception:
+        log.warning("memory.rest_get_failed", name=name, exc_info=True)
+        return JSONResponse({"error": "Memory storage unavailable"}, status_code=500)
+    if memory is None:
+        return JSONResponse({"error": f"Memory '{name}' not found"}, status_code=404)
+    return JSONResponse(memory)
 
 
 async def delete_memory_endpoint(request: Request) -> JSONResponse:
     """DELETE /v1/api/memories/{name} — delete a memory by name and scope."""
-    from turnstone.core.memory import delete_structured_memory, normalize_key
+    from turnstone.core.memory import (
+        delete_structured_memory_returning_strict,
+        normalize_memory_name,
+    )
 
-    name = normalize_key(request.path_params["name"])
+    try:
+        name = normalize_memory_name(request.path_params["name"])
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     scope = request.query_params.get("scope", "global")
-    if scope not in _VALID_MEMORY_SCOPES:
-        return JSONResponse(
-            {"error": f"invalid scope: {scope}; must be one of {sorted(_VALID_MEMORY_SCOPES)}"},
-            status_code=400,
-        )
     scope_id = request.query_params.get("scope_id", "")
-    if scope == "user":
-        scope_id, err = _resolve_user_scope_id(request, scope_id)
-        if err:
-            return err
-    err = _validate_scope_scope_id(scope, scope_id, require_scope_id=True)
+    scope, scope_id, err = _resolve_rest_memory_scope(
+        request,
+        scope,
+        scope_id,
+        allow_empty=False,
+    )
     if err:
         return err
-    if delete_structured_memory(name, scope, scope_id):
-        return JSONResponse({"status": "ok", "name": name})
-    return JSONResponse({"error": f"Memory '{name}' not found"}, status_code=404)
+    try:
+        deleted = delete_structured_memory_returning_strict(name, scope, scope_id)
+    except Exception:
+        log.warning("memory.rest_delete_failed", name=name, exc_info=True)
+        return JSONResponse({"error": "Failed to delete memory"}, status_code=500)
+    if deleted is None:
+        return JSONResponse({"error": f"Memory '{name}' not found"}, status_code=404)
+    _audit_rest_memory_mutation(request, "memory.delete", deleted)
+    return JSONResponse({"status": "ok", "name": name})
 
 
 # ---------------------------------------------------------------------------
@@ -3655,8 +3840,8 @@ async def delete_memory_endpoint(request: Request) -> JSONResponse:
 #
 # User-facing CRUD over projects.  Every handler gates first on the RBAC
 # capability (``project.{create,read,write,delete}`` — admin-default) and then,
-# for a specific project, on the per-project ACL via
-# ``auth.user_can_access_project`` (or ownership for destructive / membership
+# for a specific project, on the lifecycle-independent per-project ACL via
+# ``auth.user_can_manage_project`` (or ownership for destructive / membership
 # ops).  Registered by both the standalone server and the console — projects
 # are global / shared-DB, so the handlers are node-agnostic.
 
@@ -3747,7 +3932,7 @@ async def create_project(request: Request) -> JSONResponse:
 
 async def get_project_endpoint(request: Request) -> JSONResponse:
     """GET /v1/api/projects/{project_id} — one project the caller can read."""
-    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.auth import require_permission, user_can_manage_project
     from turnstone.core.storage import get_storage
 
     err = require_permission(request, "project.read")
@@ -3761,7 +3946,7 @@ async def get_project_endpoint(request: Request) -> JSONResponse:
     row = storage.get_project(project_id) if storage else None
     if row is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
-    if not user_can_access_project(uid, project_id, write=False, storage=storage):
+    if not user_can_manage_project(uid, project_id, write=False, storage=storage):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     return JSONResponse(_project_view(row))
 
@@ -3775,7 +3960,7 @@ async def project_resources_endpoint(request: Request) -> JSONResponse:
     Same access gate as ``get_project_endpoint``: ``project.read`` plus the
     per-project ACL.
     """
-    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.auth import require_permission, user_can_manage_project
     from turnstone.core.storage import get_storage
 
     err = require_permission(request, "project.read")
@@ -3789,7 +3974,7 @@ async def project_resources_endpoint(request: Request) -> JSONResponse:
     row = storage.get_project(project_id) if storage else None
     if row is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
-    if not user_can_access_project(uid, project_id, write=False, storage=storage):
+    if not user_can_manage_project(uid, project_id, write=False, storage=storage):
         return JSONResponse({"error": "forbidden"}, status_code=403)
 
     def _collect() -> dict[str, Any]:
@@ -3809,7 +3994,7 @@ async def project_resources_endpoint(request: Request) -> JSONResponse:
 
 async def update_project_endpoint(request: Request) -> JSONResponse:
     """PATCH /v1/api/projects/{project_id} — rename / re-visibility / archive."""
-    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.auth import require_permission, user_can_manage_project
     from turnstone.core.storage import get_storage
     from turnstone.core.web_helpers import read_json_or_400
 
@@ -3824,7 +4009,7 @@ async def update_project_endpoint(request: Request) -> JSONResponse:
     row = storage.get_project(project_id) if storage else None
     if storage is None or row is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
-    if not user_can_access_project(uid, project_id, write=True, storage=storage):
+    if not user_can_manage_project(uid, project_id, write=True, storage=storage):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     body = await read_json_or_400(request)
     if isinstance(body, JSONResponse):
@@ -3884,7 +4069,7 @@ async def delete_project_endpoint(request: Request) -> JSONResponse:
 
 async def list_project_members_endpoint(request: Request) -> JSONResponse:
     """GET /v1/api/projects/{project_id}/members — member user_ids."""
-    from turnstone.core.auth import require_permission, user_can_access_project
+    from turnstone.core.auth import require_permission, user_can_manage_project
     from turnstone.core.storage import get_storage
 
     err = require_permission(request, "project.read")
@@ -3897,7 +4082,7 @@ async def list_project_members_endpoint(request: Request) -> JSONResponse:
     storage = get_storage()
     if storage is None or storage.get_project(project_id) is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
-    if not user_can_access_project(uid, project_id, write=False, storage=storage):
+    if not user_can_manage_project(uid, project_id, write=False, storage=storage):
         return JSONResponse({"error": "forbidden"}, status_code=403)
     return JSONResponse({"members": storage.list_project_members(project_id)})
 
@@ -4889,7 +5074,7 @@ def _idle_cleanup_thread(
     rate_limiter: Any = None,
     stop: threading.Event | None = None,
 ) -> None:
-    """Run idle eviction plus always-on provisional-create recovery.
+    """Run persistence repair plus lifecycle and rate-limit maintenance.
 
     ``mgr.close_idle`` fires the adapter's ``emit_closed`` for each
     victim, which pushes ``ws_closed`` onto ``global_queue`` with
@@ -4897,44 +5082,58 @@ def _idle_cleanup_thread(
     is gone — the frontend didn't differentiate "idle" from "closed"
     anyway and the duplicate event caused spurious UI flicker.
 
-    Hidden ``state='creating'`` rows use their own conservative two-hour
-    grace and are reaped even when ``timeout_sec == 0`` disables ordinary idle
-    eviction. An initial recovery pass covers restart before the first periodic
-    wait. ``stop`` (#885) is the lifespan shutdown signal, using the same
-    ``wait``-as-sleep pattern as :func:`_aggregate_emitter_thread`.
+    Transient accepted-row persistence retries use a short one-second tick.
+    Ordinary idle eviction retains its timeout/4 cadence, and hidden
+    ``state='creating'`` rows retain their independent five-minute sweep and
+    conservative two-hour grace. Thus ``timeout_sec == 0`` disables only idle
+    eviction, not either recovery path. ``stop`` (#885) is the lifespan
+    shutdown signal, using the same ``wait``-as-sleep pattern as
+    :func:`_aggregate_emitter_thread`.
     """
     del global_queue  # adapter handles the emission
     if stop is None:
         stop = threading.Event()
     idle_enabled = timeout_sec > 0
-    check_every = (
+    lifecycle_check_every = (
         min(STALE_CREATE_SWEEP_INTERVAL_SECONDS, timeout_sec / 4)
         if idle_enabled
         else float(STALE_CREATE_SWEEP_INTERVAL_SECONDS)
     )
+    check_every = min(PERSISTENCE_RECONCILE_INTERVAL_SECONDS, lifecycle_check_every)
+    try:
+        mgr.reconcile_unresolved_persistence()
+    except Exception:
+        log.debug("server.persistence_reconcile_initial_failed", exc_info=True)
     try:
         mgr.reap_stale_creating_reservations(STALE_CREATE_GRACE_SECONDS)
     except Exception:
         log.debug("server.stale_create_cleanup_initial_failed", exc_info=True)
     last_create_sweep_at = time.monotonic()
+    last_lifecycle_sweep_at = last_create_sweep_at
     while not stop.wait(check_every):
-        if idle_enabled:
-            try:
-                mgr.close_idle(timeout_sec)
-            except Exception:
-                log.debug("server.idle_cleanup_failed", exc_info=True)
+        try:
+            mgr.reconcile_unresolved_persistence()
+        except Exception:
+            log.debug("server.persistence_reconcile_failed", exc_info=True)
         now = time.monotonic()
-        if now - last_create_sweep_at >= STALE_CREATE_SWEEP_INTERVAL_SECONDS:
-            # Keep rare hidden-create GC on its own fixed cadence. A short
-            # idle timeout must not turn the cluster-liveness scan into part
-            # of the ordinary high-frequency idle sweep.
-            last_create_sweep_at = now
-            try:
-                mgr.reap_stale_creating_reservations(STALE_CREATE_GRACE_SECONDS)
-            except Exception:
-                log.debug("server.stale_create_cleanup_failed", exc_info=True)
-        if rate_limiter is not None:
-            rate_limiter.cleanup()
+        if now - last_lifecycle_sweep_at >= lifecycle_check_every:
+            last_lifecycle_sweep_at = now
+            if idle_enabled:
+                try:
+                    mgr.close_idle(timeout_sec)
+                except Exception:
+                    log.debug("server.idle_cleanup_failed", exc_info=True)
+            if now - last_create_sweep_at >= STALE_CREATE_SWEEP_INTERVAL_SECONDS:
+                # Keep rare hidden-create GC on its own fixed cadence. A short
+                # idle timeout must not turn the cluster-liveness scan into part
+                # of the ordinary high-frequency persistence sweep.
+                last_create_sweep_at = now
+                try:
+                    mgr.reap_stale_creating_reservations(STALE_CREATE_GRACE_SECONDS)
+                except Exception:
+                    log.debug("server.stale_create_cleanup_failed", exc_info=True)
+            if rate_limiter is not None:
+                rate_limiter.cleanup()
 
 
 # Shutdown sentinel for ``_global_fanout_thread`` (#885): the lifespan
@@ -5469,7 +5668,6 @@ def create_app(
     )
     retry_handler = make_retry_handler(
         interactive_endpoint_config,
-        dispatch_retry=_interactive_dispatch_retry,
         audit_emit=_audit_retry_workstream,
         accepted_permissions=("conversation.modify",),
     )
@@ -5553,6 +5751,7 @@ def create_app(
                     Route("/api/memories", list_memories),
                     Route("/api/memories", save_memory, methods=["POST"]),
                     Route("/api/memories/search", search_memories, methods=["POST"]),
+                    Route("/api/memories/{name}", get_memory_endpoint, methods=["GET"]),
                     Route("/api/memories/{name}", delete_memory_endpoint, methods=["DELETE"]),
                     Route("/api/projects", list_projects),
                     Route("/api/projects", create_project, methods=["POST"]),
@@ -5649,8 +5848,16 @@ def create_app(
             Route("/metrics", metrics_endpoint),
             Route("/openapi.json", _openapi_handler),
             Route("/docs", _docs_handler),
-            Mount("/static", app=StaticFiles(directory=str(_STATIC_DIR)), name="static"),
-            Mount("/shared", app=StaticFiles(directory=str(_SHARED_DIR)), name="shared"),
+            Mount(
+                "/static",
+                app=RevalidatingStaticFiles(directory=str(_STATIC_DIR)),
+                name="static",
+            ),
+            Mount(
+                "/shared",
+                app=RevalidatingStaticFiles(directory=str(_SHARED_DIR)),
+                name="shared",
+            ),
         ],
         middleware=_build_middleware(cors_origins),
         lifespan=_lifespan,
@@ -5992,10 +6199,9 @@ def main() -> None:
         trusted_proxies=config_store.get("ratelimit.trusted_proxies"),
     )
 
-    # Config builders — shared between startup logging and session factory.
-    # Re-read from ConfigStore each call so hot-reload works.
+    # Judge config is shared between startup logging and session construction.
+    # Re-read from ConfigStore for each new session so hot-reload works.
     from turnstone.core.judge import JudgeConfig
-    from turnstone.core.memory_relevance import MemoryConfig
 
     def _build_judge_config() -> JudgeConfig:
         return JudgeConfig(
@@ -6013,15 +6219,6 @@ def main() -> None:
             output_guard_model=config_store.get("judge.output_guard_model"),
             output_guard_llm_timeout=config_store.get("judge.output_guard_llm_timeout"),
             redact_secrets=config_store.get("judge.redact_secrets"),
-        )
-
-    def _build_memory_config() -> MemoryConfig:
-        return MemoryConfig(
-            relevance_k=config_store.get("memory.relevance_k"),
-            fetch_limit=config_store.get("memory.fetch_limit"),
-            max_content=config_store.get("memory.max_content"),
-            nudge_cooldown=config_store.get("memory.nudge_cooldown"),
-            nudges=config_store.get("memory.nudges"),
         )
 
     judge_config = _build_judge_config()
@@ -6104,7 +6301,6 @@ def main() -> None:
                 log.debug("Failed to resolve username for uid %s", uid, exc_info=True)
 
         # Re-resolve from ConfigStore so new workstreams pick up hot-reloaded settings.
-        live_memory_config = _build_memory_config()
         live_judge_config = _build_judge_config()
         if live_judge_config and judge_model:
             import dataclasses
@@ -6168,7 +6364,6 @@ def main() -> None:
             skill=skill or args.skill or None,
             judge_config=live_judge_config,
             user_id=uid,
-            memory_config=live_memory_config,
             config_store=config_store,
             client_type=ClientType(client_type)
             if client_type in {ct.value for ct in ClientType}
@@ -6520,6 +6715,19 @@ def main() -> None:
                 bind_host=args.host,
                 extra_sans=os.environ.get("TURNSTONE_TLS_SANS", ""),
             )
+            from turnstone.core.auth import (
+                JWT_AUD_CONSOLE,
+                TLS_ACME_TOKEN_SOURCE,
+                ServiceTokenManager,
+            )
+
+            enrollment_tokens = ServiceTokenManager(
+                user_id=_node_id,
+                scopes=frozenset({"service"}),
+                source=TLS_ACME_TOKEN_SOURCE,
+                secret=jwt_secret,
+                audience=JWT_AUD_CONSOLE,
+            )
             tls_client = TLSClient(
                 storage=get_storage(),
                 hostnames=hostnames,
@@ -6528,6 +6736,11 @@ def main() -> None:
                 # explicit override pointing at the published ACME endpoint.
                 # Empty (the in-cluster default) falls back to service discovery.
                 console_url=os.environ.get("TURNSTONE_CONSOLE_URL", ""),
+                # In-cluster clients fetch the directory from ``console`` but a
+                # cross-host responder advertises its LAN/proxy URL. Trust that
+                # second credential destination only when operators configured it.
+                acme_external_url=os.environ.get("TURNSTONE_ACME_EXTERNAL_URL", ""),
+                enrollment_token_provider=lambda: enrollment_tokens.token,
             )
             asyncio.run(tls_client.init(attempts=TLS_INIT_RETRY_ATTEMPTS))
             bundle = tls_client.bundle
@@ -6562,21 +6775,16 @@ def main() -> None:
                     """
                     from turnstone.core.tls import refresh_runtime_pems, swap_context_cert
 
-                    try:
-                        new_paths = refresh_runtime_pems(
-                            new_bundle,
-                            ca_pem=tls_client.ca_pem,
-                            previous=pem_dir_state["dir"],
-                        )
-                        pem_dir_state["dir"] = new_paths.cert.parent
-                    except Exception:
-                        log.warning("TLS runtime PEM refresh failed", exc_info=True)
-
                     cfg = getattr(app.state, "uvicorn_config", None)
                     live_ctx = getattr(cfg, "ssl", None) if cfg is not None else None
-                    if live_ctx is None:
-                        return  # listener not started yet — boot cert still valid
-                    swap_context_cert(live_ctx, new_bundle, ca_pem=tls_client.ca_pem)
+                    if live_ctx is not None:
+                        swap_context_cert(live_ctx, new_bundle, ca_pem=tls_client.ca_pem)
+                    new_paths = refresh_runtime_pems(
+                        new_bundle,
+                        ca_pem=tls_client.ca_pem,
+                        previous=pem_dir_state["dir"],
+                    )
+                    pem_dir_state["dir"] = new_paths.cert.parent
                     log.info("TLS cert reloaded into listener: %s", new_bundle.domain)
 
                 tls_client.set_cert_reload_hook(_reload_server_cert)

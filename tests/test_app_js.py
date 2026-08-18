@@ -17,6 +17,9 @@ from pathlib import Path
 
 import pytest
 
+from tests._js_harness_helpers import slice_braced_block
+from tests._js_harness_helpers import strip_js_comments as _strip_js_comments
+
 _APP_JS = Path(__file__).resolve().parent.parent / "turnstone/ui/static/app.js"
 _INTERACTIVE_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/interactive.js"
 _MCP_ERROR_JS = Path(__file__).resolve().parent.parent / "turnstone/shared_static/mcp_error.js"
@@ -42,6 +45,71 @@ def _pane_method_offset(body: str, name: str) -> int:
     m = pattern.search(body)
     assert m is not None, f"class method {name!r} not found in interactive.js"
     return m.start()
+
+
+def test_close_workstream_maps_unresolved_history_to_plain_retry_copy() -> None:
+    body = _APP_JS.read_text(encoding="utf-8")
+    start = body.index("function closeWorkstream(wsId)")
+    end = body.index("//  10. Dashboard", start)
+    close = body[start:end]
+
+    assert "result.status === 409" in close
+    assert (
+        "Conversation history is still being saved. Try ending the session again shortly." in close
+    )
+    assert "delete workstreams[wsId]" in close, "successful close behavior must remain intact"
+
+
+@pytest.mark.parametrize("bundle", [_APP_JS, _CONSOLE_APP_JS], ids=["node", "console"])
+def test_dashboard_persistence_badges_render_sanitized_operator_states(bundle: Path) -> None:
+    """Both dashboards render the same three non-healthy journal states."""
+    body = bundle.read_text(encoding="utf-8")
+    display_anchor = body.index("const PERSISTENCE_DISPLAY =")
+    display_body = _slice_balanced_body(body, display_anchor)
+    helper_body = _slice_function_body(body, "appendPersistenceStatus")
+    assert display_body is not None
+    assert helper_body is not None
+
+    script = f"""
+const PERSISTENCE_DISPLAY = {display_body};
+const document = {{
+  createElement: function (tag) {{
+    return {{
+      tag: tag, dataset: {{}}, attrs: {{}}, className: "", textContent: "", title: "",
+      setAttribute: function (name, value) {{ this.attrs[name] = value; }},
+    }};
+  }},
+}};
+function appendPersistenceStatus(container, ws) {helper_body}
+function probe(state) {{
+  const container = {{ children: [], appendChild: function (el) {{ this.children.push(el); }} }};
+  appendPersistenceStatus(container, {{ persistence_state: state }});
+  return container.children[0] || null;
+}}
+console.log(JSON.stringify({{
+  pending: probe("pending"),
+  retrying: probe("retrying"),
+  conflict: probe("conflict"),
+  healthy: probe("healthy"),
+}}));
+"""
+    try:
+        proc = subprocess.run(
+            ["node", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        pytest.skip("node binary not available on PATH")
+    assert proc.returncode == 0, proc.stderr
+    rendered = json.loads(proc.stdout)
+    assert rendered["pending"]["textContent"] == "History save pending"
+    assert rendered["retrying"]["textContent"] == "History save retrying"
+    assert rendered["conflict"]["textContent"] == "History save blocked"
+    assert rendered["conflict"]["dataset"]["state"] == "conflict"
+    assert "Operator intervention is required" in rendered["conflict"]["title"]
+    assert rendered["healthy"] is None
 
 
 def test_switch_tab_opens_an_interactive_pane() -> None:
@@ -258,6 +326,101 @@ def test_refetch_history_seeds_resume_cursor_only_on_initial_connect() -> None:
     )
 
 
+def test_initial_history_handoff_token_is_one_shot_and_resyncs_on_mismatch() -> None:
+    """The opaque /history handoff belongs only to the next SSE bootstrap.
+
+    It must survive a hidden-tab deferral, compose with a valid cursor of 0,
+    and be consumed only after an EventSource is constructed.  A server-side
+    revision mismatch takes the full REST-history path; it must never try to
+    heal a missing committed row with numeric ring replay.
+    """
+    body = _INTERACTIVE_JS.read_text(encoding="utf-8")
+    start = body.index("  connectSSE(wsId) {")
+    end = body.index("  _onVisibilityChange() {", start)
+    connect = body[start:end]
+
+    hidden = connect.index("if (document.hidden)")
+    capability = connect.index('"user_turn=1"')
+    handoff_query = connect.index('"history_token="')
+    construct = connect.index("new EventSource(evtUrl)")
+    consume = connect.index("this._historyHandoffToken = null;", construct)
+    assert capability < hidden < handoff_query < construct < consume, (
+        "the bootstrap token must survive hidden-tab deferral and be consumed "
+        "only by a successfully constructed EventSource"
+    )
+    assert 'evtUrl += "?last_event_id="' in connect
+    assert '(evtUrl.includes("?") ? "&" : "?")' in connect, (
+        "history_token must compose with ?last_event_id=0 instead of replacing it"
+    )
+    assert connect.count('"user_turn=1"') == 1
+
+    refetch_start = body.index("async _refetchHistory(")
+    refetch_end = body.index("_beginReplayQuiesce(", refetch_start)
+    refetch = body[refetch_start:refetch_end]
+    assert re.search(
+        r"if\s*\(seedCursor\)\s*\{\s*this\._historyHandoffToken\s*=\s*"
+        r"typeof data\.handoff_token === \"string\"",
+        refetch,
+    ), "only a seeded history fetch may arm the initial SSE handoff"
+
+    mismatch = body.index('case "history_resync"')
+    truncated = body.index('case "replay_truncated"', mismatch)
+    mismatch_case = body[mismatch:truncated]
+    assert "this._historyRepair.begin(this.wsId);" in mismatch_case
+    assert "last_event_id" not in mismatch_case
+
+    # Once the server says the rendered history revision is stale, every
+    # reconnect chokepoint must fail closed until a new response has rendered
+    # and supplied its proof.  A failed fetch schedules one capped retry; it
+    # must not fall through to a cursorless/tokenless EventSource.  The latch,
+    # budget, backoff, and parked prompt moved into the shared controller
+    # (history_handoff.createHistoryHandoffRepair) — those are pinned there,
+    # once; what stays pinned HERE is the pane's use of it.
+    repair_guard = connect.index("if (this._historyRepair.isRepairing(wsId))")
+    assert repair_guard < handoff_query < construct
+    guard_end = connect.index("if (this._historyHandoffToken != null)", repair_guard)
+    guard = connect[repair_guard:guard_end]
+    assert "this._historyRepair.schedule();" in guard
+    assert "return;" in guard
+
+    load_start = body.index("_loadHistoryThenConnect(wsId, manualAttempt = false)")
+    load_end = body.index("async _refetchHistory(", load_start)
+    load = body[load_start:load_end]
+    # Admission before any work, then the budget charge, then exactly one
+    # handover of the verdict; the non-repair tail keeps its own reconnect.
+    admit = load.index("this._historyRepair.admitAttempt(manualAttempt)")
+    start_attempt = load.index("this._historyRepair.startAttempt(manualAttempt,", admit)
+    settle = load.index("this._historyRepair.settle({", start_attempt)
+    ordinary = load.index("// Ordinary first paint", settle)
+    assert admit < start_attempt < settle < ordinary
+    assert "hasToken: this._historyHandoffToken != null" in load[settle:ordinary]
+    assert "this.connectSSE(wsId);" not in load[settle:ordinary]
+    assert "return;" in load[settle:ordinary]
+
+    # Both terminal paths invalidate the in-flight load and kill the timer;
+    # a late retry/fetch settlement cannot resurrect the pane.
+    assert body.count("pane._historyRepair.clear();") >= 2
+
+    # The strong repair attempt has a logical 15s deadline, not merely an
+    # AbortController timeout: authFetch's Retry-After sleep is not abort-aware
+    # and old runtimes can lack AbortController entirely. The pane still owns
+    # this per-attempt bound (the coordinator bounds every /history centrally
+    # instead), and hands the controller a teardown that expires and settles
+    # the race so no detached pane waits for the deadline.
+    assert "Promise.race([" in load
+    assert "createHistoryHandoffDeadline(" in load
+    assert "deadlineHandle.promise" in load
+    assert "HISTORY_HANDOFF_FETCH_TIMEOUT_MS" in load
+    assert "if (repairAttempt && repairAttempt.expired) return;" in refetch
+    teardown = load[start_attempt:settle]
+    assert "deadlineHandle.dispose({ expire: true, resolve: true })" in teardown, (
+        "the mid-flight teardown must expire AND settle the race through the "
+        "module's dispose() — direct state-slot pokes are the drift the "
+        "shared handle exists to prevent."
+    )
+    assert "repairCtrl.abort()" in teardown
+
+
 def test_shared_utils_no_longer_defines_replay_advisories_after_tool() -> None:
     """Operator context (interjections / guard findings / nudges) no longer
     rides the tool envelope — it is first-class ``{"role": "system"}`` rows
@@ -375,7 +538,7 @@ def test_retry_walk_skips_operator_context_cards() -> None:
 
 def test_operator_nudge_labels_use_shared_helper() -> None:
     """Operator-context nudge bubbles collapse the metacognition nudge types
-    (start / resume / correction / denial / completion / repeat) to one
+    (including legacy persisted start turns) to one
     'metacognition' category via the shared ``utils.js`` ``operatorSourceLabel``
     helper rather than leaking the raw ``_source`` (the 'operator · start'
     regression).  Both panes call the one helper so they can't drift."""
@@ -1174,46 +1337,15 @@ def test_phase8_consent_url_prefix_check_in_click_handler() -> None:
 # cleanly into a standalone node invocation.
 
 
-def _slice_balanced_body(body: str, anchor: int) -> str | None:
-    """Slice ``body`` from ``anchor`` (which must point at or just before
-    the opening ``{`` of a block) up to and including the matching ``}``.
-    Tracks brace depth + string state so the slice is robust to comment
-    growth and arbitrary body reorganisation.  Returns ``None`` if the
-    matching brace isn't found within a reasonable window.
-
-    Used to slice JS handler / function bodies for static assertions
-    without committing to a fixed character window."""
-    n = len(body)
-    i = body.find("{", anchor)
-    if i == -1 or i - anchor > 200:
-        return None
-    depth = 0
-    in_str: str | None = None
-    start = i
-    # 12000: connectSSE reached ~7950 chars during the 2026-07 SSE
-    # recovery campaign (cursor-override + capture-rationale comments);
-    # the window exists to bound a runaway scan, not to cap legitimate
-    # method growth — keep it comfortably above the largest real body.
-    while i < n and i - start < 12000:
-        ch = body[i]
-        if in_str:
-            if ch == "\\" and i + 1 < n:
-                i += 2
-                continue
-            if ch == in_str:
-                in_str = None
-            i += 1
-            continue
-        if ch in ('"', "'", "`"):
-            in_str = ch
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return body[start : i + 1]
-        i += 1
-    return None
+# ``_slice_balanced_body`` is the shared comment-and-string-aware brace
+# walker from tests/_js_harness_helpers (imported at the top of this
+# file).  Comment awareness is a strict superset of the old string-only
+# local: most callers here pre-strip, where the two agree exactly, and a
+# few pass raw source (the persistence-badge and beforeunload pins),
+# where the shared walker is the more correct of the two — braces inside
+# comments no longer inflate its depth count.  One implementation means
+# a walker fix lands once for every suite.
+_slice_balanced_body = slice_braced_block
 
 
 def _slice_listener_body(body: str, event_name: str) -> str | None:
@@ -1718,66 +1850,10 @@ def test_dead_sse_defensive_reconnect_registered() -> None:
 # the contract so a future refactor can't silently regress it.
 
 
-def _strip_js_comments(src: str) -> str:
-    """Strip ``//`` and ``/* */`` comments while preserving string
-    literal contents (``"..."``, ``'...'``, `` `...` ``) and keeping
-    byte length identical (comments replaced with spaces).
-
-    Limitation — does NOT detect regex literals (``/pattern/flags``).
-    A ``//`` inside a regex like ``/abc//`` would be misread as the
-    start of a line comment.  Safe today because the regions we scan
-    (SSE-handler ``onerror`` bodies, ``connectSSE`` /
-    ``connectGlobalSSE`` function bodies) don't contain regex
-    literals; if a future caller wants to scan a region with regex
-    literals, extend the tracker first.
-
-    Motivation: ``_slice_balanced_body`` doesn't skip comments, so an
-    apostrophe inside a comment (``can't``, ``don't``) opens a fake
-    string state that swallows braces until the next ``'``.  The new
-    onerror handlers carry these comments routinely; stripping
-    comments before brace-walking removes the hazard without
-    re-architecting the existing slice helper.
-    """
-    out: list[str] = []
-    n = len(src)
-    i = 0
-    in_str: str | None = None
-    while i < n:
-        ch = src[i]
-        if in_str:
-            out.append(ch)
-            if ch == "\\" and i + 1 < n:
-                out.append(src[i + 1])
-                i += 2
-                continue
-            if ch == in_str:
-                in_str = None
-            i += 1
-            continue
-        # Line comment: replace with spaces up to newline (preserve
-        # length so downstream offset math still works).
-        if ch == "/" and i + 1 < n and src[i + 1] == "/":
-            j = src.find("\n", i)
-            if j == -1:
-                j = n
-            out.append(" " * (j - i))
-            i = j
-            continue
-        # Block comment: replace with spaces up to closing */.
-        if ch == "/" and i + 1 < n and src[i + 1] == "*":
-            j = src.find("*/", i + 2)
-            if j == -1:
-                out.append(" " * (n - i))
-                i = n
-                continue
-            out.append(" " * (j + 2 - i))
-            i = j + 2
-            continue
-        if ch in ('"', "'", "`"):
-            in_str = ch
-        out.append(ch)
-        i += 1
-    return "".join(out)
+# ``_strip_js_comments`` is the shared string-aware, offset-preserving
+# stripper from tests/_js_harness_helpers (imported at the top of this
+# file) — one implementation for every suite, so the string-blind /
+# offset-destroying per-suite variants cannot diverge again.
 
 
 def _onerror_block(body: str, anchor_substring: str) -> str | None:
@@ -1880,6 +1956,26 @@ def test_connectglobalsse_onerror_preserves_native_reconnect() -> None:
     assert onerror is not None, "globalEvtSource.onerror not found"
     passed, reason = _onerror_preserves_native_reconnect(onerror, "globalEvtSource")
     assert passed, f"connectGlobalSSE.onerror regressed: {reason}"
+
+
+def test_ws_activity_never_reinserts_a_closed_workstream() -> None:
+    """A trailing ``ws_activity`` for a closed workstream must not re-create
+    a skeletal roster entry: its dashboard row can outlive ``ws_closed``
+    until the next REST-driven repaint, and a ghost entry both suppresses
+    the empty-state transition (``showDashboard``) and paints a nameless
+    rail tab until a full resync.  The arm is membership-gated like
+    ``ws_rename`` — read the entry, mutate it in place only when it exists,
+    and never assign into the roster map."""
+    body = _strip_js_comments(_APP_JS.read_text(encoding="utf-8"))
+    start = body.index('data.type === "ws_activity"')
+    end = body.index('data.type === "ws_rename"', start)
+    arm = body[start:end]
+    assert "workstreams[data.ws_id] =" not in arm, (
+        "ws_activity assigns into the roster map — a trailing event for a "
+        "closed workstream would re-insert a ghost entry"
+    )
+    assert "const roster = workstreams[data.ws_id];" in arm
+    assert "if (roster)" in arm
 
 
 def test_coord_connectsse_onerror_preserves_native_reconnect() -> None:
@@ -2319,7 +2415,11 @@ def test_coord_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None
     assert "clearTimeout(truncatedResyncTimer)" in teardown.group(1)
     # (6) the dead-stream flow: teardown first, refs reset, seeded refetch,
     # guarded .finally reconnect, deferred latch superseded.
-    flow = re.search(r"function loadHistoryThenReconnect\(\)\s*\{(.*?)\n  \}", body, re.S)
+    flow = re.search(
+        r"function loadHistoryThenReconnect\(manualAttempt = false\)\s*\{(.*?)\n  \}",
+        body,
+        re.S,
+    )
     assert flow is not None, "loadHistoryThenReconnect not found"
     f = flow.group(1)
     assert f.index("suspendStream();") < f.index("refetchHistory(true)")
@@ -2335,8 +2435,13 @@ def test_coord_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None
     # this pin only keeps the fix from being "simplified" away.
     assert "lastEventId = null;" in f
     assert f.index("lastEventId = null;") < f.index("refetchHistory(true)")
-    assert ".finally(" in f
-    assert f.index("refetchHistory(true)") < f.index(".finally(")
+    # The settle rides the outcome-threaded terminal .then (a rendered
+    # tokenless 200 downgrades to the tokenless bootstrap; failures retry),
+    # with rejections normalized ahead of it — LOUDLY (round-4 review: a
+    # bare `.catch(() => undefined)` silently swallowed render throws).
+    assert 'console.error("history load/render failed"' in f
+    assert ".then((outcome) => {" in f
+    assert f.index("refetchHistory(true)") < f.index('console.error("history load/render failed"')
     assert "if (visHandler) connectSSE();" in f
     # (10) heal-time sidebar refresh: once, on the successful render only
     # (record cleared), only on the cursor-SEEDED heal (the cursorless
@@ -2917,8 +3022,9 @@ def test_strict_picker_requires_explicit_pick() -> None:
 def _slice_top_level_fn(body: str, header: str) -> str:
     """Slice a top-level ``function`` body from ``header`` to the next
     column-0 ``function`` declaration (or EOF).  Unlike
-    ``_slice_balanced_body`` this has no fixed-size window, so it is safe
-    for large functions like ``showNewWsModal``.  Nested (indented)
+    ``_slice_balanced_body`` this needs no balanced braces at all, so it
+    survives a body the walker would refuse (an unterminated block, or a
+    regex literal the walker misreads as a comment).  Nested (indented)
     ``function () {…}`` expressions never match the ``\\nfunction `` bound,
     so the slice stops at the next top-level function."""
     start = body.index(header)
@@ -3588,6 +3694,121 @@ def test_every_system_turn_source_has_a_fallback_label() -> None:
     labelled = {ln.split(":", 1)[0].strip() for ln in block.splitlines() if ":" in ln}
     missing = set(SYSTEM_TURN_SOURCES) - labelled - {"compaction"}
     assert not missing, f"system turn sources with no operator label: {sorted(missing)}"
+
+
+def test_memory_description_editor_defers_normalization_to_server() -> None:
+    root = Path(__file__).resolve().parent.parent
+    governance = (root / "turnstone/console/static/governance.js").read_text(encoding="utf-8")
+
+    editor = governance.split("function editMemoryDescription(memoryId) {", 1)[1].split(
+        "\nfunction showMemoryDetailModal", 1
+    )[0]
+    assert "JSON.stringify({ description: value })" in editor
+    assert ".replace(" not in editor
+    assert "Array.from(" not in editor
+
+
+def test_memory_health_refresh_lifecycle() -> None:
+    import tempfile
+
+    governance = _CONSOLE_GOVERNANCE_JS.read_text(encoding="utf-8")
+    admin = _CONSOLE_ADMIN_JS.read_text(encoding="utf-8")
+    load_memories = _slice_function_body(governance, "loadAdminMemories")
+    load_health = _slice_function_body(governance, "loadMemoryIndexHealth")
+    edit_memory = _slice_function_body(governance, "editMemoryDescription")
+    delete_memory = _slice_function_body(governance, "deleteAdminMemory")
+    assert load_memories and load_health and edit_memory and delete_memory
+
+    # Activation owns the ordinary refresh; list/search/filter work never does.
+    memories_tab = re.search(r'if \(tab === "memories"\) \{(?P<body>.*?)\n\s*\}', admin, re.S)
+    assert memories_tab is not None
+    assert memories_tab.group("body").count("loadAdminMemories();") == 1
+    assert memories_tab.group("body").count("loadMemoryIndexHealth();") == 1
+    assert "loadMemoryIndexHealth" not in load_memories
+    # Each successful mutation forces exactly one new health generation.
+    assert edit_memory.count("loadMemoryIndexHealth(true);") == 1
+    assert delete_memory.count("loadMemoryIndexHealth(true);") == 1
+
+    script = f"""
+let _memoryHealthRequest = null;
+let _memoryHealthGeneration = 0;
+let _memoryHealthHasValid = false;
+const banner = {{ textContent: "", style: {{ display: "none" }} }};
+const document = {{
+  getElementById: function (id) {{
+    if (id !== "memory-index-warning") throw new Error("unexpected element " + id);
+    return banner;
+  }},
+}};
+const pending = [];
+function authFetch(url, options) {{
+  if (url !== "/v1/api/admin/memories/index-health") throw new Error(url);
+  return new Promise(function (resolve, reject) {{
+    pending.push({{ resolve: resolve, reject: reject, options: options }});
+  }});
+}}
+function response(health) {{
+  return {{ ok: true, json: function () {{ return Promise.resolve(health); }} }};
+}}
+function loadMemoryIndexHealth(force) {load_health}
+
+(async function () {{
+  const first = loadMemoryIndexHealth();
+  const coalesced = loadMemoryIndexHealth();
+  if (first !== coalesced || pending.length !== 1) throw new Error("not single flight");
+  pending[0].resolve(response({{
+    over_budget: true, over_by_chars: 7, budget_chars: 65536,
+    invalid_description_count: 0,
+  }}));
+  await first;
+  if (!banner.textContent.includes("7") || banner.style.display !== "block")
+    throw new Error("first health did not render");
+
+  const stale = loadMemoryIndexHealth();
+  const newer = loadMemoryIndexHealth(true);
+  if (pending.length !== 3) throw new Error("forced refresh did not start");
+  if (!pending[1].options.signal.aborted) throw new Error("old request was not aborted");
+  pending[2].resolve(response({{
+    over_budget: true, over_by_chars: 2, budget_chars: 65536,
+    invalid_description_count: 0,
+  }}));
+  await newer;
+  const newestBanner = banner.textContent;
+  pending[1].resolve(response({{
+    over_budget: true, over_by_chars: 999, budget_chars: 65536,
+    invalid_description_count: 9,
+  }}));
+  await stale;
+  if (banner.textContent !== newestBanner || !banner.textContent.includes("2"))
+    throw new Error("stale response won");
+
+  const failed = loadMemoryIndexHealth();
+  pending[3].reject(new Error("offline"));
+  await failed;
+  if (banner.textContent !== newestBanner) throw new Error("valid banner was erased");
+  const retry = loadMemoryIndexHealth();
+  if (pending.length !== 5) throw new Error("failed request blocked retry");
+  pending[4].resolve(response({{
+    over_budget: false, over_by_chars: 0, budget_chars: 65536,
+    invalid_description_count: 0,
+  }}));
+  await retry;
+  if (banner.style.display !== "none") throw new Error("retry did not publish");
+}})().catch(function (error) {{
+  console.error(error.stack || error);
+  process.exitCode = 1;
+}});
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False) as handle:
+        handle.write(script)
+        path = handle.name
+    try:
+        proc = subprocess.run(["node", path], capture_output=True, text=True, timeout=15)
+    except FileNotFoundError:
+        pytest.skip("node binary not available on PATH")
+    finally:
+        os.unlink(path)
+    assert proc.returncode == 0, proc.stderr
 
 
 def test_copy_button_survives_retry_teardown_in_both_clients() -> None:

@@ -202,6 +202,23 @@ async def test_send():
 
 
 @pytest.mark.anyio
+async def test_send_threads_client_send_id_without_idempotency_semantics():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(200, json={"status": "ok"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://test"
+    ) as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        await client.send("Hello", "ws1", client_send_id="browser-send_1")
+
+    assert captured == {"message": "Hello", "client_send_id": "browser-send_1"}
+
+
+@pytest.mark.anyio
 async def test_approve():
     transport = _mock_transport(
         {
@@ -245,6 +262,36 @@ async def test_command():
 # ---------------------------------------------------------------------------
 # History
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_get_history_preserves_handoff_fields_and_limit():
+    captured: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["path"] = request.url.path
+        captured["limit"] = request.url.params["limit"]
+        return _json_response(
+            {
+                "ws_id": "ws1",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "system", "source": "compaction", "content": "summary"},
+                ],
+                "cursor": 0,
+                "handoff_token": "epoch.7",
+            }
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        resp = await client.get_history("ws1", limit=42)
+
+    assert captured == {"path": "/v1/api/workstreams/ws1/history", "limit": "42"}
+    assert resp.cursor == 0
+    assert resp.handoff_token == "epoch.7"
+    assert resp.messages[1]["role"] == "system"
 
 
 @pytest.mark.anyio
@@ -312,6 +359,185 @@ async def test_logout():
         client = AsyncTurnstoneServer(httpx_client=hc)
         resp = await client.logout()
         assert resp.status == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Memories
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_save_memory_requires_and_sends_description():
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return _json_response(
+            {
+                "memory_id": "m1",
+                "name": "deployment_process",
+                "description": captured["description"],
+                "type": "general",
+                "scope": "global",
+                "scope_id": "",
+                "content": "Deploy from main",
+                "created": "2026-08-11T00:00:00",
+                "updated": "2026-08-11T00:00:00",
+            },
+            status=201,
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        memory = await client.save_memory(
+            "deployment_process",
+            "Deploy from main",
+            description="  Production deployment workflow  ",
+        )
+
+    assert captured["description"] == "Production deployment workflow"
+    assert "type" not in captured
+    assert memory.description == "Production deployment workflow"
+
+
+@pytest.mark.anyio
+async def test_save_memory_explicit_general_type_is_sent():
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return _json_response(
+            {
+                "memory_id": "m1",
+                "name": "deployment_process",
+                "description": "Production deployment workflow",
+                "type": captured["type"],
+                "scope": "global",
+                "scope_id": "",
+                "created": "2026-08-11T00:00:00",
+                "updated": "2026-08-11T00:00:00",
+            }
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        memory = await client.save_memory(
+            "deployment_process",
+            "Deploy from main",
+            description="Production deployment workflow",
+            mem_type="general",
+        )
+
+    assert captured["type"] == "general"
+    assert memory.type == "general"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("description", [None, "", "   "])
+async def test_save_memory_rejects_empty_description(description):
+    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("invalid memory must not reach the server")
+
+    transport = httpx.MockTransport(unexpected_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        with pytest.raises(ValueError, match="description is required"):
+            await client.save_memory(
+                "deployment_process",
+                "Deploy from main",
+                description=description,  # type: ignore[arg-type]
+            )
+
+
+@pytest.mark.anyio
+async def test_save_memory_rejects_overlong_description_without_request():
+    def unexpected_request(_request: httpx.Request) -> httpx.Response:
+        raise AssertionError("invalid memory must not reach the server")
+
+    transport = httpx.MockTransport(unexpected_request)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        with pytest.raises(ValueError, match="512"):
+            await client.save_memory(
+                "deployment_process",
+                "Deploy from main",
+                description="x" * 513,
+            )
+
+
+@pytest.mark.anyio
+async def test_get_memory_fetches_exact_body_with_scope():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return _json_response(
+            {
+                "memory_id": "m1",
+                "name": "deployment_process",
+                "description": "Production deployment workflow",
+                "type": "general",
+                "scope": "workstream",
+                "scope_id": "ws1",
+                "content": "Deploy from main",
+                "created": "2026-08-11T00:00:00",
+                "updated": "2026-08-11T00:00:00",
+                "last_accessed": "",
+                "access_count": 0,
+            }
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        memory = await client.get_memory(
+            "deployment_process",
+            scope="workstream",
+            scope_id="ws1",
+        )
+
+    assert memory.content == "Deploy from main"
+    assert captured[0].url.path == "/v1/api/memories/deployment_process"
+    assert dict(captured[0].url.params) == {
+        "scope": "workstream",
+        "scope_id": "ws1",
+    }
+
+
+@pytest.mark.anyio
+async def test_memory_name_path_segments_are_percent_encoded():
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        if request.method == "DELETE":
+            return _json_response({"status": "ok"})
+        return _json_response(
+            {
+                "memory_id": "m1",
+                "name": "reserved_name",
+                "description": "Reserved-name probe",
+                "type": "general",
+                "scope": "global",
+                "scope_id": "",
+                "content": "body",
+                "created": "2026-08-11T00:00:00",
+                "updated": "2026-08-11T00:00:00",
+                "last_accessed": "",
+                "access_count": 0,
+            }
+        )
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as hc:
+        client = AsyncTurnstoneServer(httpx_client=hc)
+        await client.get_memory("café/name?#")
+        await client.delete_memory("café/name?#")
+
+    expected = b"/v1/api/memories/caf%C3%A9%2Fname%3F%23?scope=global"
+    assert [request.url.raw_path for request in captured] == [expected, expected]
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from typing import Any
 
+# Runtime import keeps the public SDK alias and dataclass annotations resolvable.
+from turnstone.core.workstream import (  # noqa: TC001
+    ConversationPersistenceState as ConversationPersistenceState,
+)
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -81,6 +86,37 @@ class HistoryEvent(ServerEvent):
 
 
 @dataclass
+class HistoryResyncEvent(ServerEvent):
+    """The rendered REST history no longer matches the live row prefix.
+
+    This is stronger than an event-ring gap.  Callers must stop using the
+    current stream, fetch ``/history`` again, render that response, and open a
+    new stream with its one-shot handoff token.  The SDK intentionally does
+    not perform that policy automatically.
+    """
+
+    type: str = "history_resync"
+    reason: str = ""
+
+
+@dataclass
+class UserTurnEvent(ServerEvent):
+    """Canonical accepted user row projected to every stream consumer.
+
+    ``client_send_ids`` correlate browser optimistic bubbles only; they are
+    not idempotency keys. ``_event_id`` is the monotonic row/event identity.
+    """
+
+    type: str = "user_turn"
+    content: str = ""
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    sender: str = ""
+    source: str = ""
+    client_send_ids: list[str] = field(default_factory=list)
+    _event_id: int | None = None
+
+
+@dataclass
 class ThinkingStartEvent(ServerEvent):
     type: str = "thinking_start"
 
@@ -116,6 +152,22 @@ class InProgressSnapshotEvent(ServerEvent):
     type: str = "in_progress_snapshot"
     content: str = ""
     reasoning: str = ""
+
+
+@dataclass
+class AgentContextEvent(ServerEvent):
+    """Latest prompt usage for one running task agent.
+
+    Live updates follow each task-agent model turn. Fresh or truncated SSE
+    connections also receive one synthetic reading per active parent call. A
+    ``ToolResultEvent`` whose ``call_id`` matches ``parent_call_id`` is the
+    terminal signal; completed readings are not retained in history.
+    """
+
+    type: str = "agent_context"
+    parent_call_id: str = ""
+    prompt_tokens: int = 0
+    context_window: int = 0
 
 
 @dataclass
@@ -195,6 +247,10 @@ class ToolResultEvent(ServerEvent):
     name: str = ""
     output: str = ""
     is_error: bool = False
+    preview: dict[str, Any] | None = None
+    accepted: bool = False
+    effect_status: str = ""
+    _event_id: int | None = None
 
 
 @dataclass
@@ -355,6 +411,7 @@ class WsStateEvent(ServerEvent):
     context_ratio: float = 0.0
     activity: str = ""
     activity_state: str = ""
+    persistence_state: ConversationPersistenceState = "healthy"
     content: str = ""  # populated on idle transitions only
 
 
@@ -418,6 +475,7 @@ class ClusterStateEvent(ClusterEvent):
     context_ratio: float = 0.0
     activity: str = ""
     activity_state: str = ""
+    persistence_state: ConversationPersistenceState = "healthy"
 
 
 @dataclass
@@ -426,6 +484,7 @@ class ClusterWsCreatedEvent(ClusterEvent):
     ws_id: str = ""
     node_id: str = ""
     name: str = ""
+    persistence_state: ConversationPersistenceState = "healthy"
 
 
 @dataclass
@@ -497,11 +556,14 @@ _SERVER_REGISTRY: dict[str, type[ServerEvent]] = {
     for cls in [
         ConnectedEvent,
         HistoryEvent,
+        HistoryResyncEvent,
+        UserTurnEvent,
         ThinkingStartEvent,
         ThinkingStopEvent,
         ReasoningEvent,
         ContentEvent,
         InProgressSnapshotEvent,
+        AgentContextEvent,
         StateChangeEvent,
         StreamEndEvent,
         ToolPendingEvent,

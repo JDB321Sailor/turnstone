@@ -75,6 +75,140 @@ describe("TurnstoneServer", () => {
     });
   });
 
+  it("saveMemory requires and normalizes the description", async () => {
+    const fetchFn = mockFetch({
+      memory_id: "m1",
+      name: "deployment_process",
+      description: "Production deployment workflow",
+      type: "general",
+      scope: "global",
+      scope_id: "",
+      content: "Deploy from main",
+      created: "2026-08-11T00:00:00",
+      updated: "2026-08-11T00:00:00",
+    });
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+
+    await client.saveMemory({
+      name: "deployment_process",
+      content: "Deploy from main",
+      description: "  Production deployment workflow  ",
+    });
+    const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body)).toMatchObject({
+      description: "Production deployment workflow",
+    });
+
+    await expect(
+      client.saveMemory({
+        name: "deployment_process",
+        content: "Deploy from main",
+        description: "   ",
+      }),
+    ).rejects.toThrow("description is required");
+    await expect(
+      client.saveMemory({
+        name: "deployment_process",
+        content: "Deploy from main",
+        description: "\u0085".repeat(4),
+      }),
+    ).rejects.toThrow("description is required");
+    await expect(
+      client.saveMemory({
+        name: "deployment_process",
+        content: "Deploy from main",
+        description: "x".repeat(513),
+      }),
+    ).rejects.toThrow("512");
+    const unicodeFetch = mockFetch({});
+    const unicodeClient = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: unicodeFetch,
+    });
+    await unicodeClient.saveMemory({
+      name: "unicode_hook",
+      content: "body",
+      description: "🙂".repeat(512),
+    });
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(unicodeFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("getMemory fetches one exact body with scope", async () => {
+    const fetchFn = mockFetch({
+      memory_id: "m1",
+      name: "deployment_process",
+      description: "Production deployment workflow",
+      type: "general",
+      scope: "workstream",
+      scope_id: "ws1",
+      content: "Deploy from main",
+      created: "2026-08-11T00:00:00",
+      updated: "2026-08-11T00:00:00",
+      last_accessed: "",
+      access_count: 0,
+    });
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+
+    const memory = await client.getMemory("deployment_process", {
+      scope: "workstream",
+      scope_id: "ws1",
+    });
+
+    expect(memory.content).toBe("Deploy from main");
+    const [url, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toContain("/v1/api/memories/deployment_process");
+    expect(url).toContain("scope=workstream");
+    expect(url).toContain("scope_id=ws1");
+    expect(init.method).toBe("GET");
+  });
+
+  it("percent-encodes memory names as one path segment", async () => {
+    const responseBody = {
+      memory_id: "m1",
+      name: "reserved_name",
+      description: "Reserved-name probe",
+      type: "general",
+      scope: "global",
+      scope_id: "",
+      content: "body",
+      created: "2026-08-11T00:00:00",
+      updated: "2026-08-11T00:00:00",
+      last_accessed: "",
+      access_count: 0,
+      status: "ok",
+    };
+    const fetchFn = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        new Response(JSON.stringify(responseBody), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    ) as typeof globalThis.fetch;
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+
+    await client.getMemory("café/name?#");
+    await client.deleteMemory("café/name?#");
+
+    const urls = (fetchFn as ReturnType<typeof vi.fn>).mock.calls.map(
+      ([url]) => url,
+    );
+    expect(urls).toEqual([
+      "http://test/v1/api/memories/caf%C3%A9%2Fname%3F%23",
+      "http://test/v1/api/memories/caf%C3%A9%2Fname%3F%23",
+    ]);
+  });
+
   it("send posts correct payload", async () => {
     const fetchFn = mockFetch({ status: "ok" });
     const client = new TurnstoneServer({
@@ -86,6 +220,21 @@ describe("TurnstoneServer", () => {
     const [url, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(url).toBe("http://test/v1/api/workstreams/ws1/send");
     expect(JSON.parse(init.body)).toEqual({ message: "Hello" });
+  });
+
+  it("send threads the optional browser correlation token", async () => {
+    const fetchFn = mockFetch({ status: "ok" });
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+    await client.send("Hello", "ws1", { clientSendId: "browser-send_1" });
+
+    const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({
+      message: "Hello",
+      client_send_id: "browser-send_1",
+    });
   });
 
   it("approve selects a cycle without duplicating ws_id in the body", async () => {
@@ -125,6 +274,57 @@ describe("TurnstoneServer", () => {
     const [, init] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(JSON.parse(init.body)).toEqual({ force: true });
     expect(response.dropped).toEqual({ tool_calls: ["call-1"] });
+  });
+
+  it("getHistory returns the cursor and one-shot handoff token", async () => {
+    const fetchFn = mockFetch({
+      ws_id: "ws1",
+      messages: [{ role: "system", source: "compaction", content: "summary" }],
+      cursor: 0,
+      handoff_token: "epoch.7",
+    });
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+
+    const history = await client.getHistory("ws1", { limit: 42 });
+
+    expect(history.cursor).toBe(0);
+    expect(history.handoff_token).toBe("epoch.7");
+    const [url] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toBe("http://test/v1/api/workstreams/ws1/history?limit=42");
+  });
+
+  it("streamEvents forwards caller-managed initial history hints", async () => {
+    const fetchFn = vi
+      .fn()
+      .mockResolvedValue(
+        new Response(
+          'data: {"type":"history_resync","ws_id":"ws1","reason":"handoff_mismatch"}\n\n',
+          { status: 200, headers: { "content-type": "text/event-stream" } },
+        ),
+      );
+    const client = new TurnstoneServer({
+      baseUrl: "http://test",
+      fetch: fetchFn,
+    });
+
+    const events = [];
+    for await (const event of client.streamEvents("ws1", {
+      lastEventId: 0,
+      historyToken: "epoch.7",
+    })) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([
+      { type: "history_resync", ws_id: "ws1", reason: "handoff_mismatch" },
+    ]);
+    const [url] = (fetchFn as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(url).toBe(
+      "http://test/v1/api/workstreams/ws1/events?user_turn=1&last_event_id=0&history_token=epoch.7",
+    );
   });
 
   it("injects auth header when token provided", async () => {

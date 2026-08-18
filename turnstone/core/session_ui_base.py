@@ -35,6 +35,7 @@ import queue
 import threading
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 from turnstone.core.log import get_logger
+from turnstone.core.workstream import session_persistence_state
 
 log = get_logger(__name__)
 
@@ -207,6 +209,20 @@ class _SmartApprovalConfig:
     wait_seconds: float
 
 
+class CrossPrincipalApprovalError(ValueError):
+    """A peer attempted a resolver action reserved for the executor."""
+
+
+def _execution_principal_for_items(items: list[dict[str, Any]]) -> str:
+    """Return the one immutable execution principal carried by a tool batch."""
+    principals = {
+        principal for item in items if (principal := str(item.get("_principal_id") or "").strip())
+    }
+    if len(principals) > 1:
+        raise ValueError("approval batch contains multiple execution principals")
+    return next(iter(principals), "")
+
+
 class ApprovalCycle:
     """One in-flight human-approval round on a workstream.
 
@@ -235,11 +251,13 @@ class ApprovalCycle:
         "cycle_id",
         "decision",
         "event",
+        "execution_principal_id",
         "items",
         "judge_event",
         "pending_verdicts",
         "publication_done",
         "resolved",
+        "resolver_principal_id",
         "result",
     )
 
@@ -253,6 +271,8 @@ class ApprovalCycle:
         self.items = items
         self.card = card
         self.call_ids: set[str] = {it.get("call_id", "") for it in items if it.get("call_id")}
+        self.execution_principal_id = _execution_principal_for_items(items)
+        self.resolver_principal_id = ""
         # The judge generation that evaluated this batch — identity-
         # compared against the delivering daemon's cancel event so a
         # stale generation (a prior turn's run-to-completion daemon
@@ -421,8 +441,8 @@ class AutoApproveReason:
       can see when a child is silently auto-approving because of a
       previously-installed skill they may have forgotten about.
     - :attr:`ALWAYS` — operator clicked "Approve + Always" on a
-      tool earlier in this session, adding its name to
-      ``auto_approve_tools``.
+      tool earlier in this session, adding its name to that execution
+      principal's runtime grant set.
     - :attr:`POLICY` — admin-defined ``tool_policies`` row with
       ``action='allow'`` matched the tool name (or pattern).
     - :attr:`BLANKET` — workstream-level ``auto_approve=True`` flag
@@ -464,20 +484,29 @@ class SessionUIBase:
     loop. All shared state is guarded by ``_listeners_lock`` /
     ``_ws_lock`` or ``threading.Event`` primitives.
 
-    Two ``on_*`` methods are additionally safe to call from a
+    Three ``on_*`` methods are additionally safe to call from a
     *concurrent* auxiliary thread (e.g. background title generation in
     ``ChatSession._generate_title``, or ``task_agent`` sub-agents), even
     while the worker thread is mid-stream: :meth:`on_aux_usage` (a
     storage ``usage_event`` write + thread-safe metric counters — it
     touches none of the ``_ws_lock``-guarded inflight state
     :meth:`on_status`/token writers mutate) and :meth:`on_rename` (a
-    queue / locked fan-out). Keep those two free of unguarded
+    queue / locked fan-out), plus :meth:`on_agent_context` (its own
+    snapshot lock followed by the same locked fan-out). Keep those three free of unguarded
     ``_ws_*`` writes so the auxiliary-thread guarantee holds.
     """
 
     def __init__(self, ws_id: str = "", user_id: str = "") -> None:
         self.ws_id = ws_id
         self._user_id = user_id
+        # The session this UI projects, bound by ChatSession.__init__.  Weak:
+        # SSE generators can outlive retirement holding the UI, and a strong
+        # back-reference would pin the whole retired session behind them.
+        # Self-derivation exists so persistence reporting never resolves the
+        # session through a registry by id — that lookup fails open to
+        # "healthy" (or to a replacement after id reuse) exactly while
+        # tombstone retention or retirement has the row out of the map.
+        self._session_ref: weakref.ref[Any] | None = None
         # Acting user of the current/last turn (the ``bind_acting_user``
         # initiator, owner fallback) — pushed by ``ChatSession._emit_state``
         # so web clients can gate cross-user sends on a shared workstream
@@ -489,6 +518,12 @@ class SessionUIBase:
         # SSE listener fan-out — one queue per connected browser tab.
         self._listeners: list[queue.Queue[dict[str, Any]]] = []
         self._listeners_lock = threading.Lock()
+        # Terminal registration fence, guarded by ``_listeners_lock``.
+        # Teardown sets this before snapshotting/clearing the current queues;
+        # a stale events request that already holds the Workstream reference
+        # but reaches registration afterward receives an internal ws_closed
+        # sentinel on a non-retained queue instead of blocking forever.
+        self._listeners_terminal = False
         # Per-ws event ring buffer for ``Last-Event-ID`` SSE replay.
         # Holds ``(event_id, event_dict)`` tuples; deque ``maxlen``
         # evicts the oldest automatically when the cap is hit.  The
@@ -530,6 +565,16 @@ class SessionUIBase:
         # own lock so the hot fan-out path never serializes on ``_listeners_lock``.
         self._agent_children: dict[str, str] = {}
         self._agent_children_lock = threading.Lock()
+        # Latest normalized prompt usage for each RUNNING task-agent parent.
+        # This is an in-memory reconnect snapshot only: the parent result clears
+        # it, and completed readings are deliberately not durable history.  A
+        # separate lock avoids inverting ``_agent_children_lock`` against the
+        # listener fan-out path. Values retain their owner generation so a
+        # force-abandoned predecessor cannot overwrite or clear its successor
+        # when a provider reuses the public parent call id, and so force-abandon
+        # can purge every reading owned by the retired generation at once.
+        self._agent_contexts: dict[str, tuple[int, dict[str, Any]]] = {}
+        self._agent_contexts_lock = threading.Lock()
         # Recall store: a finished task agent's projected sub-trajectory (step
         # items: id/name/arguments/output/is_error), keyed by its (parent)
         # call_id, so /history can rebuild the collapsible card after a fresh
@@ -561,6 +606,10 @@ class SessionUIBase:
         self._pending_approval: dict[str, Any] | None = None
         self.auto_approve = False
         self.auto_approve_tools: set[str] = set()
+        # Runtime "Approve + Always" grants are scoped to the immutable
+        # execution principal, not the shared session. Configured/template
+        # grants remain in ``auto_approve_tools`` as workstream policy.
+        self._always_approve_tools_by_principal: dict[str, set[str]] = {}
         # Smart Approvals (``judge.smart_approvals``): when enabled, a
         # tool call whose LLM intent verdict recommends ``approve`` with
         # confidence ≥ ``smart_approval_threshold`` is auto-approved
@@ -576,22 +625,14 @@ class SessionUIBase:
         # by the judge timeout; the wait returns early the moment every
         # pending call has a verdict.
         self.smart_approval_wait_seconds = 0.0
-        # Per-tool source for ``auto_approve_tools`` membership.  Two
-        # writers populate the set with semantically different intent:
-        #
-        # - **Skill template** at create time (the ``allowed_tools``
-        #   JSON list landing on ``auto_approve_tools`` from
-        #   ``server.py``'s skill block) — operator may not have
-        #   explicitly opted in tool-by-tool.
-        # - **User "Approve + Always"** click at runtime — explicit
-        #   per-tool consent from the live operator.
-        #
-        # Without per-tool source tracking the dashboard can't tell
-        # the operator WHICH path silently approved a tool call.
-        # Maps ``approval_label_or_func_name → source_string``;
-        # callers populate at the same point they update the set
-        # itself.  Default empty when neither writer ran (e.g. CLI
-        # ``/always`` doesn't set this — pre-existing).
+        # Per-tool source for configured ``auto_approve_tools`` membership.
+        # A skill template's ``allowed_tools`` JSON list lands here through
+        # ``server.py``; the operator may not have opted in tool-by-tool.
+        # Runtime user "Approve + Always" grants live separately in
+        # ``_always_approve_tools_by_principal`` and are always tagged with
+        # ``AutoApproveReason.ALWAYS``. This map is populated at the same point
+        # as the configured set; missing entries retain the legacy generic
+        # ``auto_approve_tools`` reason.
         self._auto_approve_tools_source: dict[str, str] = {}
         # Ring buffer of recent auto-approve events for /dashboard
         # visibility — a child workstream whose tool calls bypass the
@@ -743,6 +784,7 @@ class SessionUIBase:
         self._recent_decisions: collections.OrderedDict[str, tuple[str, threading.Event | None]] = (
             collections.OrderedDict()
         )
+        self._recent_decision_principals: dict[str, tuple[str, str]] = {}
         # Verdict cache for SSE reconnect replay (tab switching
         # shouldn't lose the judge's final call on a just-run tool).
         self._llm_verdicts: dict[str, dict[str, Any]] = {}
@@ -776,6 +818,30 @@ class SessionUIBase:
         # 0 and re-issue ids the prior process already stamped onto
         # ``conversations.event_id`` rows, corrupting cursor ordering.
         self._seed_event_id_from_storage()
+
+    # ------------------------------------------------------------------
+    # Session binding
+    # ------------------------------------------------------------------
+
+    def bind_session(self, session: Any) -> None:
+        """Bind the owning session (called once by ChatSession.__init__)."""
+        self._session_ref = weakref.ref(session)
+
+    def _bound_session(self) -> Any:
+        """The bound session, or None before binding / after collection."""
+        ref = self._session_ref
+        return ref() if ref is not None else None
+
+    def _current_persistence_state(self) -> str:
+        """Sanitized journal state of the UI's own session.
+
+        Derives through the bound session, never a registry lookup by id:
+        the registry fails open to "healthy" — or to a replacement
+        workstream after id reuse — exactly while failed-delete tombstone
+        retention or retirement has the row out of the map, which is
+        precisely when the operator badge must keep telling the truth.
+        """
+        return session_persistence_state(self._bound_session())
 
     # ------------------------------------------------------------------
     # Listener plumbing (SSE)
@@ -1178,6 +1244,73 @@ class SessionUIBase:
             for c in candidates:
                 del self._agent_children[c]
 
+    def on_agent_context(
+        self,
+        parent_call_id: str,
+        prompt_tokens: int,
+        context_window: int,
+        *,
+        generation: int = 0,
+    ) -> None:
+        """Publish and retain one task agent's latest context reading.
+
+        Store-before-enqueue is load-bearing for refresh races: a subscriber
+        registering between those operations sees the synthetic snapshot and
+        also may receive the live event, so clients reduce this event
+        idempotently. Reversing the order admits a window in which the event is
+        in neither the listener queue nor the snapshot.
+        """
+        if not parent_call_id or prompt_tokens < 0 or context_window <= 0:
+            return
+        event = {
+            "type": "agent_context",
+            "ws_id": self.ws_id,
+            "parent_call_id": parent_call_id,
+            "prompt_tokens": prompt_tokens,
+            "context_window": context_window,
+        }
+        with self._agent_contexts_lock:
+            current = self._agent_contexts.get(parent_call_id)
+            if current is not None and current[0] > generation:
+                return
+            self._agent_contexts[parent_call_id] = (generation, event)
+        self._enqueue(event)
+
+    def clear_agent_context(self, parent_call_id: str, *, generation: int = 0) -> None:
+        """Drop one completed task agent's reconnect snapshot.
+
+        Cleanup is exact-generation: a retiring predecessor whose public call
+        id was reused cannot remove the successor's active reading.
+        """
+        if not parent_call_id:
+            return
+        with self._agent_contexts_lock:
+            current = self._agent_contexts.get(parent_call_id)
+            if current is not None and current[0] == generation:
+                del self._agent_contexts[parent_call_id]
+
+    def clear_agent_contexts_before_generation(self, generation: int) -> None:
+        """Drop every reading owned by a force-abandoned generation.
+
+        A force successor may be claimed specifically because the retiring
+        worker is wedged and will never reach its per-agent ``finally`` block.
+        The cutoff form also preserves any reading already owned by the new
+        generation if a provider immediately reuses a public parent call id.
+        """
+        with self._agent_contexts_lock:
+            stale = [
+                parent_call_id
+                for parent_call_id, (owner_generation, _event) in self._agent_contexts.items()
+                if owner_generation < generation
+            ]
+            for parent_call_id in stale:
+                del self._agent_contexts[parent_call_id]
+
+    def _snapshot_agent_contexts(self) -> list[dict[str, Any]]:
+        """Copy active task-agent readings for fresh/truncated SSE replay."""
+        with self._agent_contexts_lock:
+            return [dict(event) for _generation, event in self._agent_contexts.values()]
+
     def on_agent_step(self, parent_call_id: str, item: dict[str, Any]) -> None:
         """Paint a sub-agent's auto-executed tool step as pending under its
         parent card so it shows live before it completes.  (Approval-gated
@@ -1229,8 +1362,23 @@ class SessionUIBase:
         """Create a per-client queue and register it as a listener."""
         client_queue: queue.Queue[dict[str, Any]] = _ListenerQueue(maxsize=maxsize)
         with self._listeners_lock:
-            self._listeners.append(client_queue)
+            self._register_or_close_listener_locked(client_queue)
         return client_queue
+
+    def _register_or_close_listener_locked(
+        self,
+        client_queue: queue.Queue[dict[str, Any]],
+    ) -> None:
+        """Register live, or pre-close a stale post-terminal request.
+
+        Caller holds ``_listeners_lock``. The terminal queue is deliberately
+        not retained: the events route consumes ``ws_closed`` internally and
+        exits, while a nonexistent consumer cannot leak a queue on the dead UI.
+        """
+        if getattr(self, "_listeners_terminal", False):
+            client_queue.put_nowait({"type": "ws_closed"})
+            return
+        self._listeners.append(client_queue)
 
     def _unregister_listener(self, client_queue: queue.Queue[dict[str, Any]]) -> None:
         """Remove a client queue from the listener list."""
@@ -1267,7 +1415,8 @@ class SessionUIBase:
         events handler's ``_seq <= snap_seq`` filter drops.
 
         Returns ``(client_queue, snapshot_dict)`` where ``snapshot_dict``
-        has keys ``content`` (str), ``reasoning`` (str), ``seq`` (int).
+        has keys ``content`` (str), ``reasoning`` (str), ``seq`` (int), and
+        ``agent_contexts`` (the active task-agent context events).
         Caller checks for non-empty content / reasoning to decide
         whether to yield the event at all (empty snapshots are common
         between turns and on freshly-opened workstreams).
@@ -1283,13 +1432,15 @@ class SessionUIBase:
             captured_content = list(self._ws_inflight_content)
             captured_reasoning = list(self._ws_inflight_reasoning)
             with self._listeners_lock:
-                self._listeners.append(client_queue)
+                self._register_or_close_listener_locked(client_queue)
                 snap_seq = self._event_id
-        return client_queue, {
+        snapshot = {
             "content": "".join(captured_content),
             "reasoning": "".join(captured_reasoning),
             "seq": snap_seq,
+            "agent_contexts": self._snapshot_agent_contexts(),
         }
+        return client_queue, snapshot
 
     def register_listener_with_replay(
         self,
@@ -1323,7 +1474,7 @@ class SessionUIBase:
         content/reasoning that the evicted events would have carried).
         ``snapshot`` has the same shape as
         :meth:`register_listener_with_in_progress_snapshot`'s second
-        return value: ``{"content": str, "reasoning": str, "seq": int}``.
+        return value, including its active ``agent_contexts`` list.
 
         Atomicity contract: under ``_ws_lock`` (outer) + ``_listeners_lock``
         (inner) — matches writer order in :meth:`on_content_token` —
@@ -1349,7 +1500,14 @@ class SessionUIBase:
         text (prevents double-rendering after a truncated emit).
 
         ``last_event_id`` semantics:
-          - ``< earliest_available_id - 1`` → ``"truncated"``.
+          - ``< 0`` or ``> _event_id`` at the registration boundary →
+            ``"truncated"``.  Per-workstream ids start at 1 and the captured
+            counter is their authoritative high-water mark, so neither cursor
+            can have been issued by this stream.  Failing closed forces the
+            caller through its authoritative snapshot/history recovery floor
+            instead of accepting an empty replay from a forged or corrupt
+            future cursor.
+          - Otherwise, ``< earliest_available_id - 1`` → ``"truncated"``.
             ``lost_count`` is the minimum gap (the buffer may have
             evicted strictly more than this — we only know the
             lower bound from what's still retained).
@@ -1365,10 +1523,9 @@ class SessionUIBase:
         distinguishes them:
 
           - ``_event_id == 0`` — genuine cold start (brand-new ws,
-            nothing ever emitted) → ``"replay_ok"`` with an empty
-            slice.  No false ``replay_truncated`` on freshly-opened
-            workstreams; the ``> 0`` guard also rejects a malformed
-            negative cursor (``?last_event_id=-1`` parses as an int).
+            nothing ever emitted).  Cursor 0 is the sole valid bootstrap
+            cursor and returns ``"replay_ok"`` with an empty slice; negative
+            or future cursors are rejected by the range check above.
           - ``_event_id > 0`` — this UI instance was rebuilt over an
             existing conversation (:meth:`_seed_event_id_from_storage`
             reseeds the counter from ``MAX(conversations.event_id)``
@@ -1383,11 +1540,14 @@ class SessionUIBase:
             load-bearing) means the client saw everything before the
             rebuild — no loss, ``"replay_ok"``.
 
-        On the empty-ring truncated path ``lost_count`` is the exact
-        counter gap and ``earliest_available_id`` is ``_event_id + 1``
-        (the next id that will exist; nothing below it is retained).
-        No production client reads either field — they are envelope
-        forensics — but tests assert them.
+        On the ordinary stale empty-ring path ``lost_count`` is the exact
+        counter gap and ``earliest_available_id`` is ``_event_id + 1`` (the
+        next id that will exist; nothing below it is retained).  For an
+        out-of-range cursor, ``lost_count`` is a conservative numeric floor
+        (zero for a future cursor) and ``earliest_available_id`` is the first
+        retained id, or the next counter id when the ring is empty.  No
+        production client reads either field — they are envelope forensics —
+        but tests assert them.
         """
         client_queue: queue.Queue[dict[str, Any]] = _ListenerQueue(maxsize=maxsize)
         # Lock order matches writer: ``_ws_lock`` outer, ``_listeners_lock``
@@ -1403,13 +1563,24 @@ class SessionUIBase:
             captured_reasoning = list(self._ws_inflight_reasoning)
             with self._listeners_lock:
                 buffered = list(self._event_buffer)
-                self._listeners.append(client_queue)
+                self._register_or_close_listener_locked(client_queue)
                 snap_seq = self._event_id
         snapshot: dict[str, Any] = {
             "content": "".join(captured_content),
             "reasoning": "".join(captured_reasoning),
             "seq": snap_seq,
+            "agent_contexts": self._snapshot_agent_contexts(),
         }
+        if last_event_id < 0 or last_event_id > snap_seq:
+            # Event ids start at 1, with cursor 0 reserved for the initial
+            # bootstrap.  A negative or beyond-high-water cursor was never
+            # issued by this UI.  Treat it as an uncovered gap so the route
+            # emits replay_truncated and the client rebuilds from
+            # authoritative history instead of silently trusting an empty
+            # replay slice.
+            earliest_id = buffered[0][0] if buffered else snap_seq + 1
+            lost_count = max(0, (earliest_id - 1) - last_event_id)
+            return client_queue, [], "truncated", lost_count, earliest_id, snapshot
         if not buffered:
             # Derived staleness — see the docstring's empty-buffer
             # section.  ``snap_seq`` (the counter captured under the
@@ -1510,6 +1681,7 @@ class SessionUIBase:
                     self._llm_verdicts.pop(cid, None)
                     self._verdict_origins.pop(cid, None)
                 self._recent_decisions.pop(cid, None)
+                self._recent_decision_principals.pop(cid, None)
 
     # ------------------------------------------------------------------
     # Approval-cycle registry
@@ -1629,6 +1801,44 @@ class SessionUIBase:
             bool(getattr(witness, "aborted", False)) for witness in cycle.cancel_witnesses
         )
 
+    @staticmethod
+    def _approval_grant_names(cycle: ApprovalCycle) -> set[str]:
+        """Return the human-gated tool labels eligible for an Always grant."""
+        names = {
+            item.get("approval_label", "") or item.get("func_name", "")
+            for item in cycle.items
+            if item.get("needs_approval") and item.get("func_name") and not item.get("error")
+        }
+        names.discard("")
+        names.discard("__budget_override__")
+        return names
+
+    @staticmethod
+    def _validate_approval_resolver(
+        cycle: ApprovalCycle,
+        *,
+        resolver_principal_id: str | None,
+        feedback: str | None,
+        always: bool,
+    ) -> str:
+        """Validate peer-resolution limits and return durable resolver identity.
+
+        ``None`` identifies internal timeout/cancel/legacy callers which do not
+        represent an authenticated human resolver. HTTP callers always pass a
+        concrete principal, including the anonymous empty-string principal.
+        """
+        if resolver_principal_id is None:
+            return ""
+        resolver = resolver_principal_id.strip()
+        if resolver != cycle.execution_principal_id and (
+            bool(str(feedback or "").strip()) or always
+        ):
+            raise CrossPrincipalApprovalError(
+                "A peer may approve or reject this action, but only the initiating "
+                "principal may add feedback or choose Approve + Always"
+            )
+        return resolver
+
     def _claim_approval_cycle_locked(
         self,
         cycle: ApprovalCycle,
@@ -1646,9 +1856,14 @@ class SessionUIBase:
         self._refresh_pending_approval_view()
         for cid in cycle.call_ids:
             self._recent_decisions[cid] = (decision, cycle.judge_event)
+            self._recent_decision_principals[cid] = (
+                cycle.resolver_principal_id,
+                cycle.execution_principal_id,
+            )
             self._recent_decisions.move_to_end(cid)
         while len(self._recent_decisions) > _RECENT_DECISION_CAP:
-            self._recent_decisions.popitem(last=False)
+            evicted_call_id, _decision = self._recent_decisions.popitem(last=False)
+            self._recent_decision_principals.pop(evicted_call_id, None)
         return pending
 
     def _publish_approval_resolution(
@@ -1691,6 +1906,7 @@ class SessionUIBase:
         timeout: bool = False,
         call_id: str | None = None,
         cycle_id: str | None = None,
+        resolver_principal_id: str | None = None,
     ) -> str | None:
         """Unblock ONE pending approval cycle with the caller's decision.
 
@@ -1709,11 +1925,10 @@ class SessionUIBase:
         that fired during this cycle's round — the audit trail reflects
         what the user actually chose for THESE calls.
 
-        ``always`` reports whether the resolving caller asked for
-        "Approve + Always" (the tool name has been added to
-        ``auto_approve_tools`` upstream by the HTTP handler — this
-        method only echoes the intent on the SSE event so peer tabs
-        can label their resolved-status pill correctly).
+        ``resolver_principal_id`` is supplied by authenticated HTTP callers.
+        A different authorized peer may make the binary approve/reject choice,
+        but cannot inject feedback or create an ``always`` grant. Same-principal
+        Always grants are owned here and scoped by execution principal + tool.
 
         ``timeout`` flips the persisted ``user_decision`` from
         ``"denied"`` to ``"timeout"`` so the audit trail can
@@ -1737,6 +1952,7 @@ class SessionUIBase:
         if not self._begin_approval_admission(lambda: self._approval_cycle_owner_aborted(cycle)):
             return None
         pending: list[dict[str, Any]] | None = None
+        effective_always = False
         try:
             # A resolver can discover the cycle immediately after
             # registration. Wait outside every state lock until the gate has
@@ -1746,6 +1962,19 @@ class SessionUIBase:
                 selected = self._select_cycle_locked(cycle_id=cycle.cycle_id)
                 if selected is not cycle:
                     return None
+                cycle.resolver_principal_id = self._validate_approval_resolver(
+                    cycle,
+                    resolver_principal_id=resolver_principal_id,
+                    feedback=feedback,
+                    always=always,
+                )
+                effective_always = bool(always and approved)
+                if effective_always:
+                    grant_names = self._approval_grant_names(cycle)
+                    if grant_names:
+                        self._always_approve_tools_by_principal.setdefault(
+                            cycle.execution_principal_id, set()
+                        ).update(grant_names)
                 pending = self._claim_approval_cycle_locked(
                     cycle,
                     approved=approved,
@@ -1757,7 +1986,7 @@ class SessionUIBase:
                     cycle,
                     approved=approved,
                     feedback=feedback,
-                    always=always,
+                    always=effective_always,
                 )
             except Exception:
                 # The decision is authoritative and the gate was awakened in
@@ -1772,7 +2001,12 @@ class SessionUIBase:
         finally:
             self._end_approval_admission()
         if pending:
-            self._persist_verdict_decisions(pending, decision_str)
+            self._persist_verdict_decisions(
+                pending,
+                decision_str,
+                resolver_principal_id=cycle.resolver_principal_id,
+                execution_principal_id=cycle.execution_principal_id,
+            )
         return cycle.cycle_id
 
     def resolve_all_approvals(
@@ -1781,6 +2015,7 @@ class SessionUIBase:
         feedback: str | None = None,
         *,
         timeout: bool = False,
+        resolver_principal_id: str | None = None,
     ) -> int:
         """Resolve EVERY live cycle with one decision; returns the count.
 
@@ -1797,6 +2032,10 @@ class SessionUIBase:
         deliberately excluded. Live dismissals publish before the barrier is
         retired, while durable verdict updates run afterward so storage latency
         never delays successor admission.
+
+        Authenticated request paths pass ``resolver_principal_id`` so durable
+        verdicts retain the human actor. Internal recovery and teardown paths
+        omit it and remain explicitly unattributed.
         """
         # A Smart Approval gate can still be waiting for its asynchronous
         # verdict before an ApprovalCycle exists.  Wake that pre-cycle wait as
@@ -1823,6 +2062,7 @@ class SessionUIBase:
                     and (not cycle.cancel_witnesses or self._approval_cycle_owner_aborted(cycle))
                 ]
                 for cycle in targets:
+                    cycle.resolver_principal_id = resolver_principal_id or ""
                     pending = self._claim_approval_cycle_locked(
                         cycle,
                         approved=approved,
@@ -1857,13 +2097,21 @@ class SessionUIBase:
         decision_str = "timeout" if timeout else ("approved" if approved else "denied")
         for _cycle, pending in claimed:
             if pending:
-                self._persist_verdict_decisions(pending, decision_str)
+                self._persist_verdict_decisions(
+                    pending,
+                    decision_str,
+                    resolver_principal_id=_cycle.resolver_principal_id,
+                    execution_principal_id=_cycle.execution_principal_id,
+                )
         return len(claimed)
 
     def _persist_verdict_decisions(
         self,
         pending: list[dict[str, Any]],
         decision_str: str,
+        *,
+        resolver_principal_id: str | None = None,
+        execution_principal_id: str | None = None,
     ) -> None:
         """Persist a verdict decision safely in either arrival order.
 
@@ -1883,10 +2131,28 @@ class SessionUIBase:
             for v in pending:
                 vid = v.get("verdict_id", "")
                 if vid:
+                    resolver = (
+                        str(v.get("resolver_principal_id") or "")
+                        if resolver_principal_id is None
+                        else resolver_principal_id
+                    )
+                    executor = (
+                        str(v.get("execution_principal_id") or "")
+                        if execution_principal_id is None
+                        else execution_principal_id
+                    )
                     decided = dict(v)
                     decided["user_decision"] = decision_str
+                    decided["resolver_principal_id"] = resolver
+                    decided["execution_principal_id"] = executor
                     self._persist_intent_verdict(decided)
-                    storage.update_intent_verdict(vid, user_decision=decision_str)
+                    update_fields = {"user_decision": decision_str}
+                    if resolver or executor:
+                        update_fields.update(
+                            resolver_principal_id=resolver,
+                            execution_principal_id=executor,
+                        )
+                    storage.update_intent_verdict(vid, **update_fields)
         except Exception:
             log.debug("Failed to update verdict user_decision", exc_info=True)
 
@@ -1901,8 +2167,8 @@ class SessionUIBase:
            the previous round can't leak onto this one.
         2. Evaluate admin-defined tool policies (deny short-circuits;
            allow tags items as auto-approved with ``AutoApproveReason.POLICY``).
-        3. Per-tool auto-approve via ``self.auto_approve_tools`` (skill
-           ``allowed_tools`` and operator "Approve + Always").
+        3. Per-tool auto-approve via configured ``self.auto_approve_tools``
+           plus execution-principal-scoped "Approve + Always" grants.
         4. Budget-override carve-out + blanket ``self.auto_approve``.
            Synthetic ``__budget_override__`` items always prompt.
         5. Activity tagging + ``_broadcast_activity`` so the dashboard
@@ -1913,7 +2179,7 @@ class SessionUIBase:
         7. Check the batch's private cancellation witness around every
            pre-cycle wait/publication, register an :class:`ApprovalCycle`,
            re-check once more, emit its ``approve_request`` card, and block on
-           the CYCLE's event up to ``_APPROVAL_WAIT_TIMEOUT``.
+           the CYCLE's event up to the batch's configured human wait deadline.
 
         ``__budget_override__`` is interactive-only today (coord
         workstreams don't have token budgets), but the carve-out check
@@ -1926,6 +2192,8 @@ class SessionUIBase:
         :class:`ApprovalCycle`.  Shared state is touched only under
         ``_ws_lock`` and scoped to this batch's call_ids.
         """
+
+        execution_principal_id = _execution_principal_for_items(items)
 
         def _cancelled() -> bool:
             return any(
@@ -1950,10 +2218,10 @@ class SessionUIBase:
                 self._end_approval_admission()
 
         # Production ChatSession gates carry the coherent judge-config
-        # snapshot captured for THIS batch.  Parallel task-agent gates may be
+        # snapshot captured for THIS batch. Parallel task-agent gates may be
         # queued while another batch observes a hot reload; reading mutable UI
         # attributes here would let one gate combine the other's enabled flag,
-        # threshold, and timeout.  Direct/legacy UI callers do not stamp the
+        # threshold, and timeout. Direct/legacy UI callers do not stamp the
         # private field, so retain their established instance-attribute path.
         stamped_configs = [it.get("_smart_approval_config") for it in items]
         if any(isinstance(cfg, _SmartApprovalConfig) for cfg in stamped_configs):
@@ -1972,6 +2240,17 @@ class SessionUIBase:
                 self.smart_approval_threshold,
                 self.smart_approval_wait_seconds,
             )
+
+        # The independently configured human wait uses the same immutable
+        # per-item channel. Every member must carry one identical value; a
+        # partial/mixed stamp falls back to the historical one-hour deadline.
+        approval_wait_seconds: float | None = float(self._APPROVAL_WAIT_TIMEOUT)
+        if items and all("_approval_wait_seconds" in item for item in items):
+            candidate = items[0]["_approval_wait_seconds"]
+            if all(item["_approval_wait_seconds"] == candidate for item in items) and (
+                candidate is None or isinstance(candidate, (int, float))
+            ):
+                approval_wait_seconds = float(candidate) if candidate is not None else None
 
         # The batch's judge generation, stamped by ``_evaluate_intent`` —
         # one event per spawn, shared by every item in the batch.  Read
@@ -2113,31 +2392,35 @@ class SessionUIBase:
             return False, "Cancelled by user"
         # -- End tool policy evaluation -------------------------------------------
 
-        # Per-tool auto-approve check (from workstream template or interactive "Always").
+        # Per-tool auto-approve check. Template/config grants are shared
+        # workstream policy; interactive "Always" grants apply only to calls
+        # executing as the same immutable principal that received the grant.
         # Suppressed when a budget-override item is present so the carve-out
         # at the next gate stays effective even if ``__budget_override__`` ever
         # lands in ``auto_approve_tools`` (defensive — listings filter it out
         # today, but the worker can be configured by a skill template).
-        if pending and self.auto_approve_tools and not has_budget_override:
+        with self._ws_lock:
+            principal_grants = set(
+                self._always_approve_tools_by_principal.get(execution_principal_id, set())
+            )
+        auto_approve_names = set(self.auto_approve_tools) | principal_grants
+        if pending and auto_approve_names and not has_budget_override:
             pending_names = {
                 it.get("approval_label", "") or it.get("func_name", "")
                 for it in pending
                 if it.get("func_name")
             }
-            if pending_names and pending_names.issubset(self.auto_approve_tools):
+            if pending_names and pending_names.issubset(auto_approve_names):
                 if _cancelled():
                     return False, "Cancelled by user"
-                # Tag each formerly-pending item with the per-tool source
-                # recorded when ``auto_approve_tools`` was populated:
-                # ``skill`` (skill template's ``allowed_tools``) /
-                # ``always`` (user "Approve + Always" click) / fallback
-                # ``auto_approve_tools`` for legacy or unknown writers.
-                # Visibility for the skill-vs-explicit conflation
-                # flagged on the coord tree dashboard.
+                # Merge configured-source labels with the current execution
+                # principal's explicit Always grants for dashboard attribution.
+                source_map = dict(self._auto_approve_tools_source)
+                source_map.update({name: AutoApproveReason.ALWAYS for name in principal_grants})
                 self._tag_auto_approved(
                     pending,
                     AutoApproveReason.AUTO_APPROVE_TOOLS,
-                    source_map=self._auto_approve_tools_source,
+                    source_map=source_map,
                 )
                 pending = []
 
@@ -2224,6 +2507,8 @@ class SessionUIBase:
             if not hv:
                 continue
             heuristic_row = dict(hv)
+            heuristic_row["execution_principal_id"] = execution_principal_id
+            heuristic_row.setdefault("resolver_principal_id", "")
             if item.get("auto_approved"):
                 heuristic_row["user_decision"] = item.get("auto_approve_reason", "") or "pending"
             else:
@@ -2305,17 +2590,21 @@ class SessionUIBase:
         for persist in deferred_auto_audit:
             persist()
         try:
-            if not cycle.event.wait(timeout=self._APPROVAL_WAIT_TIMEOUT):
+            if not cycle.event.wait(timeout=approval_wait_seconds):
+                # ``Event.wait(None)`` only returns after the event is set.
+                # Reaching this branch therefore proves a finite deadline.
+                assert approval_wait_seconds is not None
                 # Approval timed out (e.g., user disconnected). Deny via
                 # resolve_approval so verdicts and state are updated
                 # consistently — targeted at THIS cycle so a sibling gate
                 # timing out can't deny someone else's round.  Feedback
-                # string derives from ``_APPROVAL_WAIT_TIMEOUT`` so the
-                # text follows the constant if the timeout knob moves.
+                # derives from this cycle's immutable config snapshot so a
+                # hot reload cannot make the audit text disagree with the
+                # deadline that actually fired.
                 log.warning("Approval timed out for ws_id=%s", self.ws_id)
                 self.resolve_approval(
                     False,
-                    f"Approval timed out after {self._APPROVAL_WAIT_TIMEOUT}s",
+                    f"Approval timed out after {approval_wait_seconds:g}s",
                     timeout=True,
                     cycle_id=cycle.cycle_id,
                 )
@@ -2454,6 +2743,11 @@ class SessionUIBase:
                 hv = it.get("_heuristic_verdict") or {}
                 if hv.get("recommendation") == "deny" or hv.get("risk_level") == "critical":
                     return pending  # explicit deterministic danger flag → human
+                v.setdefault(
+                    "execution_principal_id",
+                    str(it.get("_principal_id") or "").strip(),
+                )
+                v.setdefault("resolver_principal_id", "")
                 qualified[cid] = v
 
         # Whole batch qualified.  Commit its shared state through the caller's
@@ -2602,11 +2896,9 @@ class SessionUIBase:
     # can't grow unbounded. FIFO eviction on insert.
     _LLM_VERDICT_CACHE_MAX = 50
 
-    # Hard cap on how long a worker thread blocks waiting for an
-    # approval decision. Subclasses' ``approve_tools`` references this
-    # rather than the literal so a future
-    # ``settings.approval_timeout_seconds`` knob can swap it in one
-    # place.
+    # Compatibility fallback for direct/legacy SessionUIBase callers whose
+    # items were not produced by ChatSession. Production batches carry the
+    # live ``tools.approval_timeout_seconds`` value per private approval item.
     _APPROVAL_WAIT_TIMEOUT = 3600
 
     def on_intent_verdict(
@@ -2663,6 +2955,8 @@ class SessionUIBase:
         call_id = verdict.get("call_id", "")
         auto_reason = ""
         decision = ""
+        decision_resolver_principal_id = ""
+        decision_execution_principal_id = ""
         initial_owner: ApprovalCycle | None = None
 
         def _unresolved_owner_locked() -> tuple[ApprovalCycle | None, bool]:
@@ -2696,6 +2990,10 @@ class SessionUIBase:
                     stale.setdefault("user_decision", "superseded")
                     persist_actions.append(functools.partial(self._persist_intent_verdict, stale))
                     return persist_actions
+                if initial_owner is not None and initial_owner.execution_principal_id:
+                    verdict.setdefault(
+                        "execution_principal_id", initial_owner.execution_principal_id
+                    )
                 if (
                     len(self._llm_verdicts) >= self._LLM_VERDICT_CACHE_MAX
                     and call_id not in self._llm_verdicts
@@ -2799,12 +3097,18 @@ class SessionUIBase:
                             decision = "superseded"
                         else:
                             decision = prior_decision
+                            (
+                                decision_resolver_principal_id,
+                                decision_execution_principal_id,
+                            ) = self._recent_decision_principals.get(call_id, ("", ""))
         if decision:
             persist_actions.append(
                 functools.partial(
                     self._persist_verdict_decisions,
                     [dict(verdict)],
                     decision,
+                    resolver_principal_id=decision_resolver_principal_id,
+                    execution_principal_id=decision_execution_principal_id,
                 )
             )
         return persist_actions
@@ -2903,6 +3207,8 @@ class SessionUIBase:
                     "judge_model": v.get("judge_model", ""),
                     "latency_ms": v.get("latency_ms", 0),
                     "user_decision": v.get("user_decision", "pending"),
+                    "resolver_principal_id": v.get("resolver_principal_id", ""),
+                    "execution_principal_id": v.get("execution_principal_id", ""),
                 }
                 for v in verdicts
             ]
@@ -2970,6 +3276,8 @@ class SessionUIBase:
                 judge_model=verdict.get("judge_model", ""),
                 latency_ms=verdict.get("latency_ms", 0),
                 user_decision=verdict.get("user_decision", "pending"),
+                resolver_principal_id=verdict.get("resolver_principal_id", ""),
+                execution_principal_id=verdict.get("execution_principal_id", ""),
             )
         except Exception:
             log.debug("Failed to persist intent verdict", exc_info=True)
@@ -3196,7 +3504,10 @@ class SessionUIBase:
             if not hv:
                 continue
             hv["user_decision"] = it.get("auto_approve_reason", "") or "pending"
-            verdicts.append(dict(hv))
+            row = dict(hv)
+            row["execution_principal_id"] = str(it.get("_principal_id") or "").strip()
+            row.setdefault("resolver_principal_id", "")
+            verdicts.append(row)
         if not verdicts:
             return
 
@@ -3232,6 +3543,7 @@ class SessionUIBase:
         """
         if not items:
             return
+        execution_principal_id = _execution_principal_for_items(items)
         ts = time.time()
         appended = [
             {
@@ -3302,7 +3614,7 @@ class SessionUIBase:
                     return
                 record_audit(
                     storage,
-                    self._user_id,
+                    execution_principal_id or self._user_id,
                     "tool.auto_approved",
                     "workstream",
                     self.ws_id,
@@ -3748,6 +4060,46 @@ class SessionUIBase:
             event["preview"] = preview
         self._enqueue(event)
 
+    def on_tool_turn_accepted(
+        self,
+        call_id: str,
+        name: str,
+        output: str,
+        *,
+        is_error: bool = False,
+        preview: dict[str, Any] | None = None,
+        effect_status: str | None = None,
+    ) -> int:
+        """Publish the canonical accepted TOOL row without replaying metrics.
+
+        ``on_tool_result`` is the executor receipt: it closes the call's
+        output stream, increments tool metrics, clears activity, and paints a
+        provisional result immediately. Output guards and truncation run
+        afterwards, so the durable row may differ. This second hook carries
+        that final guarded scalar projection to listeners that missed the
+        receipt and lets reducers replace the provisional rendering in place.
+
+        Deliberately no chunk, activity, or metric bookkeeping lives here.
+        Replaying any of it would count one accepted tool twice. Structured
+        image bytes also stay out of the event ring; ``output`` is the same
+        text-only projection persisted for ``/history`` and attachments remain
+        content-addressed in storage.
+        """
+        event: dict[str, Any] = {
+            "type": "tool_result",
+            "accepted": True,
+            "call_id": call_id,
+            "name": name,
+            "output": output,
+        }
+        if is_error:
+            event["is_error"] = True
+        if preview:
+            event["preview"] = preview
+        if effect_status:
+            event["effect_status"] = effect_status
+        return self._enqueue(event)
+
     def on_tool_output_chunk(self, call_id: str, chunk: str) -> None:
         """Buffer one tool-output line into the per-call chunk batcher.
 
@@ -3944,6 +4296,45 @@ class SessionUIBase:
             # batch flushes via _enqueue below; chunks bypass it).
             self._flush_all_chunk_batches_locked()
         self._enqueue({"type": "error", "message": message})
+
+    def on_history_resync(self, reason: str) -> int:
+        """Tell connected panes to refetch the authoritative history view.
+
+        Reserved for exceptional repair paths: older/custom UIs without the
+        typed ``user_turn`` hook, history truncation, or an accepted row that
+        does not reach an unambiguous acknowledgement.
+        """
+        return self._enqueue({"type": "history_resync", "reason": reason})
+
+    def on_user_turn(
+        self,
+        content: str,
+        *,
+        attachments: list[dict[str, Any]],
+        sender: str | None,
+        source: str | None,
+        client_send_ids: list[str],
+    ) -> int:
+        """Publish one accepted user row to every connected pane.
+
+        ``client_send_ids`` correlate this canonical event with optimistic
+        bubbles in the sending browser. They are not idempotency keys; the
+        event's monotonic ``_event_id`` remains the durable row identity.
+        Peer panes render the same event directly, including sender,
+        synthetic-source, and attachment metadata.
+        """
+        event: dict[str, Any] = {
+            "type": "user_turn",
+            "content": content,
+            "client_send_ids": list(client_send_ids),
+        }
+        if attachments:
+            event["attachments"] = [dict(item) for item in attachments]
+        if sender:
+            event["sender"] = sender
+        if source:
+            event["source"] = source
+        return self._enqueue(event)
 
     def on_system_turn(
         self, content: str, source: str, meta: dict[str, Any] | None = None
@@ -4240,3 +4631,22 @@ class SessionUIBase:
             "activity_state": activity_state,
             "content": content,
         }
+
+    def snapshot_state_payload_non_consuming(self) -> dict[str, Any]:
+        """Locked counters snapshot for observational operator-row refreshes.
+
+        The non-consuming sibling of :meth:`snapshot_and_consume_state_payload`
+        for hooks that must NOT touch the terminal turn-content accumulator
+        (the persistence refresh reports a journal transition, not a state
+        transition).  Both kinds' ``on_persistence_state_changed`` read
+        through here so the interactive dashboard and the console cluster
+        row cannot silently disagree after the same journal event — a
+        snapshot field added here reaches both surfaces at once.
+        """
+        with self._ws_lock:
+            return {
+                "tokens": self._ws_prompt_tokens + self._ws_completion_tokens,
+                "context_ratio": self._ws_context_ratio,
+                "activity": self._ws_current_activity,
+                "activity_state": self._ws_activity_state,
+            }

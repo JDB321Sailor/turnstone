@@ -194,9 +194,10 @@ export function createQueueController(opts) {
     });
   }
 
-  function addQueuedMessage(text, priority) {
+  function addQueuedMessage(text, priority, clientSendId) {
     var el = document.createElement("div");
     el.className = "msg user msg-queued";
+    if (clientSendId) el.dataset.clientSendId = clientSendId;
     el.setAttribute("role", "status");
     var important = priority === "important";
     if (important) {
@@ -506,11 +507,177 @@ export function parsePriority(text) {
   return { displayText: text, priority: "notice" };
 }
 
+// Restore a server-refused send without overwriting text entered during the
+// POST round-trip. The rejected message stays first (its original chronology).
+// Settlement is one-shot, so never infer duplicate restoration from content:
+// the user may independently type the same text while the request is pending.
+export function mergeRejectedComposerText(rejectedText, currentText) {
+  var rejected = rejectedText == null ? "" : String(rejectedText);
+  var current = currentText == null ? "" : String(currentText);
+  if (!rejected) return current;
+  if (!current) return rejected;
+  return rejected + "\n" + current;
+}
+
+// Mint one opaque browser correlation token. This is deliberately not a
+// delivery/idempotency key; the server may accept the same value on multiple
+// distinct turns, whose event ids remain authoritative.
+export function mintClientSendId() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function")
+    return window.crypto.randomUUID();
+  var bytes = new Uint8Array(16);
+  if (window.crypto && typeof window.crypto.getRandomValues === "function") {
+    window.crypto.getRandomValues(bytes);
+  } else {
+    for (var i = 0; i < bytes.length; i++)
+      bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(bytes, function (value) {
+    return value.toString(16).padStart(2, "0");
+  }).join("");
+}
+
+export function sendBubbleWasAccepted(el) {
+  return !!(el && el.dataset && el.dataset.serverAccepted === "true");
+}
+
+// Mark at most one optimistic/queued bubble per id occurrence, in DOM order.
+// client_send_id is correlation only: callers may legally reuse a token on a
+// later distinct send, so a selector that marks every matching element would
+// collapse real turns. Removal stays with each pane because queued bubbles
+// must go through their queue controller.
+export function markAcceptedClientSendBubbles(
+  candidates,
+  clientSendIds,
+  skipAlreadyAccepted = false,
+) {
+  const available = Array.from(candidates || []);
+  const matched = [];
+  for (const clientSendId of clientSendIds || []) {
+    const index = available.findIndex(
+      (el) =>
+        el.dataset &&
+        el.dataset.clientSendId === clientSendId &&
+        (!skipAlreadyAccepted || el.dataset.serverAccepted !== "true"),
+    );
+    if (index < 0) continue;
+    const bubble = available.splice(index, 1)[0];
+    bubble.dataset.serverAccepted = "true";
+    matched.push(bubble);
+  }
+  return matched;
+}
+
+// The correlation token is random but not an authorization credential. A
+// peer who reuses or guesses it must not settle this viewer's optimistic
+// bubble. Older events without sender identity retain their compatibility
+// behavior; when both identities are known they must match exactly.
+export function clientSendMaySettleForViewer(sender, viewer) {
+  const eventSender = typeof sender === "string" ? sender : "";
+  const viewerId = typeof viewer === "string" ? viewer : "";
+  return !eventSender || !viewerId || eventSender === viewerId;
+}
+
+// The viewing operator's opaque user id, retained from /whoami. Storage access
+// can be disabled (privacy mode, sandboxed frame); "" then reads as "viewer
+// unknown", which is the compatibility case for every consumer above.
+export function viewerUserId() {
+  try {
+    return sessionStorage.getItem("ts.user_id") || "";
+  } catch (_err) {
+    return "";
+  }
+}
+
+// Settle the optimistic bubbles an accepted event names. A queued chip must
+// leave through the queue controller (a bare remove() would strand its
+// live-set bookkeeping); a plain optimistic bubble just detaches.
+export function settleAcceptedClientSends(
+  messagesEl,
+  queue,
+  clientSendIds,
+  remove,
+  skipAlreadyAccepted = false,
+) {
+  const candidates = Array.from(
+    messagesEl.querySelectorAll("[data-client-send-id]"),
+  );
+  const matched = markAcceptedClientSendBubbles(
+    candidates,
+    clientSendIds,
+    skipAlreadyAccepted,
+  );
+  if (remove) {
+    for (const bubble of matched) {
+      if (bubble.classList.contains("msg-queued")) queue.remove(bubble);
+      else bubble.remove();
+    }
+  }
+  return matched;
+}
+
+// Project one canonical `user_turn` event onto a pane. Everything structural is
+// shared — the event-id dedupe that keeps an unpainted turn replayable, the
+// viewer gate on settling optimistic bubbles, the settle + removal, the
+// attachments handoff, and the system_nudge branch. Only the DOM writes arrive
+// via host, so the two panes cannot drift on the projection order.
+//
+// host:
+//   renderedEventIds: Set of ids already projected
+//   messagesEl:       container holding this viewer's optimistic bubbles
+//   queue:            queue controller owning the queued chips
+//   consumeAttachments(ids): composer chip sync for a settled send
+//   renderNudgeMarker():     the wake-driven empty-turn marker
+//   renderUserTurn(content, attachments, opts): the ordinary user bubble.
+//     opts carries {eventId, sender, source, viewer}; the pane owns its own
+//     attachments default and any viewer-relative labelling.
+export function acceptUserTurnEvent(evt, host) {
+  const eventId = evt._event_id != null ? String(evt._event_id) : null;
+  if (eventId && host.renderedEventIds.has(eventId)) return;
+  const viewer = viewerUserId();
+  const maySettle = clientSendMaySettleForViewer(evt.sender, viewer);
+  if (maySettle) {
+    // Called for the side effect — it settles and removes this viewer's
+    // optimistic bubbles.  Nothing below gates on how many it matched:
+    // an accepted turn with no local bubble (a create dispatch) still
+    // owns its attachment consumption.
+    settleAcceptedClientSends(
+      host.messagesEl,
+      host.queue,
+      evt.client_send_ids,
+      true,
+    );
+  }
+  // Chip sync follows the same viewer policy as bubble settling — NOT the
+  // matched-bubble gate: a create-dispatched first turn (or any accepted
+  // turn whose optimistic bubble this tab never held) carries consumed
+  // attachment ids whose staged uploads are spent.  A rehydrated pending
+  // chip left behind re-submits a drained id on the next send (spurious
+  // dropped-attachment warning) or double-delivers on a racing one.  A
+  // known-DIFFERENT sender still never clears this viewer's chips.
+  if (maySettle && Array.isArray(evt.attachments)) {
+    host.consumeAttachments(
+      evt.attachments.map((item) => item && item.attachment_id).filter(Boolean),
+    );
+  }
+  if (evt.source === "system_nudge") {
+    host.renderNudgeMarker();
+  } else {
+    host.renderUserTurn(evt.content || "", evt.attachments, {
+      eventId: eventId,
+      sender: evt.sender || "",
+      source: evt.source || "",
+      viewer: viewer,
+    });
+  }
+  if (eventId) host.renderedEventIds.add(eventId);
+}
+
 // Settle a parsed /send response against the pane's optimistic state — the
 // ONE implementation of the status dispatch both panes share (the
 // applyCompactionEvent hooks pattern: everything pane-specific arrives via
-// ctx). The fetch-stage concerns (409 pre-parse, network .catch) stay
-// per-pane; this owns everything after a parsed 2xx/handled body.
+// ctx). This owns everything after a parsed 2xx/handled body; the fetch stage
+// around it is postAndSettleSend below.
 //
 // ctx:
 //   queuedEl:     the pre-POST queued chip (busy pane) or null
@@ -523,6 +690,8 @@ export function parsePriority(text) {
 //                 has since asserted it (see the panes' busySource stamp)
 //   paneIsBusy(): the pane's LIVE busy flag (not the send-time snapshot)
 //                 — drives the missed-edge settle below
+//   restoreInput(): restore rejected companion text without overwriting input
+//                 entered during the POST round-trip
 //   renderError(msg): pane error row
 //   consumeAttachments(attached_ids, dropped_ids): composer chip sync
 //
@@ -538,11 +707,15 @@ export function parsePriority(text) {
 //     post-bind settle promotes it (see the inline contract).
 //   queue_full — the send was NEVER accepted (interjection cap, deferred-
 //     list saturation, or drain-spawn failure): remove the optimistic
-//     bubble too — leaving it renders loss as delivery — and restore busy
-//     under the same guard (no worker and no drain may exist to ever emit
-//     a state event; leaving busy strands the composer in Stop mode).
-//   busy / attachments_busy / cross_user_interjection / unknown-ok —
-//     the panes' historical shapes, verbatim.
+//     bubble too — leaving it renders loss as delivery — restore the input,
+//     and restore busy under the same guard (no worker and no drain may exist
+//     to ever emit a state event; leaving busy strands the composer in Stop
+//     mode).
+//   attachments_busy / cross_user_interjection — remove the false sent bubble,
+//     restore the companion text, and preserve attachment chips. The former
+//     proves server busy; the latter can also be a retained-input refusal with
+//     no worker, so it clears only this send's still-optimistic busy stamp.
+//   busy / unknown-ok — historical behavior.
 export function settleSendResponse(queue, data, ctx) {
   // Normalize a null / non-object 2xx body once, here at the shared
   // chokepoint, so neither pane's call site has to guard it (interactive
@@ -552,13 +725,27 @@ export function settleSendResponse(queue, data, ctx) {
   // without it the unknown/"ok" fall-through below would deref
   // data.attached_ids and surface a delivered message as a connection error.
   data = data || {};
+  if (
+    sendBubbleWasAccepted(ctx.queuedEl) ||
+    sendBubbleWasAccepted(ctx.optimisticEl)
+  ) {
+    // The canonical user_turn event can beat this HTTP response. It proves
+    // admission even when the response itself was lost; never recreate,
+    // promote, or report failure for the already-settled optimistic row.
+    ctx.consumeAttachments(data.attached_ids, data.dropped_attachment_ids);
+    return;
+  }
   var status = data.status;
   if (status === "queued" && data.msg_id) {
     var queuedEl = ctx.queuedEl;
     if (!queuedEl && data.deferred) {
       if (ctx.optimisticEl && ctx.optimisticEl.isConnected)
         ctx.optimisticEl.remove();
-      queuedEl = queue.addQueuedMessage(ctx.displayText, ctx.priority);
+      queuedEl = queue.addQueuedMessage(
+        ctx.displayText,
+        ctx.priority,
+        ctx.clientSendId,
+      );
     }
     if (queuedEl) {
       queue.bind(queuedEl, data.msg_id, {
@@ -618,11 +805,19 @@ export function settleSendResponse(queue, data, ctx) {
         ctx.optimisticEl.remove();
       if (ctx.busyIsOptimistic()) ctx.setBusy(false);
     }
+    if (typeof ctx.restoreInput === "function") ctx.restoreInput();
     ctx.renderError("Message queue full. Please wait.");
     return;
   }
   if (status === "attachments_busy") {
     if (ctx.queuedEl) queue.remove(ctx.queuedEl);
+    if (ctx.optimisticEl && ctx.optimisticEl.isConnected)
+      ctx.optimisticEl.remove();
+    if (typeof ctx.restoreInput === "function") ctx.restoreInput();
+    // The server just proved a worker owns the slot. Replace this send's
+    // optimistic source stamp with a server stamp; an idle SSE that already
+    // arrived would have cleared it and therefore fails this guard.
+    if (ctx.busyIsOptimistic()) ctx.setBusy(true);
     ctx.renderError(
       "Attachments can't be sent while the assistant is working. " +
         "Send a text-only message now, or wait and resend with attachments.",
@@ -631,12 +826,18 @@ export function settleSendResponse(queue, data, ctx) {
   }
   if (status === "cross_user_interjection") {
     if (ctx.queuedEl) queue.remove(ctx.queuedEl);
+    if (ctx.optimisticEl && ctx.optimisticEl.isConnected)
+      ctx.optimisticEl.remove();
+    if (typeof ctx.restoreInput === "function") ctx.restoreInput();
+    // A 409 can also come from retained foreign queued input with no live
+    // worker, so it does not prove busy. Undo only this send's optimistic
+    // stamp; a newer SSE state remains authoritative in either direction.
+    if (ctx.busyIsOptimistic()) ctx.setBusy(false);
     ctx.renderError(
       data.error ||
         "Another participant's turn is in progress. Wait for it to " +
           "finish, then send your message.",
     );
-    if (!ctx.isBusy) ctx.setBusy(false);
     return;
   }
   // Unknown / "ok" status (e.g. the stale-busy race: the client
@@ -645,4 +846,74 @@ export function settleSendResponse(queue, data, ctx) {
   // can't strand it; promote() notifies "already sent" if it was dismissed.
   if (ctx.queuedEl) queue.promote(ctx.queuedEl);
   ctx.consumeAttachments(data.attached_ids, data.dropped_attachment_ids);
+}
+
+// Drive one /send POST from its Response to the pane's optimistic state. The
+// request stays pane-owned (base/URL, credentials, abort + timeout, body
+// shape); everything from the response onward is identical for all four send
+// flows — composer send and edit-and-resend, in each pane — so it lives here:
+// the rejected-body normalization, the 409 conversion, settleSendResponse, and
+// the transport catch.
+//
+// sendRequest: the pending fetch Promise<Response> for POST /send.
+// ctx:         exactly settleSendResponse's ctx (documented above). The
+//              edit-and-resend flows pass queuedEl:null + isBusy:false, which
+//              reduces the arms below to their single-bubble shape.
+export function postAndSettleSend(queue, sendRequest, ctx) {
+  return sendRequest
+    .then((response) => {
+      if (response.ok) return response.json();
+      // 409 = the server-side cross-user interjection block (another
+      // participant's turn is in flight). Convert to a handled status so it
+      // routes to the clean arm instead of the generic connection-error catch
+      // — the reactive fallback for the race where the send button wasn't yet
+      // disabled.
+      if (response.status === 409) {
+        return response.json().then(
+          (body) => ({
+            status: "cross_user_interjection",
+            error: (body && body.error) || "",
+          }),
+          () => ({ status: "cross_user_interjection", error: "" }),
+        );
+      }
+      // Any other rejected send carries {error}, not {status}; without this it
+      // would fall through to the unknown/"ok" arm and be promote()'d — a
+      // server-refused message shown as delivered (with a false "already sent"
+      // notice if it was dismissed). Throwing surfaces the server's {error}
+      // text ("No session", a rate-limit reason, ...) rather than a bare
+      // status code. A wedged proxy can answer non-JSON (502/504 HTML); the
+      // parse-failure arm falls back to the status code so that can't surface
+      // as an "Unexpected token <" error.
+      return response.json().then(
+        (body) => {
+          throw new Error(
+            (body && body.error) || "send_http_" + response.status,
+          );
+        },
+        () => {
+          throw new Error("send_http_" + response.status);
+        },
+      );
+    })
+    .then((data) => settleSendResponse(queue, data, ctx))
+    .catch((err) => {
+      // The canonical user_turn event can beat — or outlive — a failed
+      // response: an accepted bubble is already settled, so never remove it
+      // or report failure for it. Otherwise nothing landed; drop the
+      // optimistic rows and restore the pre-send busy state.
+      if (
+        sendBubbleWasAccepted(ctx.queuedEl) ||
+        sendBubbleWasAccepted(ctx.optimisticEl)
+      ) {
+        return;
+      }
+      if (ctx.queuedEl) queue.remove(ctx.queuedEl);
+      if (ctx.optimisticEl && ctx.optimisticEl.isConnected)
+        ctx.optimisticEl.remove();
+      ctx.renderError(
+        "Connection error: " + (err && err.message ? err.message : err),
+      );
+      if (!ctx.isBusy) ctx.setBusy(false);
+    });
 }

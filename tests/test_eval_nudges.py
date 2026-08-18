@@ -256,6 +256,7 @@ class TestWorldSeeding:
             "memory": [
                 {
                     "name": "proj-context",
+                    "description": "Project deployment context",
                     "content": "acme-api: staging tracks main.",
                     "type": "reference",
                 }
@@ -265,15 +266,22 @@ class TestWorldSeeding:
     }
 
     def test_memory_rows_read_back_through_the_production_listing(self, eval_storage):
-        from turnstone.core.memory import list_structured_memories
+        from turnstone.core.memory import (
+            get_structured_memory_by_name,
+            list_structured_memories,
+        )
 
         _seed_world(eval_storage, self._WORLD_CELL)
         rows = list_structured_memories(scope="global")
         by_name = {r["name"]: r for r in rows}
         # The production writer normalizes names (normalize_key), so the
-        # seeded row reads back exactly as a model-saved one would.
+        # metadata listing names the seeded row exactly as a model-saved one
+        # would. The body remains behind the explicit get boundary.
         assert "proj_context" in by_name
-        assert by_name["proj_context"]["content"] == "acme-api: staging tracks main."
+        assert "content" not in by_name["proj_context"]
+        full = get_structured_memory_by_name("proj_context", "global", "")
+        assert full is not None
+        assert full["content"] == "acme-api: staging tracks main."
 
     def test_nodes_read_back_through_the_real_list_nodes(self, eval_storage):
         _seed_world(eval_storage, self._WORLD_CELL)
@@ -2752,7 +2760,7 @@ class TestRunResourceLifecycle:
         assert not is_storage_initialized()
 
     def test_a_hung_generation_is_bounded_by_the_wall_clock(self, monkeypatch):
-        """The per-request httpx timeout cannot bound a STREAM — a
+        """The per-request HTTP transport timeout cannot bound a STREAM — a
         trickling response resets the read timeout indefinitely — so
         without the executor wall clock a hung generation occupies a run
         slot forever and is scored as a body regression when the sweep

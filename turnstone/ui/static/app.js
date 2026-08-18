@@ -38,6 +38,57 @@ const STATE_DISPLAY = {
   error: { symbol: "\u2716", label: "err" },
 };
 
+const PERSISTENCE_DISPLAY = {
+  pending: {
+    label: "History save pending",
+    tooltip:
+      "An accepted conversation turn has not reached durable history yet.",
+  },
+  retrying: {
+    label: "History save retrying",
+    tooltip:
+      "An accepted conversation turn has not reached durable history yet. Automatic recovery is in progress.",
+  },
+  conflict: {
+    label: "History save blocked",
+    tooltip:
+      "An accepted conversation turn cannot reach durable history automatically. Operator intervention is required.",
+  },
+};
+
+function appendPersistenceStatus(container, ws) {
+  const display = PERSISTENCE_DISPLAY[ws.persistence_state];
+  if (!display) return;
+  const badge = document.createElement("span");
+  badge.className = "dash-persistence-badge";
+  badge.dataset.state = ws.persistence_state;
+  badge.textContent = display.label;
+  badge.title = display.tooltip;
+  badge.setAttribute("role", "status");
+  badge.setAttribute("aria-label", display.label + ". " + display.tooltip);
+  container.appendChild(badge);
+}
+
+function renderDashboardSubline(container, ws) {
+  container.replaceChildren();
+  container.classList.toggle("sub-attention", ws.activity_state === "approval");
+  appendPersistenceStatus(container, ws);
+  if (ws.activity) {
+    if (container.childNodes.length) container.append(" \u00b7 ");
+    container.append(ws.activity);
+  }
+}
+
+function setPersistenceRowAria(row, persistenceState) {
+  const base =
+    row.dataset.baseAriaLabel || row.getAttribute("aria-label") || "";
+  const display = PERSISTENCE_DISPLAY[persistenceState];
+  row.setAttribute(
+    "aria-label",
+    base + (display ? ", " + display.label.toLowerCase() : ""),
+  );
+}
+
 // ===========================================================================
 //  5. Health polling
 // ===========================================================================
@@ -278,6 +329,35 @@ function _isAttachmentAllowed(file) {
   return false;
 }
 
+// File clipboard items preserve their existing priority. Only when none were
+// staged do we consider synthesizing a text attachment through the shared
+// module bridge. Returns true when the native paste was handled.
+function _handleComposerPaste(event, addFiles) {
+  if (!event.clipboardData) return false;
+  const items = event.clipboardData.items || [];
+  const files = [];
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].kind === "file") {
+      const file = items[i].getAsFile();
+      if (file) files.push(file);
+    }
+  }
+  if (files.length > 0) {
+    event.preventDefault();
+    addFiles(files);
+    return true;
+  }
+
+  const paste = window.TurnstonePasteText;
+  if (!paste || !paste.pasteTextToFile) return false;
+  const textFile = paste.pasteTextToFile(
+    event.clipboardData.getData("text/plain"),
+  );
+  if (!textFile || addFiles([textFile]) === false) return false;
+  event.preventDefault();
+  return true;
+}
+
 // In-dialog error strip (sh-alert).  Empty message clears + hides; a set
 // message also scrolls into view — the alert sits at the top of the
 // scrollable body while the submit lives in the pinned foot.
@@ -293,13 +373,23 @@ function _newWsError(msg) {
 }
 
 function _newWsAddFiles(files) {
+  let handled = false;
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
+    const paste = window.TurnstonePasteText;
+    if (
+      paste &&
+      paste.isDuplicatePastedTextFile &&
+      paste.isDuplicatePastedTextFile(f, _newWsStagedFiles)
+    ) {
+      handled = true;
+      continue;
+    }
     if (_newWsStagedFiles.length >= _NEW_WS_MAX_FILES) {
       _newWsError(
         "At most " + _NEW_WS_MAX_FILES + " attachments per workstream",
       );
-      return;
+      return handled;
     }
     if (!_isAttachmentAllowed(f)) {
       _newWsError(
@@ -307,18 +397,20 @@ function _newWsAddFiles(files) {
           f.name +
           " (allowed: png/jpeg/gif/webp images, text)",
       );
-      return;
+      return handled;
     }
     const isImage = (f.type || "").indexOf("image/") === 0;
     const cap = isImage ? _NEW_WS_IMAGE_CAP : _NEW_WS_TEXT_CAP;
     if (f.size > cap) {
       _newWsError(f.name + " exceeds the " + _formatAttachSize(cap) + " cap");
-      return;
+      return handled;
     }
     _newWsStagedFiles.push(f);
+    handled = true;
   }
   _newWsError("");
   _newWsRenderChips();
+  return handled;
 }
 
 function newWorkstream() {
@@ -414,7 +506,14 @@ function showNewWsModal(forkFromWsId) {
 
   document.getElementById("new-ws-name").value = "";
   const initEl = document.getElementById("new-ws-initial-message");
-  if (initEl) initEl.value = "";
+  if (initEl) {
+    initEl.value = "";
+    initEl.onpaste = function (event) {
+      // Forks inherit history and intentionally have no attachment lane.
+      if (_forkFromWsId) return;
+      _handleComposerPaste(event, _newWsAddFiles);
+    };
+  }
   _newWsError("");
 
   // Reset attachment staging.  Forks don't carry attachments —
@@ -776,6 +875,11 @@ function submitNewWs() {
   const persona = personaEl ? personaEl.value : "";
   const initEl = document.getElementById("new-ws-initial-message");
   const initial_message = initEl ? initEl.value.trim() : "";
+  const staged = _forkFromWsId ? [] : _newWsStagedFiles.slice();
+  if (staged.length > 0 && !initial_message) {
+    _newWsError("Add a message to send with this attachment.");
+    return;
+  }
   if (name) body.name = name;
   // Forks DELIBERATELY inherit their source's model + judge: the selects are
   // hidden for a fork (showNewWsModal) and never sent here — matching the
@@ -804,7 +908,6 @@ function submitNewWs() {
   window.TurnstoneHatch.setBusy(dlg, true);
 
   let fetchOpts;
-  const staged = _forkFromWsId ? [] : _newWsStagedFiles.slice();
   if (staged.length > 0) {
     const form = new FormData();
     form.append("meta", JSON.stringify(body));
@@ -874,17 +977,40 @@ function closeWorkstream(wsId) {
     body: "{}",
   })
     .then(function (r) {
-      return r.json();
+      // Non-JSON fallback (proxy 502/504 HTML, empty body): keep the HTTP
+      // status so the 409 arm still fires — the sibling postAndSettleSend
+      // handles exactly this proxy case the same way.
+      return r
+        .json()
+        .catch(function () {
+          return {};
+        })
+        .then(function (data) {
+          return { data: data, status: r.status };
+        });
     })
-    .then(function (data) {
+    .then(function (result) {
+      const data = result.data;
       if (data.status === "ok") {
         delete workstreams[wsId];
         closeSessionPane(wsId);
         fireRender();
         if (!Object.keys(workstreams).length) showDashboard();
+      } else if (result.status === 409) {
+        showToast(
+          "Conversation history is still being saved. Try ending the session again shortly.",
+          "warning",
+        );
       } else if (data.error) {
         showToast(data.error, "warning");
+      } else {
+        showToast("Couldn't end the session. Try again shortly.", "warning");
       }
+    })
+    .catch(function () {
+      // Transport failure: the close may not have reached the server at
+      // all — say so instead of leaving the pane open with no feedback.
+      showToast("Couldn't end the session. Try again shortly.", "warning");
     });
 }
 
@@ -983,6 +1109,15 @@ function renderDashboardTable(wsList, agg) {
     return;
   }
   wsList.forEach(function (ws) {
+    // The REST dashboard row is the authoritative initial projection for
+    // operator-only journal state. Keep the Tier-1 roster copy aligned so a
+    // later activity-only delta cannot repaint the sub-line from stale data.
+    if (workstreams[ws.ws_id]) {
+      workstreams[ws.ws_id].persistence_state =
+        ws.persistence_state || "healthy";
+      workstreams[ws.ws_id].activity = ws.activity || "";
+      workstreams[ws.ws_id].activity_state = ws.activity_state || "";
+    }
     const liveState =
       (workstreams[ws.ws_id] && workstreams[ws.ws_id].state) ||
       ws.state ||
@@ -1006,7 +1141,8 @@ function renderDashboardTable(wsList, agg) {
     if (ws.tokens) ariaLabel += ", " + formatTokens(ws.tokens) + " tokens";
     if (ws.context_ratio > 0)
       ariaLabel += ", " + Math.round(ws.context_ratio * 100) + "% context";
-    row.setAttribute("aria-label", ariaLabel);
+    row.dataset.baseAriaLabel = ariaLabel;
+    setPersistenceRowAria(row, ws.persistence_state);
 
     const main = document.createElement("div");
     main.className = "dash-row-main";
@@ -1080,8 +1216,7 @@ function renderDashboardTable(wsList, agg) {
 
     const sub = document.createElement("div");
     sub.className = "dash-row-sub";
-    if (ws.activity_state === "approval") sub.classList.add("sub-attention");
-    sub.textContent = ws.activity || "";
+    renderDashboardSubline(sub, ws);
     row.appendChild(sub);
 
     row.onclick = function () {
@@ -1484,13 +1619,23 @@ function _renderDashboardChips() {
 }
 
 function _addDashboardFiles(files) {
+  let handled = false;
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
+    const paste = window.TurnstonePasteText;
+    if (
+      paste &&
+      paste.isDuplicatePastedTextFile &&
+      paste.isDuplicatePastedTextFile(f, _dashboardStagedFiles)
+    ) {
+      handled = true;
+      continue;
+    }
     if (_dashboardStagedFiles.length >= _DASH_MAX_FILES) {
       _dashboardError(
         "At most " + _DASH_MAX_FILES + " attachments per workstream",
       );
-      return;
+      return handled;
     }
     // Drag-drop bypasses the <input accept="..."> filter, so re-check
     // against the server's allowlist before the upload roundtrip.
@@ -1500,7 +1645,7 @@ function _addDashboardFiles(files) {
           f.name +
           " (allowed: png/jpeg/gif/webp images, text)",
       );
-      return;
+      return handled;
     }
     const isImage = (f.type || "").indexOf("image/") === 0;
     const cap = isImage ? _DASH_IMAGE_CAP : _DASH_TEXT_CAP;
@@ -1508,12 +1653,14 @@ function _addDashboardFiles(files) {
       _dashboardError(
         f.name + " exceeds the " + _formatAttachSize(cap) + " cap",
       );
-      return;
+      return handled;
     }
     _dashboardStagedFiles.push(f);
+    handled = true;
   }
   _renderDashboardChips();
   _refreshDashboardSubmitLabel();
+  return handled;
 }
 
 let _dashboardErrorTimer = null;
@@ -1689,6 +1836,10 @@ function dashboardSubmit() {
   const btn = document.getElementById("dashboard-submit-btn");
   const text = input.value.trim();
   const staged = _dashboardStagedFiles.slice();
+  if (staged.length > 0 && !text) {
+    _dashboardError("Add a message to send with this attachment.");
+    return;
+  }
 
   const body = {};
   const model = document.getElementById("dashboard-model").value.trim();
@@ -1848,19 +1999,23 @@ function connectGlobalSSE() {
         context_ratio: data.context_ratio,
         activity: data.activity,
         activity_state: data.activity_state,
+        persistence_state: data.persistence_state,
       });
     } else if (data.type === "ws_activity") {
-      const row = document.querySelector(
-        '#dash-ws-table .dash-row[data-ws-id="' + data.ws_id + '"]',
-      );
-      if (row) {
-        const sub = row.querySelector(".dash-row-sub");
-        if (sub) {
-          sub.textContent = data.activity || "";
-          if (data.activity_state === "approval")
-            sub.classList.add("sub-attention");
-          else sub.classList.remove("sub-attention");
-        }
+      // Membership-gated like ws_rename below: a trailing activity event
+      // for a closed workstream (its dashboard row can outlive ws_closed
+      // until the next REST-driven repaint) must not re-insert a skeletal
+      // roster entry — that ghost suppresses the empty-state transition
+      // and paints a nameless rail tab until a full resync.
+      const roster = workstreams[data.ws_id];
+      if (roster) {
+        roster.activity = data.activity || "";
+        roster.activity_state = data.activity_state || "";
+        const row = document.querySelector(
+          '#dash-ws-table .dash-row[data-ws-id="' + data.ws_id + '"]',
+        );
+        const sub = row && row.querySelector(".dash-row-sub");
+        if (sub) renderDashboardSubline(sub, roster);
       }
     } else if (data.type === "ws_rename") {
       if (workstreams[data.ws_id]) workstreams[data.ws_id].name = data.name;
@@ -1875,6 +2030,7 @@ function connectGlobalSSE() {
       // without waiting for a roster refetch (null = unattached).
       workstreams[data.ws_id].project_id = data.project_id || null;
       workstreams[data.ws_id].persona = data.persona || "";
+      workstreams[data.ws_id].persistence_state = "healthy";
       renderTabBar();
     } else if (data.type === "ws_closed") {
       const wsId = data.ws_id;
@@ -2043,19 +2199,7 @@ function _announce(text) {
   });
   input.addEventListener("input", _refreshDashboardSubmitLabel);
   input.addEventListener("paste", function (e) {
-    if (!e.clipboardData) return;
-    const items = e.clipboardData.items || [];
-    const pasted = [];
-    for (let i = 0; i < items.length; i++) {
-      if (items[i].kind === "file") {
-        const f = items[i].getAsFile();
-        if (f) pasted.push(f);
-      }
-    }
-    if (pasted.length) {
-      e.preventDefault();
-      _addDashboardFiles(pasted);
-    }
+    _handleComposerPaste(e, _addDashboardFiles);
   });
 
   if (attachBtn && attachInput) {
@@ -2406,6 +2550,8 @@ function applyRosterSnapshot(list, opts) {
     // workstreams, and that authoritative empty must not be masked by a
     // stale in-memory value.
     cur.persona = "persona" in ws ? ws.persona || "" : cur.persona || "";
+    cur.persistence_state =
+      "persistence_state" in ws ? ws.persistence_state || "healthy" : "healthy";
     workstreams[ws.id] = cur;
   });
   if (evict) {
@@ -2680,7 +2826,17 @@ function renderTabBar() {
   fireRender();
 }
 function updateTabIndicator(wsId, state, extra) {
-  if (workstreams[wsId]) workstreams[wsId].state = state;
+  const roster = workstreams[wsId];
+  if (roster) {
+    roster.state = state;
+    if (extra) {
+      if (extra.activity !== undefined) roster.activity = extra.activity || "";
+      if (extra.activity_state !== undefined)
+        roster.activity_state = extra.activity_state || "";
+      if (extra.persistence_state !== undefined)
+        roster.persistence_state = extra.persistence_state || "healthy";
+    }
+  }
   fireRender(); // rail glyph (the only surface fireRender repaints)
   // Patch the Dashboard row in place — fireRender fans out to the rail, NOT the
   // #dash-ws-table cells, so without this a watched row's STATE/TOKENS/CTX go
@@ -2715,15 +2871,12 @@ function updateTabIndicator(wsId, state, extra) {
           : "";
     }
   }
-  if (extra.activity !== undefined) {
+  if (extra.activity !== undefined || extra.persistence_state !== undefined) {
     const sub = row.querySelector(".dash-row-sub");
-    if (sub) {
-      sub.textContent = extra.activity || "";
-      if (extra.activity_state === "approval")
-        sub.classList.add("sub-attention");
-      else sub.classList.remove("sub-attention");
-    }
+    if (sub) renderDashboardSubline(sub, roster || extra);
   }
+  if (extra.persistence_state !== undefined)
+    setPersistenceRowAria(row, (roster || extra).persistence_state);
 }
 
 // Synthesize the one-node clusterState shape the rail consumes
