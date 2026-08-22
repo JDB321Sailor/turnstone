@@ -6949,11 +6949,12 @@ class ChatSession:
                 except _MemoryIndexPlanStaleError as stale:
                     project_witness = stale.snapshot
                     if attempt + 1 < _MEMORY_INDEX_ADMISSION_RETRIES:
-                        time.sleep(
+                        self._backoff_or_cancelled(
                             min(
                                 _MEMORY_INDEX_ADMISSION_RETRY_BASE_DELAY * (2**attempt),
                                 _MEMORY_INDEX_ADMISSION_RETRY_MAX_DELAY,
-                            )
+                            ),
+                            my_generation,
                         )
             else:
                 raise RuntimeError("memory context could not be refreshed safely")
