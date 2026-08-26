@@ -12,17 +12,45 @@ that minor, so the current stable line never has two independently writable
 branches. Earlier stable lines (`stable/1.7`, `stable/1.6`, `stable/1.5`) are
 frozen.
 
-## [Unreleased]
+## [1.8.1]
+
+Turnstone 1.8.1 strengthens long-running agent context and stable dependency
+compatibility, adds a quieter transcript view, and makes operator waits
+explicit. It includes no database schema migrations.
 
 ### Added
 
-- **Task-agent compaction.** Long-running agents now receive the same soft
-  warning, hard compaction, recursive overflow recovery, and visible progress
-  as the foreground while retaining bounded execution evidence for cancellation
-  disposition and task recall. The generalized `compaction` lifecycle targets
-  either the workstream or a parent task card; task compaction is transient and
-  never persists the agent's private summary. Python and TypeScript SDKs expose
-  the target fields.
+- **Task-agent compaction (#1044).** Long-running agents now receive the same
+  soft warning, hard compaction, recursive overflow recovery, and visible
+  progress as the foreground while retaining bounded execution evidence for
+  cancellation disposition and task recall. The generalized `compaction`
+  lifecycle targets either the workstream or a parent task card; task
+  compaction is transient and never persists the agent's private summary.
+  Python and TypeScript SDKs expose the target fields.
+- **Compact transcript presentation (#1048).** A browser-local Default/Compact
+  control now spans interactive and coordinator views. Compact mode hides
+  completed reasoning and folds fully settled routine tool batches while
+  keeping active, exceptional, and task-agent work visible; live events and
+  restored history use the same presentation rules.
+
+### Changed
+
+- **Configurable tool-approval waits (#1038, #1039).** The new
+  `tools.approval_timeout_seconds` setting defaults to `0` for an indefinite
+  operator wait and accepts positive finite deadlines. Each approval batch
+  snapshots the live value, platform wait limits are respected, and hard
+  deletion still releases outstanding waits.
+
+### Fixed
+
+- **Memory admission during MCP catalog priming (#1046).** First-turn immutable
+  memory-index capture now tolerates several asynchronous resource or prompt
+  catalog invalidations with a bounded, cancellation-aware backoff outside the
+  storage transaction and model-capacity lease.
+- **Anthropic SDK major-version guard (#1049, #1050).** Stable installations now
+  require `anthropic>=0.117,<1`, preventing fresh resolution of the HTTPX2-based
+  v1 SDK before Turnstone's client, sampling, and transport boundaries are
+  deliberately migrated.
 
 ## [1.8.0]
 
